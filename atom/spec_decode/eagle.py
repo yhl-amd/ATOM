@@ -1,4 +1,6 @@
+import copy
 import logging
+from typing import Optional
 
 import numpy as np
 import torch
@@ -16,6 +18,7 @@ logger = logging.getLogger("atom")
 support_eagle_model_arch_dict = {
     "DeepSeekMTPModel": "atom.models.deepseek_mtp.DeepSeekMTP",
     "Qwen3NextMTPModel": "atom.models.qwen3_next_mtp.Qwen3NextMTP",
+    "Eagle3LlamaModel": "atom.models.eagle3_llama.Eagle3LlamaModel",
 }
 
 
@@ -47,7 +50,23 @@ class EagleProposer:
         self.device = device
         draft_model_hf_config = self.speculative_config.draft_model_hf_config
         model_class = resolve_obj_by_qualname(support_eagle_model_arch_dict[draft_model_hf_config.architectures[0]])  # type: ignore
-        self.model = model_class(self.config)
+
+        if self.speculative_config.method == "eagle3":
+            # Eagle3 draft model has its own architecture (Llama, not MLA),
+            # so it must be constructed with the draft model's hf_config.
+            # Also disable torch.compile for the draft model to avoid
+            # Dynamo tracing issues with the separate KV cache binding.
+            draft_atom_config = copy.copy(atom_config)
+            draft_atom_config.hf_config = draft_model_hf_config
+            draft_compilation = copy.copy(atom_config.compilation_config)
+            draft_compilation.level = CompilationLevel.NO_COMPILATION
+            draft_atom_config.compilation_config = draft_compilation
+            # Draft attention layer_num must continue from the target model's
+            # layer count so it maps to the correct kv_cache_data entry.
+            draft_atom_config.draft_layer_offset = atom_config.hf_config.num_hidden_layers
+            self.model = model_class(draft_atom_config)
+        else:
+            self.model = model_class(self.config)
 
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
@@ -59,49 +78,65 @@ class EagleProposer:
 
     def load_model(self, target_model: nn.Module) -> None:
 
-        load_model(
-            self.model,
-            self.config.model,
-            self.speculative_config.draft_model_hf_config,
-            self.config.load_dummy,
-            True,
-        )
-
-        # share embed_tokens with the target model if needed
-        if (
-            get_pp_group().world_size == 1
-            and self.model.model.embed_tokens.weight.shape
-            == target_model.model.embed_tokens.weight.shape
-        ):
-            logger.info(
-                "Assuming the EAGLE head shares the same vocab embedding"
-                " with the target model."
+        if self.speculative_config.method == "eagle3":
+            # Eagle3: load from separate draft model checkpoint
+            load_model(
+                self.model,
+                self.speculative_config.model,
+                self.speculative_config.draft_model_hf_config,
+                self.config.load_dummy,
+                False,
             )
-            del self.model.model.embed_tokens
-            self.model.model.embed_tokens = target_model.model.embed_tokens
+            # Eagle3 uses independent embed_tokens and lm_head; no sharing
+            logger.info(
+                "Eagle3 draft model loaded from %s (independent embed/lm_head)",
+                self.speculative_config.model,
+            )
         else:
-            logger.info(
-                "The EAGLE head's vocab embedding will be loaded separately"
-                " from the target model."
+            # MTP: load from target model checkpoint
+            load_model(
+                self.model,
+                self.config.model,
+                self.speculative_config.draft_model_hf_config,
+                self.config.load_dummy,
+                True,
             )
 
-        # If MTP shared_head.head was not in checkpoint (weight is all zeros),
-        # share lm_head from the target model as fallback.
-        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
-            layers = self.model.model.layers
-            layer_iter = layers.values() if hasattr(layers, "values") else layers
-            for layer in layer_iter:
-                if (
-                    hasattr(layer, "shared_head")
-                    and hasattr(layer.shared_head, "head")
-                    and not layer.shared_head.head.weight.any()
-                ):
-                    logger.info(
-                        "MTP shared_head.head not found in checkpoint, "
-                        "sharing lm_head from the target model."
-                    )
-                    del layer.shared_head.head
-                    layer.shared_head.head = target_model.lm_head
+            # share embed_tokens with the target model if needed
+            if (
+                get_pp_group().world_size == 1
+                and self.model.model.embed_tokens.weight.shape
+                == target_model.model.embed_tokens.weight.shape
+            ):
+                logger.info(
+                    "Assuming the EAGLE head shares the same vocab embedding"
+                    " with the target model."
+                )
+                del self.model.model.embed_tokens
+                self.model.model.embed_tokens = target_model.model.embed_tokens
+            else:
+                logger.info(
+                    "The EAGLE head's vocab embedding will be loaded separately"
+                    " from the target model."
+                )
+
+            # If MTP shared_head.head was not in checkpoint (weight is all zeros),
+            # share lm_head from the target model as fallback.
+            if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+                layers = self.model.model.layers
+                layer_iter = layers.values() if hasattr(layers, "values") else layers
+                for layer in layer_iter:
+                    if (
+                        hasattr(layer, "shared_head")
+                        and hasattr(layer.shared_head, "head")
+                        and not layer.shared_head.head.weight.any()
+                    ):
+                        logger.info(
+                            "MTP shared_head.head not found in checkpoint, "
+                            "sharing lm_head from the target model."
+                        )
+                        del layer.shared_head.head
+                        layer.shared_head.head = target_model.lm_head
 
     def propose(
         self,
@@ -115,6 +150,7 @@ class EagleProposer:
         num_reject_tokens: torch.Tensor,
         next_token_ids: torch.Tensor,
         last_token_indices: torch.Tensor,
+        aux_hidden_states: Optional[list[torch.Tensor]] = None,
     ) -> torch.Tensor:
 
         forward_context = get_forward_context()
@@ -128,7 +164,13 @@ class EagleProposer:
         # input_ids[last_token_indices] = next_token_ids
         input_ids.scatter_(0, last_token_indices, next_token_ids)
         positions = target_positions + 1
-        hidden_states = target_hidden_states
+
+        # Eagle3: project concatenated aux hidden states through fc
+        if aux_hidden_states is not None:
+            concat_aux = torch.cat(aux_hidden_states, dim=-1)
+            hidden_states = self.model.combine_hidden_states(concat_aux)
+        else:
+            hidden_states = target_hidden_states
 
         draft_token_ids = torch.empty(
             bs, self.mtp_k, dtype=next_token_ids.dtype, device=next_token_ids.device
@@ -177,6 +219,26 @@ class EagleProposer:
                         positions = torch.gather(positions, 0, last_token_indices)
                         context.is_prefill = False
 
+                        # Eagle3 MHA decode needs block_tables and context_lens
+                        # (MLA uses kv_indptr/kv_indices instead).
+                        if self.speculative_config.method == "eagle3":
+                            num_blocks_per_seq = kv_indptr[1 : bs + 1] - kv_indptr[:bs]
+                            max_num_blocks = int(num_blocks_per_seq.max().item())
+                            block_tables = torch.zeros(
+                                bs, max_num_blocks,
+                                dtype=torch.int32, device=kv_indices.device,
+                            )
+                            offsets = kv_indptr[:bs]
+                            for s in range(bs):
+                                nb = int(num_blocks_per_seq[s].item())
+                                st = int(offsets[s].item())
+                                block_tables[s, :nb] = kv_indices[st : st + nb].to(torch.int32)
+                            attn_metadata.block_tables = block_tables
+                            attn_metadata.context_lens = (
+                                (num_blocks_per_seq - 1) * self.block_size
+                                + kv_last_page_lens[:bs]
+                            ).to(torch.int32)
+
                     # update metadata
                     attn_metadata.max_seqlen_k += 1
                     workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
@@ -193,6 +255,28 @@ class EagleProposer:
                     for k, v in workinfos.items():
                         attn_metadata.__dict__[k] = v
                     slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
+
+                    # Eagle3: update block_tables / context_lens after kv_indptr changes
+                    if self.speculative_config.method == "eagle3":
+                        attn_metadata.context_lens = attn_metadata.context_lens + 1
+                        nbs = kv_indptr[1 : bs + 1] - kv_indptr[:bs]
+                        new_max = int(nbs.max().item())
+                        if new_max > attn_metadata.block_tables.shape[1]:
+                            new_bt = torch.zeros(
+                                bs, new_max,
+                                dtype=torch.int32, device=kv_indices.device,
+                            )
+                            new_bt[:, : attn_metadata.block_tables.shape[1]] = (
+                                attn_metadata.block_tables
+                            )
+                            attn_metadata.block_tables = new_bt
+                        for s in range(bs):
+                            nb = int(nbs[s].item())
+                            st = int(kv_indptr[s].item())
+                            attn_metadata.block_tables[s, :nb] = kv_indices[
+                                st : st + nb
+                            ].to(torch.int32)
+
                     input_ids = new_draft_ids
                     positions += 1
                     hidden_states = sample_hidden_states

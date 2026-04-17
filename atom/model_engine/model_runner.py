@@ -550,6 +550,11 @@ class ModelRunner:
             self.rejection_sampler = RejectionSampler()
             self.mtp_total_draft_tokens = 0
             self.mtp_total_accepted_tokens = 0
+        self.eagle3_mode = (
+            self.config.speculative_config is not None
+            and self.config.speculative_config.method == "eagle3"
+        )
+        self._aux_hidden_states = None
         self.num_spec_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
         self.tokenID_processor = tokenIDProcessor(
             self,
@@ -585,6 +590,18 @@ class ModelRunner:
         if hasattr(self, "drafter"):
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.model)
+
+        if (
+            self.eagle3_mode
+            and self.config.speculative_config.use_aux_hidden_state
+        ):
+            aux_ids = self.config.speculative_config.eagle3_aux_layer_ids
+            if not aux_ids and hasattr(self.model, "get_eagle3_aux_hidden_state_layers"):
+                aux_ids = list(self.model.get_eagle3_aux_hidden_state_layers())
+            if aux_ids:
+                self.model.set_aux_hidden_state_layers(tuple(aux_ids))
+                logger.info(f"Eagle3 aux hidden state layers: {aux_ids}")
+
         torch.set_default_device(self.device)
         self.async_execute_stream = torch.cuda.Stream(self.device)
         self.allocate_forward_vars()
@@ -975,11 +992,17 @@ class ModelRunner:
             return 1
 
     def _get_total_num_layers(self):
-        """Return total layer count including draft (MTP) layers."""
+        """Return total layer count including draft (MTP) layers.
+
+        Eagle3 draft layers use standard full-attention (not MLA), so they
+        need a separate KV cache and are NOT counted here when the target
+        model uses MLA.
+        """
         total = self.config.hf_config.num_hidden_layers
         if self.config.speculative_config and hasattr(self, "drafter"):
-            draft_hf = self.config.speculative_config.draft_model_hf_config
-            total += getattr(draft_hf, "num_nextn_predict_layers", 1)
+            if not getattr(self, "eagle3_mode", False):
+                draft_hf = self.config.speculative_config.draft_model_hf_config
+                total += getattr(draft_hf, "num_nextn_predict_layers", 1)
         return total
 
     def _compute_block_bytes(self):
@@ -1006,6 +1029,19 @@ class ModelRunner:
                     * self.block_size
                     * aligned_index_dim
                     * dtypes.fp8.itemsize
+                )
+            # Eagle3 draft layer uses separate non-MLA KV cache
+            if getattr(self, "eagle3_mode", False) and hasattr(self, "drafter"):
+                draft_hf = self.config.speculative_config.draft_model_hf_config
+                draft_num_kv_heads = draft_hf.num_key_value_heads // self.world_size
+                draft_num_layers = draft_hf.num_hidden_layers
+                block_bytes += (
+                    2
+                    * draft_num_layers
+                    * self.block_size
+                    * draft_num_kv_heads
+                    * draft_hf.head_dim
+                    * kv_dtype_size
                 )
         elif self.is_qwen_next():
             self.full_attention_interval = hf_config.full_attention_interval
@@ -1172,13 +1208,22 @@ class ModelRunner:
         num_draft_layers = 0
         if self.config.speculative_config and hasattr(self, "drafter"):
             draft_hf_config = self.config.speculative_config.draft_model_hf_config
-            # For MTP, use num_nextn_predict_layers instead of num_hidden_layers
-            num_draft_layers = getattr(draft_hf_config, "num_nextn_predict_layers", 1)
-            total_num_layers += num_draft_layers
-            logger.info(
-                f"Allocating KV cache for {hf_config.num_hidden_layers} target layers + "
-                f"{num_draft_layers} draft (MTP) layers = {total_num_layers} total layers"
-            )
+            if getattr(self, "eagle3_mode", False):
+                # Eagle3 draft uses standard full-attention (not MLA), so its
+                # layers get a separate KV cache below — don't add them here.
+                num_draft_layers = draft_hf_config.num_hidden_layers
+                logger.info(
+                    f"Allocating KV cache for {hf_config.num_hidden_layers} MLA target layers + "
+                    f"{num_draft_layers} Eagle3 draft layers (separate non-MLA cache)"
+                )
+            else:
+                # For MTP, use num_nextn_predict_layers instead of num_hidden_layers
+                num_draft_layers = getattr(draft_hf_config, "num_nextn_predict_layers", 1)
+                total_num_layers += num_draft_layers
+                logger.info(
+                    f"Allocating KV cache for {hf_config.num_hidden_layers} target layers + "
+                    f"{num_draft_layers} draft (MTP) layers = {total_num_layers} total layers"
+                )
 
         if self.use_mla:
             self.kv_cache = torch.zeros(
@@ -1201,6 +1246,32 @@ class ModelRunner:
                     aligned_index_dim,
                     dtype=dtypes.fp8,
                     device="cuda",
+                )
+            # Allocate separate non-MLA KV cache for Eagle3 draft layer(s)
+            if getattr(self, "eagle3_mode", False) and hasattr(self, "drafter"):
+                draft_hf = self.config.speculative_config.draft_model_hf_config
+                eagle3_num_kv_heads = draft_hf.num_key_value_heads // self.world_size
+                self.eagle3_kv_cache = torch.zeros(
+                    2,
+                    draft_hf.num_hidden_layers,
+                    self.num_physical_kvcache_blocks,
+                    self.physical_block_size,
+                    eagle3_num_kv_heads,
+                    draft_hf.head_dim,
+                    dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                    device="cuda",
+                )
+                self.eagle3_kv_scale = torch.zeros(
+                    2,
+                    draft_hf.num_hidden_layers,
+                    self.num_physical_kvcache_blocks,
+                    eagle3_num_kv_heads,
+                    self.physical_block_size,
+                    dtype=dtypes.fp32,
+                    device="cuda",
+                )
+                logger.info(
+                    f"Allocated Eagle3 draft KV cache: {self.eagle3_kv_cache.shape}"
                 )
         elif self.is_qwen_next():
 
@@ -1279,6 +1350,7 @@ class ModelRunner:
 
         kv_cache_tensors = []
         layer_id = 0
+        eagle3_draft_layer_id = 0
         x = 16 // self.kv_cache.element_size()
         for model_name, model in models_to_bind:
             logger.info(
@@ -1289,28 +1361,58 @@ class ModelRunner:
                 # Since use attention base and there are child in attention, add base condition
                 if hasattr(module, "base_attention"):
                     if hasattr(module, "use_mla") and not module.use_mla:
-                        # Non-MLA attention
-                        if self.is_qwen_next():
-                            attn_idx = layer_id // self.full_attention_interval
+                        # Non-MLA attention — use eagle3_kv_cache for Eagle3 draft layers
+                        is_eagle3_draft = (
+                            model_name == "draft"
+                            and getattr(self, "eagle3_mode", False)
+                            and hasattr(self, "eagle3_kv_cache")
+                        )
+                        if is_eagle3_draft:
+                            draft_hf = self.config.speculative_config.draft_model_hf_config
+                            draft_num_kv_heads = draft_hf.num_key_value_heads // self.world_size
+                            draft_head_dim = draft_hf.head_dim
+                            draft_x = 16 // self.eagle3_kv_cache.element_size()
+                            k_cache = self.eagle3_kv_cache[0, eagle3_draft_layer_id].view(
+                                self.num_physical_kvcache_blocks,
+                                draft_num_kv_heads,
+                                draft_head_dim // draft_x,
+                                self.physical_block_size,
+                                draft_x,
+                            )
+                            v_cache = self.eagle3_kv_cache[1, eagle3_draft_layer_id].view(
+                                self.num_physical_kvcache_blocks,
+                                draft_num_kv_heads,
+                                draft_head_dim,
+                                self.physical_block_size,
+                            )
+                            eagle3_draft_layer_id += 1
                         else:
-                            attn_idx = layer_id
-                        k_cache = self.kv_cache[0, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim // x,
-                            self.physical_block_size,
-                            x,
-                        )
-                        v_cache = self.kv_cache[1, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim,
-                            self.physical_block_size,
-                        )
+                            if self.is_qwen_next():
+                                attn_idx = layer_id // self.full_attention_interval
+                            else:
+                                attn_idx = layer_id
+                            k_cache = self.kv_cache[0, attn_idx].view(
+                                self.num_physical_kvcache_blocks,
+                                num_kv_heads,
+                                hf_config.head_dim // x,
+                                self.physical_block_size,
+                                x,
+                            )
+                            v_cache = self.kv_cache[1, attn_idx].view(
+                                self.num_physical_kvcache_blocks,
+                                num_kv_heads,
+                                hf_config.head_dim,
+                                self.physical_block_size,
+                            )
                         module.max_model_len = self.config.max_model_len
                         if config.kv_cache_dtype == "fp8":
-                            module.k_scale = self.kv_scale[0, attn_idx]
-                            module.v_scale = self.kv_scale[1, attn_idx]
+                            if is_eagle3_draft:
+                                eidx = eagle3_draft_layer_id - 1
+                                module.k_scale = self.eagle3_kv_scale[0, eidx]
+                                module.v_scale = self.eagle3_kv_scale[1, eidx]
+                            else:
+                                module.k_scale = self.kv_scale[0, attn_idx]
+                                module.v_scale = self.kv_scale[1, attn_idx]
 
                         k_scale = module.k_scale
                         v_scale = module.v_scale
@@ -1588,7 +1690,7 @@ class ModelRunner:
         bs = context.batch_size
         is_prefill = context.is_prefill
         positions = context.positions
-        if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
+        if is_prefill or self.enforce_eager or self.eagle3_mode or bs > self.graph_bs[-1]:
             # prefill[bs=1 tok=115 ctx=115]
             label = f"prefill[bs={bs}"
             if batch is not None:
@@ -1602,7 +1704,12 @@ class ModelRunner:
                 label += f" tok={batch.total_tokens_num} ctx={ctx_str}"
             label += "]"
             with record_function(label):
-                hidden_states = self.model(input_ids, positions)
+                model_output = self.model(input_ids, positions)
+                if isinstance(model_output, tuple):
+                    hidden_states, self._aux_hidden_states = model_output
+                else:
+                    hidden_states = model_output
+                    self._aux_hidden_states = None
                 logits = self.model.compute_logits(hidden_states)
         else:
             # decode[bs=128 tok=128 d=128]  or  decode[bs=128 tok=128 p=2 d=126 spec=3]
@@ -1776,11 +1883,18 @@ class ModelRunner:
             num_reject_tokens=num_reject_tokens,
             next_token_ids=next_token_ids,
             last_token_indices=last_token_indices,
+            aux_hidden_states=self._aux_hidden_states,
         )
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        if self.eagle3_mode:
+            self.graphs = {}
+            self.graph_logits = {}
+            self.graph_bs = [self.config.max_num_seqs]
+            logger.info("Skipping CUDA graph capture for Eagle3 mode")
+            return
         start_time = time.time()
         # self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         if self.config.compilation_config.cudagraph_capture_sizes:

@@ -45,6 +45,8 @@ class EngineArgs:
     enable_dp_attention: bool = False
     method: Optional[str] = None
     num_speculative_tokens: int = 1
+    draft_model: Optional[str] = None
+    eagle3_aux_layer_ids: Optional[str] = None
     mark_trace: bool = False
 
     @staticmethod
@@ -137,7 +139,7 @@ class EngineArgs:
             "--method",
             type=str,
             default=None,
-            choices=["mtp"],
+            choices=["mtp", "eagle3"],
             help="Speculative method",
         )
         parser.add_argument(
@@ -145,6 +147,18 @@ class EngineArgs:
             type=int,
             default=1,
             help="Number of speculative tokens to generate per iteration (draft model runs this many times autoregressively)",
+        )
+        parser.add_argument(
+            "--draft-model",
+            type=str,
+            default=None,
+            help="Path to external Eagle3 draft model. Required when --method eagle3.",
+        )
+        parser.add_argument(
+            "--eagle3-aux-layer-ids",
+            type=str,
+            default=None,
+            help="Comma-separated target model layer indices for aux hidden state collection, e.g. '1,29,57'.",
         )
         parser.add_argument(
             "--max-num-batched-tokens",
@@ -209,14 +223,28 @@ class EngineArgs:
             ),
         )
         if self.method:
-            kwargs["speculative_config"] = SpeculativeConfig(
-                method=kwargs.pop("method"),
-                model=self.model,
-                num_speculative_tokens=kwargs.pop("num_speculative_tokens"),
-            )
+            method = kwargs.pop("method")
+            num_spec_tokens = kwargs.pop("num_speculative_tokens")
+            draft_model = kwargs.pop("draft_model")
+            eagle3_aux_layer_ids = kwargs.pop("eagle3_aux_layer_ids")
+            if method == "eagle3":
+                kwargs["speculative_config"] = SpeculativeConfig(
+                    method=method,
+                    model=draft_model,
+                    num_speculative_tokens=num_spec_tokens,
+                    eagle3_aux_layer_ids_str=eagle3_aux_layer_ids,
+                )
+            else:
+                kwargs["speculative_config"] = SpeculativeConfig(
+                    method=method,
+                    model=self.model,
+                    num_speculative_tokens=num_spec_tokens,
+                )
         else:
             kwargs.pop("method")
             kwargs.pop("num_speculative_tokens")
+            kwargs.pop("draft_model")
+            kwargs.pop("eagle3_aux_layer_ids")
             kwargs["speculative_config"] = None
 
         return kwargs

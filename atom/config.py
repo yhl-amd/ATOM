@@ -685,14 +685,41 @@ class SpeculativeConfig:
     model: Optional[str] = None
     num_speculative_tokens: Optional[int] = None
     draft_model_hf_config: Optional[PretrainedConfig] = None
+    use_aux_hidden_state: bool = False
+    eagle3_aux_layer_ids: list[int] = field(default_factory=list)
+    eagle3_aux_layer_ids_str: Optional[str] = None
 
     def __post_init__(self):
         if self.draft_model_hf_config is None:
             self.draft_model_hf_config = AutoConfig.from_pretrained(self.model)
         self.hf_config_override(self.draft_model_hf_config)
 
+        if self.method == "eagle3":
+            if self.eagle3_aux_layer_ids_str:
+                self.eagle3_aux_layer_ids = [
+                    int(x) for x in self.eagle3_aux_layer_ids_str.split(",")
+                ]
+                self.use_aux_hidden_state = True
+            else:
+                eagle_cfg = getattr(
+                    self.draft_model_hf_config, "eagle_config", None
+                )
+                if eagle_cfg:
+                    self.use_aux_hidden_state = eagle_cfg.get(
+                        "use_aux_hidden_state", False
+                    )
+                    if self.use_aux_hidden_state and not self.eagle3_aux_layer_ids:
+                        self.eagle3_aux_layer_ids = eagle_cfg.get(
+                            "eagle_aux_hidden_state_layer_ids", []
+                        )
+
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
+        # Eagle3 architecture mapping
+        arch = (getattr(hf_config, "architectures", None) or [""])[0]
+        if arch == "LlamaForCausalLMEagle3":
+            hf_config.architectures = ["Eagle3LlamaModel"]
+
         if hf_config.model_type in ("deepseek_v3", "glm_moe_dsa"):
             hf_config.model_type = "deepseek_mtp"
         if hf_config.model_type == "qwen3_next":

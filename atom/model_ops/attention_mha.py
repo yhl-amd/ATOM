@@ -459,7 +459,7 @@ class PagedAttentionImpl(nn.Module):
         attn_metadata = fwd_ctx.attn_metadata
         sliding_window = (
             (self.sliding_window, 0, 0)
-            if self.sliding_window is not None
+            if self.sliding_window > 0
             else (-1, -1, 0)
         )
         o = aiter.flash_attn_varlen_func(
@@ -504,7 +504,7 @@ class PagedAttentionImpl(nn.Module):
         descale_shape = (attn_metadata.cu_seqlens_q.shape[0] - 1, k.shape[1])
         sliding_window = (
             (self.sliding_window - 1, 0)
-            if self.sliding_window is not None
+            if self.sliding_window > 0
             else (-1, -1)
         )
         unified_attention(
@@ -530,6 +530,93 @@ class PagedAttentionImpl(nn.Module):
 
         return o
 
+    @mark_trace(prefix="eagle3_decode_attention", torch_compile=False)
+    def eagle3_decode_attention(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+    ):
+        num_tokens = q.shape[0]
+        attn_metadata = fwd_ctx.attn_metadata
+        block_tables = attn_metadata.block_tables
+        bs = block_tables.shape[0]
+
+        # Multi-token pass (propose i=0 with spec decode tokens):
+        # q/k/v are fresh from this forward, use them directly with SDPA.
+        # attn_metadata.cu_seqlens_k is None in propose decode, so
+        # prefill_attention (flash_attn_varlen_func) cannot be used.
+        if num_tokens != bs:
+            seq_len = num_tokens // bs
+            q_sdpa = q.view(bs, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+            k_sdpa = k.view(bs, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v_sdpa = v.view(bs, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            num_groups = self.num_heads // self.num_kv_heads
+            if num_groups > 1:
+                k_sdpa = k_sdpa.repeat_interleave(num_groups, dim=1)
+                v_sdpa = v_sdpa.repeat_interleave(num_groups, dim=1)
+            o = torch.nn.functional.scaled_dot_product_attention(
+                q_sdpa, k_sdpa, v_sdpa, scale=self.scale, is_causal=True,
+            )
+            return o.transpose(1, 2).reshape(num_tokens, self.num_heads, self.head_dim)
+
+        max_ctx = block_tables.shape[1]
+        context_lens = attn_metadata.context_lens[:bs].clamp(max=max_ctx)
+
+        num_blocks = k_cache.shape[0]
+        # fused_qk_rope_reshape_and_cache stores:
+        #   K: [num_blocks, nh, hd//x, block_size, x]  (5-dim)
+        #   V: [num_blocks, nh, hd, block_size]         (4-dim)
+        # With block_size=1, reshape to [num_blocks, nh, hd].
+        if k_cache.dim() == 5:
+            k_flat = k_cache.permute(0, 1, 3, 2, 4).contiguous().view(
+                num_blocks, self.num_kv_heads, self.head_dim
+            )
+        else:
+            k_flat = k_cache.contiguous().view(
+                num_blocks, self.num_kv_heads, self.head_dim
+            )
+        if v_cache.dim() == 4:
+            v_flat = v_cache.permute(0, 1, 3, 2).contiguous().view(
+                num_blocks, self.num_kv_heads, self.head_dim
+            )
+        else:
+            v_flat = v_cache.contiguous().view(
+                num_blocks, self.num_kv_heads, self.head_dim
+            )
+
+        gather_idx = block_tables.long()
+        k_gathered = k_flat[gather_idx]
+        v_gathered = v_flat[gather_idx]
+
+        if self.kv_cache_dtype.startswith("fp8"):
+            k_gathered = k_gathered.to(q.dtype) * k_scale
+            v_gathered = v_gathered.to(q.dtype) * v_scale
+        else:
+            k_gathered = k_gathered.to(q.dtype)
+            v_gathered = v_gathered.to(q.dtype)
+
+        q_sdpa = q.view(bs, self.num_heads, self.head_dim).unsqueeze(2)
+        k_sdpa = k_gathered.transpose(1, 2)
+        v_sdpa = v_gathered.transpose(1, 2)
+
+        num_groups = self.num_heads // self.num_kv_heads
+        if num_groups > 1:
+            k_sdpa = k_sdpa.repeat_interleave(num_groups, dim=1)
+            v_sdpa = v_sdpa.repeat_interleave(num_groups, dim=1)
+
+        pad_mask = (
+            torch.arange(max_ctx, device=q.device).unsqueeze(0)
+            < context_lens.unsqueeze(1)
+        )
+        attn_mask = pad_mask.unsqueeze(1).unsqueeze(2)
+
+        o = torch.nn.functional.scaled_dot_product_attention(
+            q_sdpa, k_sdpa, v_sdpa,
+            attn_mask=attn_mask,
+            scale=self.scale,
+        )
+
+        o = o.squeeze(2)
+        return o
+
     def dispatch_backend(self, fwd_ctx: ForwardContext):
 
         ctx = fwd_ctx.context
@@ -538,6 +625,8 @@ class PagedAttentionImpl(nn.Module):
             return self.prefill_attention
         else:
             if self.use_triton_attn:
+                if self.sliding_window == 0:
+                    return self.eagle3_decode_attention
                 return self.paged_attention_triton
             else:
                 # Only use pa persistent when block_size == 1024
