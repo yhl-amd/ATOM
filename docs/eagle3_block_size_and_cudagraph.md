@@ -61,21 +61,43 @@ Phase 1 初版导致 Eagle3 KV cache 16 倍超额分配。原因：
 
 ---
 
-## 3. Phase 2 计划：启用 Eagle3 CUDAGraph
+## 3. Phase 2：启用 Eagle3 CUDAGraph（target model）
 
-**状态**：待实施（依赖 Phase 1 验证通过）
+**状态**：已完成
 
-Phase 1 消除了 cudagraph 的所有阻塞因素：SDPA fallback 已删除、`.item()` 同步已删除、动态 `torch.zeros` 已删除、i=0 多 token 分支已消除。
+### 背景
 
-### 计划步骤
+MTP 的 cudagraph 仅覆盖 target model（drafter 始终 eager），Eagle3 被两处 `eagle3_mode` 检查硬编码跳过，导致 target model 也走 eager，性能白白损失。
 
-1. **预分配 drafter buffer**：`draft_input_ids`、`draft_positions`、`draft_hidden_states` 按 `max_bs` 预分配
-2. **i=0 走 eager，i>=1 走 cudagraph replay**：drafter 只捕获 `max_q_len=1` 的图，按 `graph_bs` 建若干张
-3. **移除 target model 的 eagle3_mode cudagraph 跳过**：删除 `capture_cudagraph()` 的 `if self.eagle3_mode: return` 和 `run_model` 的 `or self.eagle3_mode`
-4. **drafter 保持 `NO_COMPILATION`**：cudagraph 捕获 eager forward，后续可选 piecewise compile
+### 改动要点
+
+| 改动 | 说明 |
+|---|---|
+| 删除 `capture_cudagraph()` 的 `eagle3_mode` 跳过 | 原先直接 return 空 graphs，现在正常捕获 |
+| 删除 `run_model()` 的 `eagle3_mode` eager 强制 | 原先 `or self.eagle3_mode` 阻止走 graph replay |
+| `capture_cudagraph()` 处理 tuple 返回值 | Eagle3 开启 `aux_hidden_state` 后 model forward 返回 `(hidden_states, aux_hidden_states)` 元组，需拆开赋值 |
+| 新增 `graph_aux_hidden` 字典 | 按 `(graph_bs, max_q_len)` 保存 graph capture 内的 aux tensor 引用，replay 后原地更新 |
+| `run_model()` replay 后恢复 `_aux_hidden_states` | 从 `graph_aux_hidden` 取出 aux 供 Eagle3 drafter 使用 |
+
+### tuple 返回值问题
+
+MTP 不用 `aux_hidden_states`，model forward 返回单个 tensor，直接 `outputs[:] = self.model(...)` 即可。Eagle3 配置了 `eagle3_aux_layer_ids`（layer 1, 29, 57），model forward 返回 `(hidden_states, [aux1, aux2, aux3])`，直接赋值报 `TypeError: can't assign a tuple to a torch.cuda.BFloat16Tensor`。
+
+修复：warmup 和 graph capture 中用 `isinstance(model_output, tuple)` 拆包。`isinstance` 是类型检查而非数据依赖分支，model 返回类型在 capture 时已确定，不影响 cudagraph 捕获。
+
+### 待验证
+
+- [ ] 去掉 `--enforce-eager` 后 cudagraph capture 成功
+- [ ] decode 阶段走 graph replay（日志中应出现 `decode[...]` 而非 `prefill[...]`）
+- [ ] Eagle3 drafter 在 graph replay 后能正确拿到 `_aux_hidden_states`
+- [ ] 与 `--enforce-eager` 对比输出一致性和性能提升
+
+### 后续可选
+
+- **drafter cudagraph**：MTP 的 drafter 也是 eager，可独立实现（预分配 buffer + 按 graph_bs 捕获）
+- **drafter torch.compile**：将 `NO_COMPILATION` 提升到 `PIECEWISE`（需解决 KV 绑定与 Dynamo 时序问题）
 
 ### 风险
 
-- Phase 1 风险低：block_size 值替换 + dispatch 简化，MTP 和 target model 路径不受影响
-- Phase 2 风险中等：cudagraph 捕获涉及固定输入形状、graph pool 管理。回退方案：`--enforce-eager`
+- 回退方案：`--enforce-eager` 恢复全 eager
 - 显存影响可忽略：Eagle3 只有 1 层 + GQA=1，以 10K blocks、bf16 计算增量约 3.6 MB

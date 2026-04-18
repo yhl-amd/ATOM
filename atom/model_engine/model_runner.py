@@ -1711,7 +1711,7 @@ class ModelRunner:
         bs = context.batch_size
         is_prefill = context.is_prefill
         positions = context.positions
-        if is_prefill or self.enforce_eager or self.eagle3_mode or bs > self.graph_bs[-1]:
+        if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
             # prefill[bs=1 tok=115 ctx=115]
             label = f"prefill[bs={bs}"
             if batch is not None:
@@ -1750,6 +1750,10 @@ class ModelRunner:
                 self.graphs[graph_key].replay()
                 num_tokens = context.batch_size * max_q_len
                 hidden_states = self.forward_vars["outputs"][:num_tokens]
+                if graph_key in self.graph_aux_hidden:
+                    self._aux_hidden_states = self.graph_aux_hidden[graph_key]
+                else:
+                    self._aux_hidden_states = None
                 if self.logits_in_graph:
                     logits = self.graph_logits[graph_key][:num_tokens]
                 else:
@@ -1910,12 +1914,6 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
-        if self.eagle3_mode:
-            self.graphs = {}
-            self.graph_logits = {}
-            self.graph_bs = [self.config.max_num_seqs]
-            logger.info("Skipping CUDA graph capture for Eagle3 mode")
-            return
         start_time = time.time()
         # self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         if self.config.compilation_config.cudagraph_capture_sizes:
@@ -1941,6 +1939,7 @@ class ModelRunner:
 
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
         self.graph_logits: dict[tuple[int, int], torch.Tensor] = dict()
+        self.graph_aux_hidden: dict[tuple[int, int], list[torch.Tensor]] = dict()
         self.graph_pool = None
         self.logits_in_graph = self.world_size == 1
 
@@ -1980,9 +1979,13 @@ class ModelRunner:
                 )
 
                 # Warmup
-                outputs[:num_tokens] = self.model(
+                model_output = self.model(
                     input_ids[:num_tokens], positions[:num_tokens]
                 )
+                if isinstance(model_output, tuple):
+                    outputs[:num_tokens] = model_output[0]
+                else:
+                    outputs[:num_tokens] = model_output
                 if self.logits_in_graph:
                     self.model.compute_logits(outputs[:num_tokens])
 
@@ -1995,9 +1998,15 @@ class ModelRunner:
                     else nullcontext()
                 ):
                     with torch.cuda.graph(graph, self.graph_pool, stream=gc.stream):
-                        outputs[:num_tokens] = self.model(
+                        model_output = self.model(
                             input_ids[:num_tokens], positions[:num_tokens]
                         )
+                        if isinstance(model_output, tuple):
+                            outputs[:num_tokens] = model_output[0]
+                            graph_aux = model_output[1]
+                        else:
+                            outputs[:num_tokens] = model_output
+                            graph_aux = None
                         if self.logits_in_graph:
                             graph_logits = self.model.compute_logits(
                                 outputs[:num_tokens]
@@ -2007,6 +2016,8 @@ class ModelRunner:
                 self.graphs[(bs, max_q_len)] = graph
                 if self.logits_in_graph:
                     self.graph_logits[(bs, max_q_len)] = graph_logits
+                if graph_aux is not None:
+                    self.graph_aux_hidden[(bs, max_q_len)] = graph_aux
                 torch.cuda.synchronize()
         self.graph_bs.sort(reverse=False)
 
