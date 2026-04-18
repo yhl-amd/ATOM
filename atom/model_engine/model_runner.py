@@ -1033,6 +1033,10 @@ class ModelRunner:
             # Eagle3 draft layer uses separate non-MLA KV cache
             if getattr(self, "eagle3_mode", False) and hasattr(self, "drafter"):
                 draft_hf = self.config.speculative_config.draft_model_hf_config
+                if getattr(draft_hf, "kv_lora_rank", None):
+                    raise NotImplementedError(
+                        "Eagle3 draft model with MLA attention is not supported"
+                    )
                 draft_num_kv_heads = draft_hf.num_key_value_heads // self.world_size
                 draft_num_layers = draft_hf.num_hidden_layers
                 block_bytes += (
@@ -1211,6 +1215,10 @@ class ModelRunner:
             if getattr(self, "eagle3_mode", False):
                 # Eagle3 draft uses standard full-attention (not MLA), so its
                 # layers get a separate KV cache below — don't add them here.
+                if getattr(draft_hf_config, "kv_lora_rank", None):
+                    raise NotImplementedError(
+                        "Eagle3 draft model with MLA attention is not supported"
+                    )
                 num_draft_layers = draft_hf_config.num_hidden_layers
                 logger.info(
                     f"Allocating KV cache for {hf_config.num_hidden_layers} MLA target layers + "
@@ -1250,6 +1258,10 @@ class ModelRunner:
             # Allocate separate non-MLA KV cache for Eagle3 draft layer(s)
             if getattr(self, "eagle3_mode", False) and hasattr(self, "drafter"):
                 draft_hf = self.config.speculative_config.draft_model_hf_config
+                if getattr(draft_hf, "kv_lora_rank", None):
+                    raise NotImplementedError(
+                        "Eagle3 draft model with MLA attention is not supported"
+                    )
                 eagle3_num_kv_heads = draft_hf.num_key_value_heads // self.world_size
                 self.eagle3_kv_cache = torch.zeros(
                     2,

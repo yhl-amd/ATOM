@@ -690,6 +690,12 @@ class SpeculativeConfig:
     eagle3_aux_layer_ids_str: Optional[str] = None
 
     def __post_init__(self):
+        if self.eagle3_aux_layer_ids_str and self.method != "eagle3":
+            raise ValueError(
+                "--eagle3-aux-layer-ids requires --method eagle3, "
+                f"but got method={self.method!r}"
+            )
+
         if self.draft_model_hf_config is None:
             self.draft_model_hf_config = AutoConfig.from_pretrained(self.model)
         self.hf_config_override(self.draft_model_hf_config)
