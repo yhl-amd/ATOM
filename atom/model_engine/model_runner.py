@@ -554,6 +554,8 @@ class ModelRunner:
             self.config.speculative_config is not None
             and self.config.speculative_config.method == "eagle3"
         )
+        if self.eagle3_mode:
+            self.eagle3_block_size = 1024 if self.block_size == 1024 else 16
         self._aux_hidden_states = None
         self.num_spec_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
         self.tokenID_processor = tokenIDProcessor(
@@ -1042,11 +1044,17 @@ class ModelRunner:
                 block_bytes += (
                     2
                     * draft_num_layers
-                    * self.block_size
                     * draft_num_kv_heads
                     * draft_hf.head_dim
                     * kv_dtype_size
                 )
+                if config.kv_cache_dtype == "fp8":
+                    block_bytes += (
+                        2
+                        * draft_num_layers
+                        * draft_num_kv_heads
+                        * 4  # float32
+                    )
         elif self.is_qwen_next():
             self.full_attention_interval = hf_config.full_attention_interval
             self.num_full_attn = (
@@ -1263,11 +1271,12 @@ class ModelRunner:
                         "Eagle3 draft model with MLA attention is not supported"
                     )
                 eagle3_num_kv_heads = draft_hf.num_key_value_heads // self.world_size
+                self.eagle3_num_blocks = self.num_physical_kvcache_blocks // self.eagle3_block_size
                 self.eagle3_kv_cache = torch.zeros(
                     2,
                     draft_hf.num_hidden_layers,
-                    self.num_physical_kvcache_blocks,
-                    self.physical_block_size,
+                    self.eagle3_num_blocks,
+                    self.eagle3_block_size,
                     eagle3_num_kv_heads,
                     draft_hf.head_dim,
                     dtype=dtypes.d_dtypes[config.kv_cache_dtype],
@@ -1276,9 +1285,9 @@ class ModelRunner:
                 self.eagle3_kv_scale = torch.zeros(
                     2,
                     draft_hf.num_hidden_layers,
-                    self.num_physical_kvcache_blocks,
+                    self.eagle3_num_blocks,
                     eagle3_num_kv_heads,
-                    self.physical_block_size,
+                    self.eagle3_block_size,
                     dtype=dtypes.fp32,
                     device="cuda",
                 )
@@ -1385,17 +1394,17 @@ class ModelRunner:
                             draft_head_dim = draft_hf.head_dim
                             draft_x = 16 // self.eagle3_kv_cache.element_size()
                             k_cache = self.eagle3_kv_cache[0, eagle3_draft_layer_id].view(
-                                self.num_physical_kvcache_blocks,
+                                self.eagle3_num_blocks,
                                 draft_num_kv_heads,
                                 draft_head_dim // draft_x,
-                                self.physical_block_size,
+                                self.eagle3_block_size,
                                 draft_x,
                             )
                             v_cache = self.eagle3_kv_cache[1, eagle3_draft_layer_id].view(
-                                self.num_physical_kvcache_blocks,
+                                self.eagle3_num_blocks,
                                 draft_num_kv_heads,
                                 draft_head_dim,
-                                self.physical_block_size,
+                                self.eagle3_block_size,
                             )
                             eagle3_draft_layer_id += 1
                         else:

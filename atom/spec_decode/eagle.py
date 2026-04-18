@@ -175,8 +175,12 @@ class EagleProposer:
         draft_token_ids = torch.empty(
             bs, self.mtp_k, dtype=next_token_ids.dtype, device=next_token_ids.device
         )
-        # return draft_token_ids.fill_(1) # for debug
         var = self.runner.forward_vars
+
+        if self.speculative_config.method == "eagle3":
+            attn_metadata.block_tables = var["block_tables"].gpu[:bs]
+            attn_metadata.context_lens = var["context_lens"].gpu[:bs].clone()
+
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
                 ret_hidden_states = self.model(
@@ -219,26 +223,6 @@ class EagleProposer:
                         positions = torch.gather(positions, 0, last_token_indices)
                         context.is_prefill = False
 
-                        # Eagle3 MHA decode needs block_tables and context_lens
-                        # (MLA uses kv_indptr/kv_indices instead).
-                        if self.speculative_config.method == "eagle3":
-                            num_blocks_per_seq = kv_indptr[1 : bs + 1] - kv_indptr[:bs]
-                            max_num_blocks = int(num_blocks_per_seq.max().item())
-                            block_tables = torch.zeros(
-                                bs, max_num_blocks,
-                                dtype=torch.int32, device=kv_indices.device,
-                            )
-                            offsets = kv_indptr[:bs]
-                            for s in range(bs):
-                                nb = int(num_blocks_per_seq[s].item())
-                                st = int(offsets[s].item())
-                                block_tables[s, :nb] = kv_indices[st : st + nb].to(torch.int32)
-                            attn_metadata.block_tables = block_tables
-                            attn_metadata.context_lens = (
-                                (num_blocks_per_seq - 1) * self.block_size
-                                + kv_last_page_lens[:bs]
-                            ).to(torch.int32)
-
                     # update metadata
                     attn_metadata.max_seqlen_k += 1
                     workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
@@ -256,26 +240,8 @@ class EagleProposer:
                         attn_metadata.__dict__[k] = v
                     slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
 
-                    # Eagle3: update block_tables / context_lens after kv_indptr changes
                     if self.speculative_config.method == "eagle3":
                         attn_metadata.context_lens = attn_metadata.context_lens + 1
-                        nbs = kv_indptr[1 : bs + 1] - kv_indptr[:bs]
-                        new_max = int(nbs.max().item())
-                        if new_max > attn_metadata.block_tables.shape[1]:
-                            new_bt = torch.zeros(
-                                bs, new_max,
-                                dtype=torch.int32, device=kv_indices.device,
-                            )
-                            new_bt[:, : attn_metadata.block_tables.shape[1]] = (
-                                attn_metadata.block_tables
-                            )
-                            attn_metadata.block_tables = new_bt
-                        for s in range(bs):
-                            nb = int(nbs[s].item())
-                            st = int(kv_indptr[s].item())
-                            attn_metadata.block_tables[s, :nb] = kv_indices[
-                                st : st + nb
-                            ].to(torch.int32)
 
                     input_ids = new_draft_ids
                     positions += 1
