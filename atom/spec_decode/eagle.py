@@ -180,6 +180,7 @@ class EagleProposer:
         if self.speculative_config.method == "eagle3":
             attn_metadata.block_tables = var["block_tables"].gpu[:bs]
             attn_metadata.context_lens = var["context_lens"].gpu[:bs].clone()
+            attn_metadata.slot_mapping = var["slot_mapping"].gpu[:len(input_ids)]
 
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):

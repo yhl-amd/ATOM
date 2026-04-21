@@ -1783,7 +1783,10 @@ class ModelRunner:
                 num_tokens = context.batch_size * max_q_len
                 hidden_states = self.forward_vars["outputs"][:num_tokens]
                 if graph_key in self.graph_aux_hidden:
-                    self._aux_hidden_states = self.graph_aux_hidden[graph_key]
+                    self._aux_hidden_states = [
+                        aux[:num_tokens]
+                        for aux in self.graph_aux_hidden[graph_key]
+                    ]
                 else:
                     self._aux_hidden_states = None
                 if self.logits_in_graph:
