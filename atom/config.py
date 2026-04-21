@@ -718,6 +718,8 @@ class SpeculativeConfig:
                         self.eagle3_aux_layer_ids = eagle_cfg.get(
                             "eagle_aux_hidden_state_layer_ids", []
                         )
+                else:
+                    self.use_aux_hidden_state = True
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:

@@ -327,11 +327,19 @@ class LinearBase(nn.Module):
         loaded_weight: torch.Tensor,
         post_process_func: Callable = lambda a: a,
     ):
-        if (
-            param.data.dtype != loaded_weight.dtype
-            and param.data.element_size() == loaded_weight.element_size()
-        ):
-            param.data = param.data.view(loaded_weight.dtype)
+        if param.data.dtype != loaded_weight.dtype:
+            if param.data.element_size() == loaded_weight.element_size():
+                # Same byte-width: use view for raw-bit-compatible pairs
+                # (e.g. fp8 variants) but convert for semantically different
+                # formats (float16 ↔ bfloat16) where bit reinterpretation
+                # would corrupt values.
+                incompatible = {torch.float16, torch.bfloat16}
+                if {param.data.dtype, loaded_weight.dtype} == incompatible:
+                    loaded_weight = loaded_weight.to(param.data.dtype)
+                else:
+                    param.data = param.data.view(loaded_weight.dtype)
+            else:
+                loaded_weight = loaded_weight.to(param.data.dtype)
         loaded_weight = post_process_func(loaded_weight)
         if (
             loaded_weight.shape != param.data.shape
