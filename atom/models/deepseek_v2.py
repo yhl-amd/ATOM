@@ -2011,7 +2011,7 @@ class DeepseekV2ForCausalLM(nn.Module):
 
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         num_layers = len(self.model.layers)
-        return (1, num_layers // 2 - 1, num_layers - 4)
+        return (2, num_layers // 2, num_layers - 3)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

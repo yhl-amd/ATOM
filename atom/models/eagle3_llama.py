@@ -292,21 +292,12 @@ class Eagle3LlamaModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        """Forward pass of the Eagle3 draft model.
-
-        Args:
-            input_ids: [N] token IDs
-            positions: [N] position indices
-            hidden_states: [N, hidden_size] (already projected through fc)
-
-        Returns:
-            [N, hidden_size] output hidden states
-        """
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         embeds = self.embed_tokens(input_ids)
         hidden_states, _ = self.midlayer(positions, embeds, hidden_states)
+        hidden_states_prenorm = hidden_states
         hidden_states = self.norm(hidden_states)
-        return hidden_states
+        return hidden_states, hidden_states_prenorm
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)

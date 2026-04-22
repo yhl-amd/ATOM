@@ -182,13 +182,21 @@ class EagleProposer:
             attn_metadata.context_lens = var["context_lens"].gpu[:bs].clone()
             attn_metadata.slot_mapping = var["slot_mapping"].gpu[:len(input_ids)]
 
+        is_eagle3 = self.speculative_config.method == "eagle3"
+
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
-                ret_hidden_states = self.model(
+                model_output = self.model(
                     input_ids=input_ids,
                     positions=positions,
                     hidden_states=hidden_states,
                 )
+                if is_eagle3:
+                    ret_hidden_states, ret_hidden_prenorm = model_output
+                else:
+                    ret_hidden_states = model_output
+                    ret_hidden_prenorm = None
+
                 sample_hidden_states = (
                     torch.index_select(ret_hidden_states, 0, last_token_indices)
                     if i == 0
@@ -241,12 +249,19 @@ class EagleProposer:
                         attn_metadata.__dict__[k] = v
                     slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
 
-                    if self.speculative_config.method == "eagle3":
+                    if is_eagle3:
                         attn_metadata.context_lens = attn_metadata.context_lens + 1
 
                     input_ids = new_draft_ids
                     positions += 1
-                    hidden_states = sample_hidden_states
+                    if ret_hidden_prenorm is not None:
+                        hidden_states = (
+                            torch.index_select(ret_hidden_prenorm, 0, last_token_indices)
+                            if i == 0
+                            else ret_hidden_prenorm
+                        )
+                    else:
+                        hidden_states = sample_hidden_states
 
         # self.runner.debug(f"final {draft_token_ids=}")
         # [batch_size, mtp_k]
