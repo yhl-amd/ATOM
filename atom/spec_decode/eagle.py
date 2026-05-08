@@ -401,10 +401,14 @@ class EagleProposer:
                         if target_uses_mla:
                             kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
                             attn_metadata.kv_last_page_lens = kv_last_page_lens
-                        if not target_uses_mla or draft_uses_mha:
-                            # MHA drafts needs to update by itself, as MLA target wouldn't handle it but MHA target does.
-                            attn_metadata.block_tables = var["block_tables"].gpu[:bs]
-                            attn_metadata.context_lens = var["context_lens"].gpu[:bs]
+                        # block_tables, context_lens, and sparse_kv_indptr are
+                        # needed by both MHA and MLA+sparse attention
+                        attn_metadata.block_tables = var["block_tables"].gpu[:bs]
+                        attn_metadata.context_lens = var["context_lens"].gpu[:bs]
+                        if "sparse_kv_indptr" in var:
+                            attn_metadata.sparse_kv_indptr = var[
+                                "sparse_kv_indptr"
+                            ].gpu[: bs + 1]
                         cu_seqlens_q[: bs + 1] = self.arrange_bs[: bs + 1]
                         if target_uses_mla:
                             # MLA: block_size=1, kv_indptr tracks tokens
@@ -416,9 +420,9 @@ class EagleProposer:
 
                     # update metadata
                     attn_metadata.max_seqlen_k += 1
-                    # MHA drafts needs to update by itself, as MLA wouldn't handle it
-                    if draft_uses_mha or not target_uses_mla:
-                        attn_metadata.context_lens[:bs] += 1
+                    # Update context_lens for each draft step (needed by both
+                    # MHA attention and MLA+sparse indexer)
+                    attn_metadata.context_lens[:bs] += 1
                     workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
                         bs,
                         (
