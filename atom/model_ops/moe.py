@@ -13,13 +13,14 @@ from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+from aiter.ops.shuffle import shuffle_weight, shuffle_scale
 from aiter.utility import fp4_utils
 from atom.config import (
     Config,
     QuantizationConfig,
     get_current_atom_config,
 )
+from aiter.ops.flydsl.moe_common import GateMode
 from atom.quant_spec import LayerQuantConfig
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
@@ -681,6 +682,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.quant_dtype = quant_config.quant_dtype
         self.quant_method = quant_config.quant_method or ""
         self.static_input_scales = not quant_config.is_dynamic
+        self.is_guinterleave = envs.ATOM_MOE_GU_ITLV
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
@@ -856,40 +858,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w13_weight_scale = None
             layer.w2_weight_scale = None
             return
-        elif layer.activation == ActivationType.Swiglu:
-            e, n, k = layer.w13_weight.shape
-            layer.w13_weight.view(torch.uint8).copy_(
-                layer.w13_weight.data.view(torch.uint8)
-                .view(e, n // 2, 2, k)
-                .permute(0, 2, 1, 3)
-                .contiguous()
-                .view(e, n, k)
-            )
-            layer.w13_weight_scale.data = (
-                layer.w13_weight_scale.data.view(e, n // 2, 2, -1)
-                .permute(0, 2, 1, 3)
-                .contiguous()
-                .view(e, n, -1)
-            )
-            layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
-            shuffled_w13_scale = shuffle_scale_a16w4(
-                layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
-                self.num_experts,
-                True,
-            )
-            layer.w2_weight.data = shuffle_weight_a16w4(layer.w2_weight, 16, False)
-            shuffled_w2_scale = shuffle_scale_a16w4(
-                layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
-                self.num_experts,
-                False,
-            )
-            if layer.w13_bias is not None:
-                layer.w13_bias.data = (
-                    layer.w13_bias.data.view(-1, n // 2, 2)
-                    .permute(0, 2, 1)
-                    .contiguous()
-                    .view(-1, n)
-                )
+
         # quark method for moe, split it out?
         elif self.quant_method == "quark":
             shuffle_weights(layer.w13_weight, layer.w2_weight)
@@ -904,12 +873,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
             return
         else:
-            shuffle_weights(layer.w13_weight, layer.w2_weight)
-            shuffled_w13_scale = fp4_utils.e8m0_shuffle(
-                layer.w13_weight_scale.view(self.num_experts, -1)
+            # shuffle weight
+            layer.w13_weight.data = shuffle_weight(
+                layer.w13_weight,
+                is_guinterleave=self.is_guinterleave,
+                gate_up=True,
             )
-            shuffled_w2_scale = fp4_utils.e8m0_shuffle(
-                layer.w2_weight_scale.view(self.num_experts, -1)
+            layer.w2_weight.data = shuffle_weight(
+                layer.w2_weight,
+                is_guinterleave=self.is_guinterleave,
+                gate_up=False,
+            )
+
+            # shuffle scale
+            if self.is_guinterleave:
+                w13_scale_2d = layer.w13_weight_scale.view(
+                    -1, layer.w13_weight_scale.shape[-1]
+                )
+                w2_scale_2d = layer.w2_weight_scale.view(
+                    -1, layer.w2_weight_scale.shape[-1]
+                )
+            else:
+                w13_scale_2d = layer.w13_weight_scale.view(self.num_experts, -1)
+                w2_scale_2d = layer.w2_weight_scale.view(self.num_experts, -1)
+
+            shuffled_w13_scale = shuffle_scale(
+                w13_scale_2d, self.num_experts, self.is_guinterleave, True
+            )
+            shuffled_w2_scale = shuffle_scale(
+                w2_scale_2d, self.num_experts, self.is_guinterleave, False
             )
 
         layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
@@ -1070,6 +1062,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_pad=self.intermediate_pad,
                 bias1=layer.w13_bias,
                 bias2=layer.w2_bias,
+                swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+                gate_mode=(
+                    GateMode.INTERLEAVE.value
+                    if self.is_guinterleave
+                    else GateMode.SEPARATED.value
+                ),
             )
         return self.fused_experts(
             hidden_states=x,
@@ -1096,7 +1094,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
 # Refer to CompressedTensorsW8A8Fp8MoEMethod in vllm
 class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
-
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
         self.quant_config = quant_config
@@ -1294,12 +1291,14 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         w2_input_scale = getattr(layer, "w2_input_scale", None)
 
         if self.need_normalize_e4m3fn_to_e4m3fnuz:
-            w13.data, w13_scale.data, w13_input_scale_data = (
-                normalize_e4m3fn_to_e4m3fnuz(
-                    w13.data,
-                    w13_scale.data,
-                    w13_input_scale.data if w13_input_scale is not None else None,
-                )
+            (
+                w13.data,
+                w13_scale.data,
+                w13_input_scale_data,
+            ) = normalize_e4m3fn_to_e4m3fnuz(
+                w13.data,
+                w13_scale.data,
+                w13_input_scale.data if w13_input_scale is not None else None,
             )
             if w13_input_scale is not None and w13_input_scale_data is not None:
                 w13_input_scale.data = w13_input_scale_data
@@ -1731,9 +1730,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w13_weight_scale[expert_id][shard_id],
                 )
                 quant_func = get_hip_quant(self.quant_type)
-                layer.w13_weight[expert_id][start : start + shard_size, :], _ = (
-                    quant_func(dq_weight, max_w13_scales[expert_id])
-                )
+                (
+                    layer.w13_weight[expert_id][start : start + shard_size, :],
+                    _,
+                ) = quant_func(dq_weight, max_w13_scales[expert_id])
                 start += shard_size
 
         shuffle_weights(layer.w13_weight, layer.w2_weight)
