@@ -33,10 +33,15 @@ from aiter import (
     cp_gather_indexer_k_quant_cache,
     dtypes,
     get_hip_quant,
+    silu_and_mul as aiter_silu_and_mul,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
-from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.dist.communication_op import (
+    tensor_model_parallel_all_reduce,
+)
+from aiter.dist.parallel_state import (
+    get_tensor_model_parallel_world_size,
+)
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
@@ -48,7 +53,7 @@ from atom.config import (
     get_current_atom_config,
 )
 from atom.model_loader.loader import WeightsMapper
-from atom.model_ops.embed_head import VocabParallelEmbedding
+from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import DualRMSNorm, RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.linear import (
@@ -769,12 +774,14 @@ class Compressor(nn.Module):
         d = self.head_dim
         rd = self.rope_head_dim
 
-        # Single fused BF16 GEMM via tgemm; otype=fp32 keeps softmax-pool
-        # accumulator in fp32. torch.split returns zero-copy strided views;
-        # downstream kernels (fused_compress_attn, update_compressor_states)
-        # accept strided kv/score (only inner stride must be 1).
+        # Single fused BF16 GEMM via tgemm. (Probing whether dropping the
+        # otype=fp32 upcast — relying on fused_compress_attn's internal fp32
+        # accumulator instead — is accuracy-neutral.) torch.split returns
+        # zero-copy strided views; downstream kernels (fused_compress_attn,
+        # update_compressor_states) accept strided kv/score (only inner
+        # stride must be 1).
         coff_d = (1 + overlap) * d
-        combined = self.wkv_gate(x, otype=torch.float32)
+        combined = self.wkv_gate(x)
         kv, score = torch.split(combined, [coff_d, coff_d], dim=-1)
 
         # ====== Unified fused kernel path (CSA + Indexer) ======
@@ -920,8 +927,11 @@ class Indexer(nn.Module):
     def forward_batched(
         self,
         x_full: torch.Tensor,  # [total_tokens, dim]
-        qr_full: torch.Tensor,  # [total_tokens, q_lora_rank]
+        qr_full: torch.Tensor,  # [total_tokens, q_lora_rank] — fp8 when qr_full_scale given
         positions: torch.Tensor,  # [total_tokens]
+        qr_full_scale: Optional[
+            torch.Tensor
+        ] = None,  # per_1x128 scale paired with qr_full
     ) -> torch.Tensor:
         """Q proj + RoPE + FP8-quant + weights compute (have module state),
         then dispatch to `torch.ops.aiter.indexer_score_topk`, which calls
@@ -946,7 +956,9 @@ class Indexer(nn.Module):
         # Q proj + RoPE + rotate (batched). rotary_emb internally reshapes
         # to (1, num_tokens, -1, rotary_dim) so the input doesn't need an
         # explicit batch dim. rotate_activation is last-dim-only.
-        q = self.wq_b(qr_full).view(total_tokens, self.n_heads, self.head_dim)
+        q = self.wq_b(qr_full, x_scale=qr_full_scale).view(
+            total_tokens, self.n_heads, self.head_dim
+        )
         # self.rotary_emb(positions, q[..., -rd:])
         # q = rotate_activation(q)
         cos, sin = self.rotary_emb._caches(q.device)
@@ -1235,7 +1247,16 @@ class DeepseekV4Attention(nn.Module):
             quant_config=qc,
             prefix=f"{p}.wqkv_a",
         )
-        self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
+        # Fuse q_norm + per_1x128 FP8 quant: kernel emits (qr_fp8, qr_scale)
+        # in one launch, both wq_b consumers (outer ColumnParallel + Indexer
+        # ReplicatedLinear) skip their own input quant.
+        self.q_norm = RMSNorm(
+            self.q_lora_rank,
+            self.eps,
+            fused_quant=True,
+            quant_config=qc,
+            prefix=f"{p}.q_norm",
+        )
         # q_norm2: per-head Q normalization. The checkpoint has no
         # `q_norm2.weight` entry, so the module is constructed with
         # `weight=None` (no learnable Parameter) — `DualRMSNorm` reads the
@@ -1451,15 +1472,17 @@ class DeepseekV4Attention(nn.Module):
         # Single fused FP8 GEMM for [wq_a; wkv]; torch.split returns zero-copy views.
         qkv_a = self.wqkv_a(x)
         q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
-        qr = self.q_norm(q_lora)  # [num_tokens, q_lora_rank]  shared with Indexer
-        if _V4_FORCE_UE8M0_QUANT:
-            qr = qr.clone()
-            act_quant_inplace(qr, 128, "ue8m0")
+        # q_norm is fused-quant: returns (qr_fp8, qr_scale) — shared by
+        # outer wq_b and Indexer.wq_b, both per_1x128 FP8 GEMMs.
+        assert (
+            not _V4_FORCE_UE8M0_QUANT
+        ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
+        qr, qr_scale = self.q_norm(q_lora)
         # Flat q_flat is [num_tokens, n_local_heads * head_dim]; DualRMSNorm
         # views internally to per-head shape and returns flat. Single Triton
         # launch fuses per-head Q RMSNorm (weightless) + KV RMSNorm (both
         # head_dim=128), replacing the prior `_rmsnorm_nw + kv_norm` pair.
-        q_flat = self.wq_b(qr)
+        q_flat = self.wq_b(qr, x_scale=qr_scale)
         q_flat, kv = self.qk_norm(q_flat, kv_pre)
         q = q_flat.view(num_tokens, self.n_local_heads, self.head_dim)
         # q [S, H, D] / kv [S, head_dim] — rotary_emb internally unsqueezes
@@ -1513,6 +1536,7 @@ class DeepseekV4Attention(nn.Module):
             indexer_topk_batched = self.indexer.forward_batched(
                 x_full=x,
                 qr_full=qr,
+                qr_full_scale=qr_scale,
                 positions=positions,
             )  # raw seq-local [T, index_topk] int32, -1 sentinels in tail cols
             # Translate seq-local topk → physical paged offsets and write into
@@ -1720,7 +1744,6 @@ class Expert(nn.Module):
         x: torch.Tensor,  # [num_tokens, dim]
         weights: Optional[torch.Tensor] = None,  # [num_tokens, 1]  optional gate
     ) -> torch.Tensor:  # [num_tokens, dim]
-        from aiter import silu_and_mul as aiter_silu_and_mul
 
         dtype = x.dtype
         # Single fused GEMM. Layout is [gate | up] concat on last dim — matches
@@ -2152,58 +2175,43 @@ class Block(nn.Module):
         return x
 
 
-class ParallelHead(nn.Module):
-    """LM head with mHC reduction.
+class ParallelHead(ParallelLMHead):
+    """V4 LM head with mHC reduction; vocab-parallel sharded across TP ranks.
 
-    Port of inference/model.py:704-736. Unlike `Block.hc_pre` (which uses
-    Sinkhorn projection on the combination matrix), `hc_head` uses simple
-    `Sigmoid(mix*scale + base) + eps` weights to reduce the [num_tokens, hc, dim]
-    residual to [num_tokens, dim] before applying the LM head linear projection.
+    Port of inference/model.py:704-736. Inherits from `ParallelLMHead` so the
+    vocab-axis sharding, `weight_loader`, last-token slicing, bf16 a16w16 GEMM
+    (`tgemm.mm`), and TP all-gather come for free. V4 only adds:
 
-    `get_logits` projects only the last token of each sequence (decode mode);
-    for prefill the caller should slice the desired positions before passing
-    through.
+    - `forward(...)` taking the mHC residual + hc_head params + final norm
+    - `get_logits(...)` so `compute_logits` can call it directly on the
+      hidden-state output of `model.forward` (CUDAGraph contract)
+    - `hc_head(...)` Sigmoid-gated mHC reduction (vs `Block.hc_pre`'s Sinkhorn)
+
+    Note on weight dtype: the V4 reference (model.py:713-714) keeps the LM head
+    in fp32 because the disk weight is bf16; on AMD CDNA3/CDNA4 the bf16 MFMA
+    instruction accumulates in fp32 natively, so a bf16 GEMM with the
+    bf16-on-disk weight has the same effective precision as the reference's
+    fp32 path while halving VRAM and using the faster a16w16 kernel.
     """
 
     def __init__(
         self, vocab_size: int, dim: int, norm_eps: float = 1e-6, hc_eps: float = 1e-6
     ):
-        super().__init__()
-        self.vocab_size = vocab_size
+        super().__init__(vocab_size, dim, bias=False)
         self.dim = dim
         self.norm_eps = norm_eps
         self.hc_eps = hc_eps
-        # PR1 single-rank: full vocab on this rank.
-        self.weight = atom_parameter(
-            torch.empty(self.vocab_size, self.dim, dtype=torch.float32)
-        )
 
     def get_logits(
         self, x: torch.Tensor  # [num_tokens, dim]
     ) -> torch.Tensor:  # [bs, vocab]
-        """Project the last-token-per-seq slice of `x` to vocab logits.
-
-        Picks the last token of each sequence using `cu_seqlens_q` from the
-        forward_context. Falls back to `x[-1:]` (single-seq) when no
-        forward_context is set (warmup / standalone).
+        """Project to vocab logits via the inherited `ParallelLMHead.forward`,
+        which handles last-token slicing (prefill) + tgemm.mm + all-gather.
         """
         assert (
             x.dim() == 2 and x.shape[-1] == self.dim
         ), f"get_logits expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
-        ctx = get_forward_context()
-        cu_seqlens_q = (
-            ctx.attn_metadata.cu_seqlens_q
-            if ctx is not None and ctx.attn_metadata is not None
-            else None
-        )
-        if cu_seqlens_q is not None and cu_seqlens_q.numel() >= 2:
-            # Last-token positions per seq: cu_seqlens_q[1:bs+1] - 1.
-            # block_tables tells us the actual scheduled bs (cu_seqlens_q
-            # may have trailing zeros from the CpuGpuBuffer pool).
-            bs = ctx.attn_metadata.block_tables.size(0)
-            last_idx = cu_seqlens_q[1 : bs + 1] - 1
-            return F.linear(x.index_select(0, last_idx.long()).float(), self.weight)
-        return F.linear(x[-1:].float(), self.weight)
+        return super().forward(x)
 
     def hc_head(
         self,
@@ -2233,9 +2241,8 @@ class ParallelHead(nn.Module):
         norm: nn.Module,
     ) -> torch.Tensor:  # [bs, vocab]
         x = self.hc_head(x, hc_fn, hc_scale, hc_base)  # [num_tokens, dim]
-        logits = self.get_logits(norm(x))  # [bs, vocab]
-        # PR1 single-rank: skip all_gather
-        return logits
+        # get_logits handles the per-rank vocab shard + all-gather internally.
+        return self.get_logits(norm(x))  # [bs, vocab]
 
 
 class MTPBlock(Block):
