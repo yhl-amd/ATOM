@@ -806,10 +806,26 @@ class SpeculativeConfig:
                 "num_nextn_predict_layers": n_predict,
                 "architectures": [arch],
             }
-            # Qwen3.5 MTP needs expert counts for MoE layer construction
-            if hf_config.model_type == "qwen3_5_mtp":
+            # Naming differs across families:
+            #   DeepSeek / GLM       → already have `n_routed_experts`
+            #   Qwen3.5 / Qwen3-Next → only carry `num_experts`
+            #   non-MoE / unknown    → leave unset (no MoE = no field)
+            n_routed = getattr(
+                hf_config,
+                "n_routed_experts",
+                getattr(hf_config, "num_experts", None),
+            )
+            if n_routed is not None:
+                updates["n_routed_experts"] = n_routed
+            # n_shared_experts: prefer the field's own value if it exists
+            # (DeepSeek / GLM ship it natively); else, if this looks like
+            # a MoE model (n_routed_experts was synthesized > 0), default
+            # to 1; else leave it unset (non-MoE).
+            existing_n_shared = getattr(hf_config, "n_shared_experts", None)
+            if existing_n_shared is not None:
+                updates["n_shared_experts"] = existing_n_shared
+            elif updates.get("n_routed_experts"):
                 updates["n_shared_experts"] = 1
-                updates["n_routed_experts"] = getattr(hf_config, "num_experts", 0)
 
             hf_config.update(updates)
 
