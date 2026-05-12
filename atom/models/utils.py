@@ -241,6 +241,66 @@ def maybe_prefix(prefix: str, name: str) -> str:
     return name if not prefix else f"{prefix}.{name}"
 
 
+def ckpt_has_tensor_suffix(model_path: str, suffix: str) -> bool:
+    """Return True if the checkpoint at ``model_path`` contains a tensor whose
+    key ends with ``suffix``.
+
+    Used by MTP modules to decide whether the entry projection (eh_proj/fc) is
+    actually quantized on disk: when the HF quantization_config's exclude list
+    is incomplete, falling back to the global quant spec creates an
+    uninitialized weight_scale that silently corrupts inference. Checking the
+    safetensors index for a sibling ``*.weight_scale`` is the only reliable
+    signal.
+    """
+    import glob
+    import json
+    import os
+
+    if not model_path or not os.path.isdir(model_path):
+        logger.warning(
+            "ckpt_has_tensor_suffix: model_path %r is not a directory; "
+            "assuming suffix %r is absent",
+            model_path,
+            suffix,
+        )
+        return False
+
+    index_files = glob.glob(os.path.join(model_path, "*.safetensors.index.json"))
+    if index_files:
+        try:
+            with open(index_files[0]) as f:
+                weight_map = json.load(f)["weight_map"]
+        except (OSError, json.JSONDecodeError, KeyError) as e:
+            logger.warning(
+                "ckpt_has_tensor_suffix: failed to read %s (%s); "
+                "assuming suffix %r is absent",
+                index_files[0],
+                e,
+                suffix,
+            )
+            return False
+        return any(k.endswith(suffix) for k in weight_map)
+
+    safetensors_files = glob.glob(os.path.join(model_path, "*.safetensors"))
+    if safetensors_files:
+        try:
+            from safetensors import safe_open
+
+            with safe_open(safetensors_files[0], framework="pt") as sf:
+                return any(k.endswith(suffix) for k in sf.keys())
+        except Exception as e:
+            logger.warning(
+                "ckpt_has_tensor_suffix: failed to read %s (%s); "
+                "assuming suffix %r is absent",
+                safetensors_files[0],
+                e,
+                suffix,
+            )
+            return False
+
+    return False
+
+
 def cast_overflow_tensors(
     tensors: torch.Tensor,
     offset: float = 1000,
