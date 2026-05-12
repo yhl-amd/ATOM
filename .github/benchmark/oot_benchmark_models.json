@@ -141,7 +141,7 @@
           "dashboard_model": "Kimi-K2.5-MXFP4-tp4",
           "prefix": "kimi-k25-mxfp4-tp4-met",
           "bench_args": "",
-          "extra_args": "--trust-remote-code --tensor-parallel-size 4",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
         },
         {
