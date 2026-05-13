@@ -754,7 +754,7 @@ class SpeculativeConfig:
         # For multimodal models, extract text_config
         if hasattr(self.draft_model_hf_config, "text_config"):
             self.draft_model_hf_config = self.draft_model_hf_config.text_config
-        self.hf_config_override(self.draft_model_hf_config)
+        self.hf_config_override(self.draft_model_hf_config, self.model)
 
         if self.method == "eagle3":
             if getattr(self.draft_model_hf_config, "kv_lora_rank", None):
@@ -778,7 +778,9 @@ class SpeculativeConfig:
                 self.use_aux_hidden_state = True
 
     @staticmethod
-    def hf_config_override(hf_config: PretrainedConfig) -> None:
+    def hf_config_override(
+        hf_config: PretrainedConfig, model_path: Optional[str] = None
+    ) -> None:
         # Eagle3 architecture mapping (architecture-level, not model_type)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
         if arch == "LlamaForCausalLMEagle3":
@@ -818,14 +820,21 @@ class SpeculativeConfig:
             if n_routed is not None:
                 updates["n_routed_experts"] = n_routed
             # n_shared_experts: prefer the field's own value if it exists
-            # (DeepSeek / GLM ship it natively); else, if this looks like
-            # a MoE model (n_routed_experts was synthesized > 0), default
-            # to 1; else leave it unset (non-MoE).
+            # (DeepSeek / GLM ship it natively); else scan the checkpoint
+            # for `shared_expert` weights and use the parsed count (1 for
+            # the flat-block layout every released model uses). Leaving
+            # the field unset for ckpts without shared experts avoids
+            # fabricating a phantom shared block (e.g. R1 MTP eh_proj
+            # would otherwise pull a stale BF16 weight_scale).
             existing_n_shared = getattr(hf_config, "n_shared_experts", None)
             if existing_n_shared is not None:
                 updates["n_shared_experts"] = existing_n_shared
-            elif updates.get("n_routed_experts"):
-                updates["n_shared_experts"] = 1
+            else:
+                from atom.models.utils import ckpt_shared_expert_count
+
+                n_shared = ckpt_shared_expert_count(model_path)
+                if n_shared > 0:
+                    updates["n_shared_experts"] = n_shared
 
             hf_config.update(updates)
 
