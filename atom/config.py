@@ -878,7 +878,7 @@ class Config:
     kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
-    enable_prefix_caching: bool = False
+    enable_prefix_caching: bool = True
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -1021,6 +1021,16 @@ class Config:
             v4_block_size = 128
             if self.kv_cache_block_size != v4_block_size:
                 self.kv_cache_block_size = v4_block_size
+            # TODO: V4's per-request SWA buffer cannot be restored from the classical
+            # KV pool on prefix cache hit, so disable prefix caching silently.
+            if self.enable_prefix_caching:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "DeepSeek-V4 does not support prefix caching "
+                    "(SWA buffer is not cacheable); disabling automatically."
+                )
+                self.enable_prefix_caching = False
 
     def compute_hash(self) -> str:
         """
