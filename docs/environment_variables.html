@@ -110,6 +110,7 @@
 <li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#supported-quantization-dtypes">3.4 Supported Quantization Dtypes</a></li>
 <li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#auto-detection-from-huggingface">3.5 Auto-Detection from HuggingFace</a></li>
 <li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#layer-level-quantization-dispatch">3.6 Layer-Level Quantization Dispatch</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#online-quantization-at-load-time">3.7 Online Quantization at Load Time</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#parallel-configuration-parallelconfig">4. Parallel Configuration (<code class="docutils literal notranslate"><span class="pre">ParallelConfig</span></code>)</a></li>
@@ -626,11 +627,6 @@
 <td><p>0 (false)</p></td>
 <td><p>If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, disable the vLLM plugin registration entirely.</p></td>
 </tr>
-<tr class="row-odd"><td><p><strong>ATOM_DISABLE_VLLM_PLUGIN_ATTENTION</strong></p></td>
-<td><p>bool</p></td>
-<td><p>0 (false)</p></td>
-<td><p>If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, disable only the vLLM attention plugin while keeping other plugins active.</p></td>
-</tr>
 </tbody>
 </table>
 </section>
@@ -651,7 +647,12 @@
 <td><p>0 (false)</p></td>
 <td><p>If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, use AITER Triton FP4 weight preshuffled GEMM. Otherwise use AITER ASM FP4 weight preshuffled GEMM.</p></td>
 </tr>
-<tr class="row-odd"><td><p><strong>ATOM_USE_TRITON_MXFP4_BMM</strong></p></td>
+<tr class="row-odd"><td><p><strong>ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM</strong></p></td>
+<td><p>bool</p></td>
+<td><p>0 (false)</p></td>
+<td><p>If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, use AITER Triton FP4 GEMM with non-shuffled weights. Takes precedence over the FP4 preshuffled GEMM path selected by <code class="docutils literal notranslate"><span class="pre">ATOM_USE_TRITON_GEMM</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>ATOM_USE_TRITON_MXFP4_BMM</strong></p></td>
 <td><p>bool</p></td>
 <td><p>0 (false)</p></td>
 <td><p>If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, use FP4 BMM in MLA attention module.</p></td>
