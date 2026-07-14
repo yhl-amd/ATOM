@@ -24,6 +24,7 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
 import logging
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -102,6 +103,52 @@ from transformers import PretrainedConfig
 
 
 logger = logging.getLogger("atom")
+
+
+@torch._dynamo.disable
+def _deterministic_top_k_per_row_decode(
+    logits: torch.Tensor,
+    next_n: int,
+    context_lens: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Choose a rank-stable top-k set with token-position tie-breaking.
+
+    The sparse indexer is replicated on every tensor-parallel rank. The native
+    decode top-k can select different members of an equal-score boundary set
+    on different ranks, so its result must not be used when deterministic
+    sparse MLA is requested. This path keeps every score strictly above the
+    kth threshold, then fills remaining entries with equal scores in ascending
+    logical-token order. It avoids a full stable sort.
+
+    It is eager-only because each row's active context length is dynamic.
+    """
+
+    topk = out.shape[1]
+    for row_idx in range(out.shape[0]):
+        batch_idx = row_idx // next_n
+        token_idx = row_idx % next_n
+        valid = int(context_lens[batch_idx].detach().cpu()) - next_n + token_idx + 1
+        valid = max(0, min(valid, logits.shape[1]))
+        if valid < topk:
+            raise RuntimeError(
+                f"deterministic indexer top-k needs at least {topk} valid logits, "
+                f"got {valid}"
+            )
+
+        row = logits[row_idx, :valid]
+        threshold = torch.topk(row, topk, sorted=False).values.min()
+        strict = torch.nonzero(row > threshold, as_tuple=False).flatten()
+        remaining = topk - strict.numel()
+        ties = torch.nonzero(row == threshold, as_tuple=False).flatten()
+        chosen = torch.cat((strict, ties[:remaining]))
+        if chosen.numel() != topk:
+            raise RuntimeError(
+                "deterministic indexer top-k could not construct a full selection"
+            )
+        out[row_idx].copy_(chosen.to(out.dtype))
+
+
 if use_triton_gemm():
     try:
         from aiter.ops.triton.gemm_a8w8_blockscale import (
@@ -130,6 +177,9 @@ ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION = (
 )
 SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
 ENABLE_GLM_FUSED_INDEXER = envs.ATOM_ENABLE_GLM_FUSED_INDEXER
+DETERMINISTIC_GLM_INDEXER_TOPK = (
+    os.getenv("ATOM_DETERMINISTIC_GLM_INDEXER_TOPK", "0") == "1"
+)
 _FP8_DTYPES = tuple(
     dtype
     for dtype in (
@@ -1363,15 +1413,23 @@ def sparse_attn_indexer(
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
-        top_k_per_row_decode(
-            logits,
-            next_n,
-            decode_metadata.context_lens,
-            topk_indices_decode,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
-        )
+        if DETERMINISTIC_GLM_INDEXER_TOPK:
+            _deterministic_top_k_per_row_decode(
+                logits,
+                next_n,
+                decode_metadata.context_lens,
+                topk_indices_decode,
+            )
+        else:
+            top_k_per_row_decode(
+                logits,
+                next_n,
+                decode_metadata.context_lens,
+                topk_indices_decode,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+            )
         if attn_metadata.max_seqlen_q > 1:
             triton_gather_kv_indices_sparse(
                 attn_metadata.sparse_kv_indptr,
