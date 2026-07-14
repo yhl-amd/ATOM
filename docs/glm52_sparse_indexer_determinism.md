@@ -85,6 +85,72 @@ For each query row the fallback:
 The resulting comparison rule is `(score descending, token position ascending)`
 and therefore has rank-stable membership. It avoids a full stable sort.
 
+## vLLM NVIDIA native top-k reference
+
+vLLM's CUDA sparse-indexer path is a useful performance reference, but its
+tie-breaking semantics must be distinguished from this fix's strict TP
+requirement. Its decode dispatcher has three relevant paths:
+
+```text
+CUDA and topK in {512, 1024, 2048}
+  ├─ Hopper (SM90), <= 32 rows, aligned stride
+  │    -> cooperative_topk: CTA cluster, TMA loads and DSMEM histogram
+  ├─ other CUDA cases
+  │    -> persistent_topk: persistent CTA / multi-CTA radix selection
+  └─ other topK values or non-CUDA
+       -> generic top_k_per_row_decode
+```
+
+The CUDA-specialised kernels do not fully sort a context row. They first
+histogram scores in a coarse FP16-derived bin space, identify the bin
+containing the kth item, and then refine candidates with four radix-256 passes
+over the complete ordered FP32 score bits. This is a good design to retain for
+the production AITER implementation: it avoids a full sort while resolving
+scores that collide in a coarse FP16 bin.
+
+For short/medium rows, vLLM has an explicit small-candidate comparison:
+
+```cpp
+(a.score > b.score) || (a.score == b.score && a.idx < b.idx)
+```
+
+This is the same desired ordering as this fix. Its CUDA code can be found in
+vLLM's `sparse_attn_indexer.py`, `topk.cu`, `persistent_topk.cuh`,
+`cooperative_topk.cuh`, and `topk_histogram_4096.cuh`.
+
+However, this must not be read as a complete TP determinism guarantee for
+every vLLM CUDA path. The large tie paths refine the 32 bits of the FP32 score,
+but do not consistently include the logical token position as a secondary
+radix key. Candidate collection/final exact-score selection still has forms
+equivalent to:
+
+```text
+slot = atomicAdd(equal_score_counter, 1)
+if slot < remaining:
+    output[slot] = token_index
+```
+
+Thus, when the boundary contains more *bitwise-identical* FP32 scores than
+remaining top-k slots, atomic arrival order can determine membership. The
+score radix solves "same coarse bin but different FP32 score"; it does not by
+itself solve "same FP32 score, choose the smallest logical positions". This is
+particularly relevant here because FP8 quantisation followed by ReLU creates
+many exact `0.0f` scores.
+
+The intended AITER native follow-up therefore combines vLLM's efficient
+score-radix structure with the missing final rule:
+
+```text
+1. Use histogram/radix passes to find the exact kth FP32 score.
+2. Keep every position whose score is strictly greater.
+3. For score == kth_score, select the smallest logical token positions until k.
+```
+
+Equivalently, the kernel must select by the lexicographic key
+`(score descending, token position ascending)`. A position-aware
+prefix-sum/radix pass (rather than an `atomicAdd` race) keeps that rule
+graph-safe and makes independently launched TP ranks select the same KV set.
+
 ## Validation
 
 With the fallback enabled on TP=8:
