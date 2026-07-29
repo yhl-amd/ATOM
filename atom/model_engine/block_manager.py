@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from collections import deque
+from collections.abc import Iterable
 
 import numpy as np
 import xxhash
@@ -15,11 +15,14 @@ from atom.distributed.kv_events import (
     BlockStored,
     KVCacheEvent,
 )
-from atom.model_engine.chunk_arena import ArenaEmpty
+from atom.kv_cache.batch import KvBatchTables
+from atom.kv_cache.dsv4.arena import Dsv4UnifiedArena
+from atom.kv_cache.dsv4.batch_tables import build_dsv4_batch_tables
+from atom.kv_cache.dsv4.swa_pool import Dsv4SwaPool
+from atom.kv_cache.pools.chunk_arena import ArenaEmpty
+from atom.kv_cache.pools.pooled_free_list import PooledFreeList
 from atom.model_engine.kv_block import Block
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.swa_pool import SlidingWindowPool
-from atom.model_engine.unified_kv_arena import UnifiedKvArena
 from atom.utils import envs
 
 
@@ -49,6 +52,12 @@ def _make_all_cleared() -> AllBlocksCleared:
 
 
 class BlockManager:
+    @staticmethod
+    def _make_primary_free_list(
+        capacity: int, *, initially_backed: bool
+    ) -> PooledFreeList:
+        return PooledFreeList(capacity, initially_backed=initially_backed)
+
     def __init__(self, config: Config):
         block_size = config.kv_cache_block_size
         num_blocks = config.num_kvcache_blocks
@@ -86,17 +95,16 @@ class BlockManager:
         # assigned until first _allocate_block). Arena OFF: block_id IS its fixed
         # physical slot (always "backed"), so the unbacked pool stays empty and
         # free_block_ids holds every id — byte-identical to the pre-arena path.
-        if self._arena_on:
-            self.free_block_ids: deque[int] = deque()
-            self.free_block_ids_set: set[int] = set()
-            self._unbacked_free_ids: deque[int] = deque(range(n_logical))
-            self._unbacked_free_set: set[int] = set(range(n_logical))
-        else:
-            self.free_block_ids = deque(range(n_logical))
-            self.free_block_ids_set = set(range(n_logical))
-            self._unbacked_free_ids = deque()
-            self._unbacked_free_set = set()
-        self.used_block_ids: set[int] = set()
+        self._free_list = self._make_primary_free_list(
+            n_logical, initially_backed=not self._arena_on
+        )
+        # Migration aliases for existing diagnostics/tests. Allocation mechanics
+        # are owned by PooledFreeList; these names no longer implement queues.
+        self.free_block_ids = self._free_list.backed_ids
+        self.free_block_ids_set = self._free_list.backed_set
+        self._unbacked_free_ids = self._free_list.unbacked_ids
+        self._unbacked_free_set = self._free_list.unbacked_set
+        self.used_block_ids = self._free_list.used_ids
         self.enable_prefix_caching = config.enable_prefix_caching
 
         kv_events = getattr(config, "kv_events_config", None)
@@ -130,7 +138,7 @@ class BlockManager:
         _num_swa = getattr(config, "num_swa_blocks", 0)
         if self.arena is not None and self.arena.enabled:
             _num_swa = max(_num_swa, self.arena.max_swa_blocks())
-        self.swa = SlidingWindowPool(
+        self.swa = Dsv4SwaPool(
             num_blocks=_num_swa,
             window=getattr(config, "swa_window_size", 0),
             block_size=block_size,
@@ -171,7 +179,7 @@ class BlockManager:
         specs = getattr(config, "v4_arena_group_specs", None)
         if not specs:
             return None
-        return UnifiedKvArena(block_size=block_size, group_specs=list(specs))
+        return Dsv4UnifiedArena(block_size=block_size, group_specs=list(specs))
 
     def _evict_cold_compressed(self) -> bool:
         """Truly evict the coldest ref-0 compressed block (drop hash + return its
@@ -184,27 +192,23 @@ class BlockManager:
         # drop its hash + return its arena page, and move the id to the UNBACKED
         # free pool so it stays reusable (re-borrows a page on reuse) instead of
         # leaking out of circulation.
-        while self.free_block_ids:
-            block_id = self.free_block_ids.popleft()
-            if block_id not in self.free_block_ids_set:
-                continue  # stale duplicate
+        while True:
+            block_id = self._free_list.pop_backed()
+            if block_id is None:
+                return False
             block = self.blocks[block_id]
             if block.ref_count != 0:
-                # Should not happen (used ids aren't in free_block_ids); drop it
-                # from the free set to self-heal rather than spin.
-                self.free_block_ids_set.discard(block_id)
+                # Should not happen (used ids are not backed-free); self-heal
+                # rather than spin on a stale queue entry.
                 continue
-            self.free_block_ids_set.discard(block_id)
             if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
                 del self.hash_to_block_id[block.hash]
                 if self._event_log is not None:
                     self._event_log.append(_make_block_removed([block.hash]))
             block.reset()
             self.arena.free_compressed(block_id)
-            self._unbacked_free_ids.append(block_id)
-            self._unbacked_free_set.add(block_id)
+            self._free_list.move_to_unbacked(block_id)
             return True
-        return False
 
     def _arena_alloc_compressed(self, block_id: int) -> None:
         """Back a compressed block with arena pages, evicting a cold sibling
@@ -256,6 +260,47 @@ class BlockManager:
         """
         return self._require_csa_boundary_state
 
+    # ---------------- Scheduler-facing manager contract ---------------- #
+
+    def materialize_window(self, seq: Sequence, seq_len: int) -> None:
+        self.swa.materialize_window(seq, seq_len)
+
+    def ensure_window_for_tokens(
+        self, seq: Sequence, num_cached_tokens: int, num_new_tokens: int
+    ) -> None:
+        self.swa.ensure_for_tokens(seq, num_cached_tokens, num_new_tokens)
+
+    def finish_prefill_chunk(self, seq: Sequence) -> None:
+        self.swa.free_after_prefill_chunk(seq)
+
+    def build_batch_tables(self, seqs: Iterable[Sequence]) -> KvBatchTables:
+        seqs = list(seqs)
+        block_tables = [seq.block_table for seq in seqs if seq.block_table]
+        swa_block_tables = [seq.swa_block_table for seq in seqs if seq.block_table]
+        boundary_sources = [
+            int(getattr(seq, "csa_boundary_state_block_id", -1)) for seq in seqs
+        ]
+        return build_dsv4_batch_tables(
+            arena=self.arena,
+            block_tables=block_tables,
+            swa_block_tables=swa_block_tables,
+            v4_csa_boundary_source_ids=boundary_sources,
+        )
+
+    @property
+    def num_total_blocks(self) -> int:
+        return len(self.blocks)
+
+    @property
+    def num_free_per_req_cache_groups(self) -> int:
+        return len(self.free_per_req_cache_groups)
+
+    def kv_usage(self) -> float:
+        return len(self.used_block_ids) / len(self.blocks) if self.blocks else 0.0
+
+    def get_block(self, block_id: int) -> Block:
+        return self.blocks[block_id]
+
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
         h = xxhash.xxh64()
@@ -269,17 +314,7 @@ class BlockManager:
         its held arena page, no borrow) before an UNBACKED-free one (must borrow a
         page back on _allocate_block). Backed-first keeps `_has_free_compressed`
         accounting sound. Arena off: `_unbacked_free_ids` is empty (unchanged)."""
-        while self.free_block_ids:
-            block_id = self.free_block_ids.popleft()
-            if block_id in self.free_block_ids_set:
-                self.free_block_ids_set.discard(block_id)
-                return block_id
-        while self._unbacked_free_ids:
-            block_id = self._unbacked_free_ids.popleft()
-            if block_id in self._unbacked_free_set:
-                self._unbacked_free_set.discard(block_id)
-                return block_id
-        raise AssertionError("No free blocks available")
+        return self._free_list.pop()
 
     def _allocate_block(self, block_id: int) -> Block:
         block = self.blocks[block_id]
@@ -293,9 +328,7 @@ class BlockManager:
             if self._event_log is not None:
                 self._event_log.append(_make_block_removed([block.hash]))
         block.reset()
-        self.free_block_ids_set.discard(block_id)
-        self._unbacked_free_set.discard(block_id)  # now becomes used+backed
-        self.used_block_ids.add(block_id)
+        self._free_list.mark_used(block_id)
         # Ensure arena pages back this block (no-op off / already backed; borrows
         # from SWA under pressure). A backed id keeps its pages across content
         # cycles; they return to the arena only via _evict_cold_compressed, which
@@ -305,9 +338,7 @@ class BlockManager:
 
     def _deallocate_block(self, block_id: int):
         assert self.blocks[block_id].ref_count == 0
-        self.used_block_ids.remove(block_id)
-        self.free_block_ids.append(block_id)
-        self.free_block_ids_set.add(block_id)
+        assert self._free_list.deallocate(block_id), f"block {block_id} not in use"
 
     def _dcp_num_blocks(self, seq_len: int) -> int:
         if self.dcp_world_size <= 1:
@@ -440,9 +471,7 @@ class BlockManager:
                 # A cache hit lands only on a BACKED block (its KV is still
                 # resident); unbacked ids have no hash. discard from both sets so
                 # the id leaves the free pool cleanly.
-                self.free_block_ids_set.discard(block_id)
-                self._unbacked_free_set.discard(block_id)
-                self.used_block_ids.add(block_id)
+                self._free_list.mark_used(block_id)
             seq.block_table.append(block_id)
             if i < swa_hit_start:
                 self.swa.alloc_placeholder(seq)  # out of window: never read → -1
