@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Type, cast
 
 if TYPE_CHECKING:
-    from atom.kv_cache.layout import KvLayoutOptions, KvPoolLayout
+    from atom.kv_cache.kv_pool_layout import KvLayoutOptions, KvPoolLayout
     from atom.model_engine.scheduler import ScheduledBatch
 
 import numpy as np

@@ -7,8 +7,8 @@ from conftest import MockConfig, ids_conserved
 from atom.kv_cache.dense_kv_cache_manager import DenseKvCacheManager
 from atom.kv_cache.dsv4.dsv4_kv_cache_manager import Dsv4CompressedPool
 from atom.kv_cache.dsv4.dsv4_kv_cache_manager import Dsv4KvCacheManager
-from atom.kv_cache.factory import make_kv_cache_manager
-from atom.kv_cache.protocol import KvCacheManager
+from atom.kv_cache.kv_manager_factory import make_kv_cache_manager
+from atom.kv_cache.kv_manager_protocol import KvCacheManager
 from atom.model_engine.sequence import Sequence
 
 

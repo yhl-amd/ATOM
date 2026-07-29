@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any, Protocol, runtime_checkable
 
-from atom.kv_cache.hybrid import HybridKvCacheTables
+from atom.kv_cache.hybrid_tables import HybridKvCacheTables
 
 
 @runtime_checkable

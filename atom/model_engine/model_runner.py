@@ -1483,7 +1483,7 @@ class ModelRunner:
         Eagle3 independent MHA). Per-request cache bytes are accounted
         for separately via `compute_per_req_cache_bytes()`.
         """
-        from atom.kv_cache.layout import compute_total_kv_block_bytes
+        from atom.kv_cache.kv_pool_layout import compute_total_kv_block_bytes
 
         builders = [self.attn_metadata_builder]
         if hasattr(self, "eagle3_draft_builder"):

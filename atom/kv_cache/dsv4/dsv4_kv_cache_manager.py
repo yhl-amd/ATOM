@@ -13,7 +13,7 @@ from atom.config import Config
 from atom.kv_cache.dsv4.arena import Dsv4UnifiedArena
 from atom.kv_cache.dsv4.batch_tables import build_dsv4_batch_tables
 from atom.kv_cache.dsv4.swa_pool import Dsv4SwaPool
-from atom.kv_cache.hybrid import HybridKvCacheTables
+from atom.kv_cache.hybrid_tables import HybridKvCacheTables
 from atom.kv_cache.pools.chunk_arena import ArenaEmpty
 from atom.kv_cache.pools.pooled_free_list import PooledFreeList
 from atom.model_engine.block_manager import BlockManager

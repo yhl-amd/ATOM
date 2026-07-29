@@ -15,7 +15,7 @@ from atom.distributed.kv_events import (
     BlockStored,
     KVCacheEvent,
 )
-from atom.kv_cache.hybrid import HybridKvCacheTables
+from atom.kv_cache.hybrid_tables import HybridKvCacheTables
 from atom.kv_cache.pools.pooled_free_list import PooledFreeList
 from atom.model_engine.kv_block import Block
 from atom.model_engine.sequence import Sequence

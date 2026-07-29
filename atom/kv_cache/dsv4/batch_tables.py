@@ -7,7 +7,7 @@ from typing import Protocol
 
 import numpy as np
 
-from atom.kv_cache.hybrid import HybridKvCacheTables
+from atom.kv_cache.hybrid_tables import HybridKvCacheTables
 
 
 class ArenaBatchTranslator(Protocol):

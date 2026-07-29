@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, Generic, Optional, Type, TypeVar
 
 if TYPE_CHECKING:
-    from atom.kv_cache.layout import KvLayoutOptions, KvPoolLayout
+    from atom.kv_cache.kv_pool_layout import KvLayoutOptions, KvPoolLayout
     from atom.kv_transfer.disaggregation.types import KVTransferTensors
     from atom.model_engine.scheduler import ScheduledBatch
 
@@ -216,7 +216,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         The default is a single primary pool.  Hybrid backends override this
         capability instead of requiring ModelRunner architecture branches.
         """
-        from atom.kv_cache.layout import compute_default_kv_pool_layout
+        from atom.kv_cache.kv_pool_layout import compute_default_kv_pool_layout
 
         return compute_default_kv_pool_layout(
             available_for_pool=available_for_pool,

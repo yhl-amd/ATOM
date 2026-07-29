@@ -26,9 +26,9 @@ from typing import Optional
 import numpy as np
 
 from atom.config import Config
-from atom.kv_cache.hybrid import HybridKvCacheTables
-from atom.kv_cache.factory import make_kv_cache_manager
-from atom.kv_cache.protocol import KvCacheManager
+from atom.kv_cache.hybrid_tables import HybridKvCacheTables
+from atom.kv_cache.kv_manager_factory import make_kv_cache_manager
+from atom.kv_cache.kv_manager_protocol import KvCacheManager
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
