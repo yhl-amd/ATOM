@@ -5,7 +5,7 @@ import pytest
 from conftest import MockConfig
 
 from atom.kv_cache.dense_manager import DenseKvCacheManager
-from atom.kv_cache.dsv4.compressed_pool import Dsv4CompressedPool
+from atom.kv_cache.dsv4.manager import Dsv4CompressedPool
 from atom.kv_cache.dsv4.manager import Dsv4KvCacheManager
 from atom.kv_cache.factory import make_kv_cache_manager
 from atom.kv_cache.protocol import KvCacheManager

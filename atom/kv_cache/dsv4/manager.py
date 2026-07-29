@@ -1,11 +1,24 @@
 """DeepSeek-V4 compressed/SWA/arena KV-cache manager."""
 
-from atom.kv_cache.base_manager import BaseKvCacheManager
-from atom.kv_cache.dsv4.compressed_pool import Dsv4CompressedPool
+from atom.kv_cache.pools.pooled_free_list import PooledFreeList
+from atom.model_engine.block_manager import BlockManager
 
 
-class Dsv4KvCacheManager(BaseKvCacheManager):
-    """Coordinate compressed blocks, paged SWA, CSA sources, and arena lending."""
+class Dsv4CompressedPool(PooledFreeList):
+    """Backed/unbacked logical IDs coordinated with the DSV4 chunk arena.
+
+    Hashing, events, and sibling eviction intentionally stay in the manager;
+    this class only names the shared ``PooledFreeList`` mechanism for DSV4.
+    """
+
+
+class Dsv4KvCacheManager(BlockManager):
+    """Coordinate compressed blocks, paged SWA, CSA sources, and arena lending.
+
+    The primary-cache lifecycle (chained hash, primary blocks, per-request
+    slots, KV events) is inherited directly from ``BlockManager``; there is no
+    intermediate base layer.
+    """
 
     @staticmethod
     def _make_primary_free_list(

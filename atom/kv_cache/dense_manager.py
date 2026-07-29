@@ -6,12 +6,17 @@ from collections.abc import Iterable
 from copy import copy
 from typing import Any
 
-from atom.kv_cache.base_manager import BaseKvCacheManager
 from atom.kv_cache.batch import KvBatchTables
+from atom.model_engine.block_manager import BlockManager
 
 
-class DenseKvCacheManager(BaseKvCacheManager):
-    """Primary paged-cache manager with no DSV4 sidecar lifecycle."""
+class DenseKvCacheManager(BlockManager):
+    """Primary paged-cache manager with no DSV4 sidecar lifecycle.
+
+    Inherits the primary-cache lifecycle directly from ``BlockManager``; the
+    disabled ``.swa``/``.arena`` members the scheduler's generic path expects
+    are kept inert by zeroing the DSV4 geometry below.
+    """
 
     def __init__(self, config: Any):
         # Keep the caller's cross-process layout immutable.  The compatibility
