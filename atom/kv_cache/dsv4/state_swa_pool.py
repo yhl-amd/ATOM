@@ -1,4 +1,8 @@
-"""DSV4 window pool: retention and shared-arena backing."""
+"""DSV4 sliding-window pool that also carries the fused CSA boundary state.
+
+The CSA boundary snapshot is fused into each SWA chunk (feat/csa-swa-fusion),
+so this one pool owns both the sliding-window KV and the boundary state whose
+retention rides the SWA pin."""
 
 from __future__ import annotations
 
@@ -10,7 +14,7 @@ from atom.kv_cache.pools.windowed_kv_pool import WindowedKvPool
 from atom.model_engine.sequence import Sequence
 
 
-class Dsv4SwaPool(WindowedKvPool):
+class Dsv4StateSwaPool(WindowedKvPool):
     """Add CSA-into-SWA retention and arena sibling lending."""
 
     def __init__(
@@ -120,6 +124,6 @@ class Dsv4SwaPool(WindowedKvPool):
 
 
 # External compatibility name used by existing integrations.
-SlidingWindowPool = Dsv4SwaPool
+SlidingWindowPool = Dsv4StateSwaPool
 
-__all__ = ["Dsv4SwaPool", "SlidingWindowPool"]
+__all__ = ["Dsv4StateSwaPool", "SlidingWindowPool"]

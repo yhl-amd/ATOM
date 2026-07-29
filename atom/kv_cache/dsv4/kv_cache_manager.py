@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from atom.config import Config
 from atom.kv_cache.dsv4.arena import Dsv4UnifiedArena
 from atom.kv_cache.dsv4.hybrid_tables import build_dsv4_batch_tables
-from atom.kv_cache.dsv4.swa_pool import Dsv4SwaPool
+from atom.kv_cache.dsv4.state_swa_pool import Dsv4StateSwaPool
 from atom.kv_cache.hybrid_tables import HybridKvCacheTables
 from atom.kv_cache.pools.chunk_arena import ArenaEmpty
 from atom.kv_cache.pools.pooled_free_list import PooledFreeList
@@ -62,7 +62,7 @@ class Dsv4KvCacheManager(BlockManager):
         # the fixed num_swa pool.
         if self.arena is not None and self.arena.enabled:
             _num_swa = max(_num_swa, self.arena.max_swa_blocks())
-        self.swa = Dsv4SwaPool(
+        self.swa = Dsv4StateSwaPool(
             num_blocks=_num_swa,
             window=getattr(config, "swa_window_size", 0),
             block_size=block_size,
