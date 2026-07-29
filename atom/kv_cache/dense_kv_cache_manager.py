@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from copy import copy
 from typing import Any
 
-from atom.kv_cache.batch import KvBatchTables
+from atom.kv_cache.hybrid import HybridKvCacheTables
 from atom.model_engine.block_manager import BlockManager
 
 
@@ -40,5 +40,5 @@ class DenseKvCacheManager(BlockManager):
     def finish_prefill_chunk(self, seq: Any) -> None:
         del seq
 
-    def build_batch_tables(self, seqs: Iterable[Any]) -> KvBatchTables:
-        return KvBatchTables.empty(num_sequences=sum(1 for _ in seqs))
+    def build_batch_tables(self, seqs: Iterable[Any]) -> HybridKvCacheTables:
+        return HybridKvCacheTables.empty(num_sequences=sum(1 for _ in seqs))

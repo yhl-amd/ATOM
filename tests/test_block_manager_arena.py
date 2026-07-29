@@ -9,7 +9,7 @@ SWA and compressed borrow chunks from a shared arena on demand (pool-driven).
 
 import pytest
 
-from atom.kv_cache.dsv4.manager import Dsv4KvCacheManager
+from atom.kv_cache.dsv4.dsv4_kv_cache_manager import Dsv4KvCacheManager
 from conftest import MockConfig
 
 BS = 4  # kv_cache_block_size

@@ -7,7 +7,7 @@ from typing import Protocol
 
 import numpy as np
 
-from atom.kv_cache.batch import KvBatchTables
+from atom.kv_cache.hybrid import HybridKvCacheTables
 
 
 class ArenaBatchTranslator(Protocol):
@@ -42,7 +42,7 @@ def build_dsv4_batch_tables(
     block_tables: Sequence[Sequence[int]],
     swa_block_tables: Sequence[Sequence[int]],
     v4_csa_boundary_source_ids: Sequence[int] | np.ndarray,
-) -> KvBatchTables:
+) -> HybridKvCacheTables:
     """Translate logical DSV4 tables into arena physical pages.
 
     Bulk arena tables preserve the arena's existing page-zero fallback because
@@ -51,7 +51,7 @@ def build_dsv4_batch_tables(
     """
     logical_sources = np.asarray(v4_csa_boundary_source_ids, dtype=np.int32)
     if arena is None or not getattr(arena, "enabled", False):
-        return KvBatchTables.empty(boundary_source_ids=logical_sources)
+        return HybridKvCacheTables.empty(boundary_source_ids=logical_sources)
 
     physical_blocks: dict[str, list[list[int]]] = {}
     physical_swa: dict[str, list[list[int]]] = {}
@@ -77,7 +77,7 @@ def build_dsv4_batch_tables(
 
     # Main and indexer share the c4 chunk.  Keep object identity so callers
     # cannot accidentally diverge the two views during migration.
-    return KvBatchTables(
+    return HybridKvCacheTables(
         arena_block_tables=physical_blocks,
         arena_swa_block_tables=physical_swa,
         csa_main_page_tables=csa_pages,

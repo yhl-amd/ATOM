@@ -26,7 +26,7 @@ from typing import Optional
 import numpy as np
 
 from atom.config import Config
-from atom.kv_cache.batch import KvBatchTables
+from atom.kv_cache.hybrid import HybridKvCacheTables
 from atom.kv_cache.factory import make_kv_cache_manager
 from atom.kv_cache.protocol import KvCacheManager
 from atom.kv_transfer.disaggregation import KVConnectorOutput
@@ -288,7 +288,7 @@ class ScheduledBatch:
         remote_kv_block_ids: list[int] | None = None,
         remote_kv_seq_blocks: dict[int, list[int]] | None = None,
         num_cached_tokens: list[int] | None = None,
-        kv_batch_tables: KvBatchTables | None = None,
+        kv_batch_tables: HybridKvCacheTables | None = None,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
@@ -388,7 +388,7 @@ class ScheduledBatch:
         # disaggregated-prefill batches have no local manager and carry an empty
         # table object.
         if kv_batch_tables is None:
-            kv_batch_tables = KvBatchTables.empty(num_sequences=len(self.req_ids))
+            kv_batch_tables = HybridKvCacheTables.empty(num_sequences=len(self.req_ids))
         self.kv_batch_tables = kv_batch_tables
         self.last_block_num_tokens = [
             _seq.last_block_num_tokens for _seq in seqs.values()

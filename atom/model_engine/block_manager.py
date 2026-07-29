@@ -15,7 +15,7 @@ from atom.distributed.kv_events import (
     BlockStored,
     KVCacheEvent,
 )
-from atom.kv_cache.batch import KvBatchTables
+from atom.kv_cache.hybrid import HybridKvCacheTables
 from atom.kv_cache.dsv4.arena import Dsv4UnifiedArena
 from atom.kv_cache.dsv4.batch_tables import build_dsv4_batch_tables
 from atom.kv_cache.dsv4.swa_pool import Dsv4SwaPool
@@ -273,7 +273,7 @@ class BlockManager:
     def finish_prefill_chunk(self, seq: Sequence) -> None:
         self.swa.free_after_prefill_chunk(seq)
 
-    def build_batch_tables(self, seqs: Iterable[Sequence]) -> KvBatchTables:
+    def build_batch_tables(self, seqs: Iterable[Sequence]) -> HybridKvCacheTables:
         seqs = list(seqs)
         block_tables = [seq.block_table for seq in seqs if seq.block_table]
         swa_block_tables = [seq.swa_block_table for seq in seqs if seq.block_table]

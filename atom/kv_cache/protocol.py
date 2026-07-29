@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any, Protocol, runtime_checkable
 
-from atom.kv_cache.batch import KvBatchTables
+from atom.kv_cache.hybrid import HybridKvCacheTables
 
 
 @runtime_checkable
@@ -34,7 +34,7 @@ class KvCacheManager(Protocol):
 
     def finish_prefill_chunk(self, seq: Any) -> None: ...
 
-    def build_batch_tables(self, seqs: Iterable[Any]) -> KvBatchTables: ...
+    def build_batch_tables(self, seqs: Iterable[Any]) -> HybridKvCacheTables: ...
 
     def kv_usage(self) -> float: ...
 

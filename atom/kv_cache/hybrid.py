@@ -1,4 +1,4 @@
-"""Physical KV-cache tables attached to a scheduled batch."""
+"""Physical hybrid-cache (arena / SWA / CSA) tables attached to a batch."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ def _empty_sources() -> np.ndarray:
 
 
 @dataclass(frozen=True, slots=True)
-class KvBatchTables:
+class HybridKvCacheTables:
     """Backend-specific physical tables for one scheduled batch.
 
     Logical block tables remain on ``ScheduledBatch``.  Dense managers return
@@ -34,7 +34,7 @@ class KvBatchTables:
         *,
         num_sequences: int = 0,
         boundary_source_ids: Sequence[int] | np.ndarray | None = None,
-    ) -> "KvBatchTables":
+    ) -> "HybridKvCacheTables":
         """Build empty physical tables with logical CSA source passthrough."""
         if boundary_source_ids is None:
             sources = np.full(num_sequences, -1, dtype=np.int32)
