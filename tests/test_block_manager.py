@@ -3,6 +3,7 @@
 
 from conftest import MockConfig
 
+from atom.kv_cache.dsv4.dsv4_kv_cache_manager import Dsv4KvCacheManager
 from atom.model_engine.block_manager import BlockManager
 
 # ── compute_hash ───────────────────────────────────────────────────────────
@@ -368,7 +369,8 @@ _MC = MockConfig
 
 
 def _swa_bm(num_blocks=10, num_swa=10, bs=4, window=8, prefix=True):
-    return BlockManager(
+    # SWA lives only on the DSV4 manager now; the base BlockManager is pure dense.
+    return Dsv4KvCacheManager(
         _MC(
             num_kvcache_blocks=num_blocks,
             num_swa_blocks=num_swa,

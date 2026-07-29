@@ -16,14 +16,9 @@ from atom.distributed.kv_events import (
     KVCacheEvent,
 )
 from atom.kv_cache.hybrid import HybridKvCacheTables
-from atom.kv_cache.dsv4.arena import Dsv4UnifiedArena
-from atom.kv_cache.dsv4.batch_tables import build_dsv4_batch_tables
-from atom.kv_cache.dsv4.swa_pool import Dsv4SwaPool
-from atom.kv_cache.pools.chunk_arena import ArenaEmpty
 from atom.kv_cache.pools.pooled_free_list import PooledFreeList
 from atom.model_engine.kv_block import Block
 from atom.model_engine.sequence import Sequence
-from atom.utils import envs
 
 
 def _make_block_stored(
@@ -52,6 +47,16 @@ def _make_all_cleared() -> AllBlocksCleared:
 
 
 class BlockManager:
+    """Architecture-neutral paged primary KV-cache manager.
+
+    Owns the generic control plane: chained content hashing, primary block
+    lifecycle, per-request state slots, and KV events. DSV4's compressed / SWA
+    / CSA sidecar lifecycle lives in ``Dsv4KvCacheManager``, which overrides the
+    protected ``_*`` seams below. The base defaults reproduce the pure dense
+    path exactly (no window pool, no arena), so ``BlockManager`` is usable on
+    its own for dense models.
+    """
+
     @staticmethod
     def _make_primary_free_list(
         capacity: int, *, initially_backed: bool
@@ -69,32 +74,20 @@ class BlockManager:
         # memory reservation; the actual per-rank routing is done in the workers.
         self.dcp_rank = 0
 
-        # Unified-KV chunk arena (ATOM_V4_UNIFIED_KV_ARENA): elastic SWA/
-        # compressed split. When on, a compressed block_id is a LOGICAL id and
-        # the arena maps it to per-group physical pages; the logical id space is
-        # sized to the arena's max compressed capacity so it can grow into
-        # borrowed SWA chunks. Off -> block_id is its fixed physical slot (today).
-        self.arena = self._build_arena(config, block_size)
-        n_logical = (
-            self.arena.max_compressed_blocks()
-            if (self.arena is not None and self.arena.enabled)
-            else num_blocks
-        )
-        self._arena_on = self.arena is not None and self.arena.enabled
+        # Null sidecar members expected by the manager contract (a dense manager
+        # answers ``.arena is None``). Subclasses that add elastic paging replace
+        # these before the free list is sized.
+        self.arena = None
+        self._arena_on = False
+        # The logical id space defaults to the fixed physical block count; a
+        # subclass with an elastic arena sizes it to the arena's capacity.
+        n_logical = self._logical_capacity(config, num_blocks)
         self.blocks: list[Block] = [Block(i) for i in range(n_logical)]
         self.hash_to_block_id: dict[int, int] = dict()
-        # Free logical ids are split into two pools ONLY when the arena is on:
-        #   free_block_ids       — BACKED-free: ref-0 ids that still hold an arena
-        #                          page (cached KV or just-freed content). Reuse
-        #                          needs NO new page; these are the ids the
-        #                          cross-pool evictor lends by draining a chunk.
-        #   _unbacked_free_ids   — ref-0 ids with NO arena page (their page was
-        #                          lent to the SWA pool). Reuse must borrow a page
-        #                          back via _arena_alloc_compressed.
-        # A used id is always backed. Initially every id is UNbacked (no page
-        # assigned until first _allocate_block). Arena OFF: block_id IS its fixed
-        # physical slot (always "backed"), so the unbacked pool stays empty and
-        # free_block_ids holds every id — byte-identical to the pre-arena path.
+        # Free logical ids. Arena OFF (dense): block_id IS its fixed physical
+        # slot (always "backed"), the unbacked pool stays empty and
+        # free_block_ids holds every id. A subclass may split the pool into
+        # backed / unbacked ids when it borrows physical pages elastically.
         self._free_list = self._make_primary_free_list(
             n_logical, initially_backed=not self._arena_on
         )
@@ -124,168 +117,111 @@ class BlockManager:
             range(num_per_req_cache_groups)
         )
 
-        # SWA component: content-addressed sliding-window pool, the sole prefix-
-        # cache sidecar owner now that the CSA boundary snapshot is fused into the
-        # SWA chunk (feat/csa-swa-fusion) — no separate page pool. It is a no-op
-        # for non-SWA models (num_swa_blocks == 0), so the compressed path stays
-        # byte-identical. Under the unified-KV arena, size the SWA logical id
-        # space to the arena's max SWA capacity so SWA can grow into borrowed
-        # compressed chunks; else the fixed num_swa pool. full_retain/retention/
-        # checkpoint carry the SWA sparse-checkpoint policy (and the arena
-        # elastic-borrow lives inside SlidingWindowPool).
-        _spec = getattr(config, "speculative_config", None)
-        _mtp_k = int(getattr(_spec, "num_speculative_tokens", 0) or 0) if _spec else 0
-        _num_swa = getattr(config, "num_swa_blocks", 0)
-        if self.arena is not None and self.arena.enabled:
-            _num_swa = max(_num_swa, self.arena.max_swa_blocks())
-        self.swa = Dsv4SwaPool(
-            num_blocks=_num_swa,
-            window=getattr(config, "swa_window_size", 0),
-            block_size=block_size,
-            max_num_batched_tokens=getattr(config, "max_num_batched_tokens", 0),
-            mtp_k=_mtp_k,
-            full_retain=envs.ATOM_SWA_FULL_RETAIN,
-            retention_interval=envs.ATOM_SWA_RETENTION_INTERVAL,
-            checkpoint_frac=envs.ATOM_SWA_CHECKPOINT_FRAC,
-        )
-        # CSA boundary snapshot is fused into the SWA chunk (feat/csa-swa-fusion):
-        # it has no separate page pool — capture writes into the block's SWA chunk
-        # and retention rides the SWA pin. This flag only gates whether the
-        # capture/restore plans are built; exposed via the
-        # requires_csa_boundary_state property (a seam for a future non-SWA
-        # sidecar that would not ride the SWA pin).
-        self._require_csa_boundary_state = bool(
-            getattr(config, "enable_v4_csa_prefix_state_cache", False)
-        )
-        # Wire the arena into SWA so SWA + compress borrow chunks from the shared
-        # arena and reclaim from a sibling under pressure (pool-driven lending via
-        # _evict_cold_for_borrow). CSA rides the SWA chunk, so no separate wiring.
-        if self.arena is not None and self.arena.enabled:
-            self.swa.attach_arena(self.arena, self._evict_cold_for_borrow)
+        # Sidecar pools (windowed SWA, CSA boundary snapshot) are built by
+        # subclasses that need them; the base has none.
+        self._init_sidecars(config, block_size)
 
-    def _evict_cold_for_borrow(self) -> bool:
-        """Free one arena page by evicting the coldest ref-0 page of either owner
-        (compressed / SWA), so a starved owner can borrow the chunk. Tries each in
-        turn; returns True if one was evicted (progress). Pool-driven lending.
-        (CSA has no owner of its own — it rides the SWA chunk.)"""
-        return self._evict_cold_compressed() or self.swa.evict_cold_for_arena()
+    # ---------------- Architecture seams (base = dense no-ops) ---------------- #
 
-    @staticmethod
-    def _build_arena(config: Config, block_size: int):
-        """Construct the unified-KV arena from ModelRunner-provided group specs
-        when ATOM_V4_UNIFIED_KV_ARENA is on; None otherwise (fixed two-pool)."""
-        if not envs.ATOM_V4_UNIFIED_KV_ARENA:
-            return None
-        specs = getattr(config, "v4_arena_group_specs", None)
-        if not specs:
-            return None
-        return Dsv4UnifiedArena(block_size=block_size, group_specs=list(specs))
+    def _logical_capacity(self, config: Config, num_blocks: int) -> int:
+        """Number of logical block ids. Dense: the fixed physical block count.
 
-    def _evict_cold_compressed(self) -> bool:
-        """Truly evict the coldest ref-0 compressed block (drop hash + return its
-        arena pages) so the SWA pool can borrow the freed chunk. Returns False
-        when no ref-0 compressed block is available. Pool-driven lending."""
-        if self.arena is None:
-            return False
-        # free_block_ids holds only BACKED-free ids (all evictable candidates),
-        # so no unbacked-skip dance is needed. Pop the coldest ref-0 backed id,
-        # drop its hash + return its arena page, and move the id to the UNBACKED
-        # free pool so it stays reusable (re-borrows a page on reuse) instead of
-        # leaking out of circulation.
-        while True:
-            block_id = self._free_list.pop_backed()
-            if block_id is None:
-                return False
-            block = self.blocks[block_id]
-            if block.ref_count != 0:
-                # Should not happen (used ids are not backed-free); self-heal
-                # rather than spin on a stale queue entry.
-                continue
-            if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
-                del self.hash_to_block_id[block.hash]
-                if self._event_log is not None:
-                    self._event_log.append(_make_block_removed([block.hash]))
-            block.reset()
-            self.arena.free_compressed(block_id)
-            self._free_list.move_to_unbacked(block_id)
-            return True
+        A subclass with an elastic arena builds the arena here (setting
+        ``self.arena`` / ``self._arena_on``) and returns its max capacity.
+        """
+        return num_blocks
 
-    def _arena_alloc_compressed(self, block_id: int) -> None:
-        """Back a compressed block with arena pages, evicting a cold sibling
-        (SWA/CSA/compressed) on starvation and retrying (pool-driven three-way
-        lending)."""
-        if self.arena is None or self.arena.is_compressed_backed(block_id):
-            return
-        while True:
-            try:
-                self.arena.alloc_compressed(block_id)
-                return
-            except ArenaEmpty:
-                if not self._evict_cold_for_borrow():
-                    raise
+    def _init_sidecars(self, config: Config, block_size: int) -> None:
+        """Build window / boundary-state sidecar pools. Dense: none."""
+        del config, block_size
 
-    def _has_free_compressed(self, n: int) -> bool:
-        """Whether ``n`` compressed blocks can be admitted. Off: free logical
-        slots. On: enough free logical ids AND enough physical placement:
-        reusing a BACKED-free id costs no new page, so only the shortfall beyond
-        the backed-free ids must be backed by arena free pages + pages reclaimable
-        from the SWA pool (one evicted SWA block frees one chunk per group, worth
-        the tightest group's pages/chunk). Allocation pops backed-free first
-        (`_pop_free_block`), so this accounting is sound."""
-        if not self._arena_on:
-            return len(self.free_block_ids_set) >= n
-        backed_free = len(self.free_block_ids_set)
-        total_free = backed_free + len(self._unbacked_free_set)
-        if total_free < n:
-            return False
-        backable = (
-            self.arena.compressed_available()
-            + self.swa.num_evictable() * self.arena.compress_pages_per_chunk()
-        )
-        # backed_free ids reuse their held page (0 new pages); the remaining
-        # (n - backed_free) must draw a page from `backable`.
-        return backed_free + backable >= n
+    def _back_block(self, block_id: int) -> None:
+        """Ensure physical backing for a freshly allocated block. Dense: no-op
+        (block_id is its own fixed physical slot)."""
+        del block_id
+
+    def _primary_has_free(self, n: int) -> bool:
+        """Whether ``n`` primary blocks can be admitted. Dense: free slots."""
+        return len(self.free_block_ids_set) >= n
+
+    def _bounded_window_hit(
+        self, seq: Sequence, compressed_hit: int, block_hashes: list[int]
+    ) -> int:
+        """Shrink the compressed hit to what the window pool can also serve.
+        Dense: no window, so the full compressed hit stands."""
+        del seq, block_hashes
+        return compressed_hit
+
+    def _window_has_free(self, n: int) -> bool:
+        """Whether the window pool can admit ``n`` blocks. Dense: always."""
+        del n
+        return True
+
+    def _window_admission_blocks(self, seq: Sequence) -> int:
+        """Windowed peak the pool must admit for ``seq``. Dense: none."""
+        del seq
+        return 0
+
+    def _window_claim_cached(
+        self,
+        seq: Sequence,
+        i: int,
+        h: int,
+        token_ids: list[int],
+        num_cached_blocks: int,
+    ) -> None:
+        """Claim / placeholder the window block parallel to a cached primary
+        block. Dense: no-op."""
+        del seq, i, h, token_ids, num_cached_blocks
+
+    def _window_alloc_new(self, seq: Sequence) -> None:
+        """Add a window placeholder parallel to a fresh primary block. Dense:
+        no-op."""
+        del seq
+
+    def _set_boundary_state(self, seq: Sequence, num_cached_blocks: int) -> None:
+        """Record the CSA boundary-state restore source. Dense: no-op."""
+        del seq, num_cached_blocks
+
+    def _publish_window_hash(
+        self, seq: Sequence, i: int, h: int, token_ids: list[int]
+    ) -> None:
+        """Publish the parallel window block under a content hash. Dense: no-op."""
+        del seq, i, h, token_ids
+
+    def _release_window(self, seq: Sequence) -> None:
+        """Release window blocks and boundary state for ``seq``. Dense: no-op."""
+        del seq
+
+    def _window_append_new(self, seq: Sequence) -> None:
+        """Append a decode-step window block in lockstep. Dense: no-op."""
+        del seq
+
+    def _window_free_out(self, seq: Sequence, seq_len: int) -> None:
+        """Reclaim window blocks that fell out of the window. Dense: no-op."""
+        del seq, seq_len
 
     @property
     def swa_enabled(self) -> bool:
-        """Compatibility capability for callers that only need SWA status."""
-        return self.swa.enabled
+        """Whether a sliding-window pool is active. Dense: never."""
+        return False
 
-    @property
-    def requires_csa_boundary_state(self) -> bool:
-        """Whether CSA boundary-state capture/restore plans should be built.
-
-        Kept as a property (not a bare read) as a seam: a future non-SWA sidecar
-        that does not ride the SWA pin would gate its own lifecycle here.
-        """
-        return self._require_csa_boundary_state
-
-    # ---------------- Scheduler-facing manager contract ---------------- #
+    def build_batch_tables(self, seqs: Iterable[Sequence]) -> HybridKvCacheTables:
+        """Physical batch tables. Dense: empty (logical == physical)."""
+        return HybridKvCacheTables.empty(num_sequences=sum(1 for _ in seqs))
 
     def materialize_window(self, seq: Sequence, seq_len: int) -> None:
-        self.swa.materialize_window(seq, seq_len)
+        del seq, seq_len
 
     def ensure_window_for_tokens(
         self, seq: Sequence, num_cached_tokens: int, num_new_tokens: int
     ) -> None:
-        self.swa.ensure_for_tokens(seq, num_cached_tokens, num_new_tokens)
+        del seq, num_cached_tokens, num_new_tokens
 
     def finish_prefill_chunk(self, seq: Sequence) -> None:
-        self.swa.free_after_prefill_chunk(seq)
+        del seq
 
-    def build_batch_tables(self, seqs: Iterable[Sequence]) -> HybridKvCacheTables:
-        seqs = list(seqs)
-        block_tables = [seq.block_table for seq in seqs if seq.block_table]
-        swa_block_tables = [seq.swa_block_table for seq in seqs if seq.block_table]
-        boundary_sources = [
-            int(getattr(seq, "csa_boundary_state_block_id", -1)) for seq in seqs
-        ]
-        return build_dsv4_batch_tables(
-            arena=self.arena,
-            block_tables=block_tables,
-            swa_block_tables=swa_block_tables,
-            v4_csa_boundary_source_ids=boundary_sources,
-        )
+    # ---------------- Metrics / block access ---------------- #
 
     @property
     def num_total_blocks(self) -> int:
@@ -309,31 +245,33 @@ class BlockManager:
         h.update(np.array(token_ids).tobytes())
         return h.intdigest()
 
+    # ---------------- Primary block lifecycle ---------------- #
+
+    def _drop_hash_if_owner(self, block_id: int) -> None:
+        """Evict the stale prefix-cache hash entry a block still owns, emitting
+        a BlockRemoved event. ATOM's eviction is lazy: a freed block keeps its
+        hash until its slot is reused, so this is the true eviction event."""
+        block = self.blocks[block_id]
+        if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
+            del self.hash_to_block_id[block.hash]
+            if self._event_log is not None:
+                self._event_log.append(_make_block_removed([block.hash]))
+
     def _pop_free_block(self) -> int:
         """Pop the next available free block id. Prefer a BACKED-free id (reuse
-        its held arena page, no borrow) before an UNBACKED-free one (must borrow a
-        page back on _allocate_block). Backed-first keeps `_has_free_compressed`
-        accounting sound. Arena off: `_unbacked_free_ids` is empty (unchanged)."""
+        its held page, no borrow) before an UNBACKED-free one. Arena off:
+        `_unbacked_free_ids` is empty (unchanged)."""
         return self._free_list.pop()
 
     def _allocate_block(self, block_id: int) -> Block:
         block = self.blocks[block_id]
         assert block.ref_count == 0
-        # Evict stale hash entry before resetting. ATOM's eviction is lazy:
-        # blocks sit in the free queue with their hash intact until the slot
-        # is re-allocated, so this point — not `deallocate()` — is the true
-        # eviction event.
-        if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
-            del self.hash_to_block_id[block.hash]
-            if self._event_log is not None:
-                self._event_log.append(_make_block_removed([block.hash]))
+        # Evict stale hash entry before resetting (lazy eviction fires here).
+        self._drop_hash_if_owner(block_id)
         block.reset()
         self._free_list.mark_used(block_id)
-        # Ensure arena pages back this block (no-op off / already backed; borrows
-        # from SWA under pressure). A backed id keeps its pages across content
-        # cycles; they return to the arena only via _evict_cold_compressed, which
-        # moves the id to the UNBACKED free pool.
-        self._arena_alloc_compressed(block_id)
+        # Ensure physical backing (no-op dense; borrows arena pages in DSV4).
+        self._back_block(block_id)
         return self.blocks[block_id]
 
     def _deallocate_block(self, block_id: int):
@@ -372,17 +310,17 @@ class BlockManager:
         if seq.has_per_req_cache and not self.free_per_req_cache_groups:
             return -1
         if not self.enable_prefix_caching:
-            if not self._has_free_compressed(self._dcp_num_blocks(len(seq))):
+            if not self._primary_has_free(self._dcp_num_blocks(len(seq))):
                 return -1
-            # SWA admission: only the per-request windowed peak (filled
+            # Window admission: only the per-request windowed peak (filled
             # incrementally + window-freed), not the whole prompt. No-op / True
-            # when SWA disabled.
-            if not self.swa.has_free(self.swa.admission_blocks(seq)):
+            # when there is no window pool.
+            if not self._window_has_free(self._window_admission_blocks(seq)):
                 return -1
             return 0
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
         # read the WHOLE history, so this stays a full front-to-back chained
-        # match). Record each block's hash for the SWA scan below.
+        # match). Record each block's hash for the window scan below.
         h = -1
         compressed_hit = 0
         block_hashes: list[int] = []
@@ -396,25 +334,17 @@ class BlockManager:
             block_hashes.append(h)
             compressed_block_ids.append(block_id)
             compressed_hit += 1
-        # Step 2: SWA only needs the trailing window before the boundary to be
-        # present (SWA is local). Scan right-to-left within the compressed prefix
-        # for the largest boundary whose window is SWA-cached (vLLM
-        # SlidingWindowManager; simple-hybrid one pass). Reduces compressed_hit
-        # → num_cached_blocks so we never reuse a block whose in-window SWA is
-        # gone (#1417), while out-of-window front blocks (SWA-freed) don't block
-        # the hit.
-        # SWA trailing-window gate: shrink the compressed hit to the largest
-        # boundary whose trailing window is SWA-present. Under CSA-into-SWA fusion
-        # the CSA boundary rides that same SWA block, so this one gate covers CSA
-        # too — a boundary whose SWA window is present has its fused CSA state
-        # present. The assert guards the caller's compressed-prefix invariant
+        # Step 2: shrink the compressed hit to the largest boundary the window
+        # pool can also serve (a local sliding window may have evicted the tail
+        # even when the compressed prefix is present). No-op when there is no
+        # window pool. The assert guards the caller's compressed-prefix invariant
         # (every counted hit block must have a materialized physical id).
         assert (
             len(compressed_block_ids) >= compressed_hit
         ), "missing physical ids for compressed prefix hit"
-        num_cached_blocks = self.swa.bounded_hit(seq, compressed_hit, block_hashes)
+        num_cached_blocks = self._bounded_window_hit(seq, compressed_hit, block_hashes)
         # Instrumentation: record the pre-gate compressed hit so CacheStats can
-        # separate reuse lost to the SWA tail gate (compressed_hit -
+        # separate reuse lost to the window tail gate (compressed_hit -
         # num_cached_blocks) from reuse lost to compressed eviction.
         seq.num_compressed_hit_blocks = compressed_hit
         # Free-pool demand: blocks we actually reuse minus those already used
@@ -423,12 +353,14 @@ class BlockManager:
         for i in range(num_cached_blocks):
             if self.hash_to_block_id[block_hashes[i]] in self.used_block_ids:
                 num_new_blocks -= 1
-        if not self._has_free_compressed(num_new_blocks):
+        if not self._primary_has_free(num_new_blocks):
             return -1
-        # SWA new-block demand is bounded by the windowed peak (filled
+        # Window new-block demand is bounded by the windowed peak (filled
         # incrementally + window-freed), not the full new-block count. No-op /
-        # True when SWA disabled.
-        if not self.swa.has_free(min(num_new_blocks, self.swa.admission_blocks(seq))):
+        # True when there is no window pool.
+        if not self._window_has_free(
+            min(num_new_blocks, self._window_admission_blocks(seq))
+        ):
             return -1
         return num_cached_blocks
 
@@ -443,17 +375,6 @@ class BlockManager:
         a hash until fully filled.
         """
         assert not seq.block_table
-        # SWA tail-gate: only the trailing window before the hit boundary is
-        # SWA-reused; earlier blocks are out of window (never read by the resumed
-        # forward) → mark -1 (matches self.swa.bounded_hit; keeps swa_block_table
-        # aligned with block_table). swa_hit_start == boundary - swa_tail_blocks
-        # on a full-window hit, and 0 on a short/partial hit (whole prefix in
-        # one window → all present, all claimed).
-        # SWA tail-gate: only the trailing window before the hit boundary is
-        # SWA-reused; earlier (out-of-window) blocks get -1. A tail size of zero
-        # when disabled makes swa_hit_start == num_cached_blocks → every SWA call
-        # below is a no-op (swa_block_table stays empty for non-SWA models).
-        swa_hit_start = max(0, num_cached_blocks - self.swa.tail_blocks)
         h = -1
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
@@ -469,41 +390,19 @@ class BlockManager:
                 assert block.ref_count == 0
                 block.ref_count = 1
                 # A cache hit lands only on a BACKED block (its KV is still
-                # resident); unbacked ids have no hash. discard from both sets so
-                # the id leaves the free pool cleanly.
+                # resident); discard from the free pool so the id leaves cleanly.
                 self._free_list.mark_used(block_id)
             seq.block_table.append(block_id)
-            if i < swa_hit_start:
-                self.swa.alloc_placeholder(seq)  # out of window: never read → -1
-            else:
-                self.swa.claim_cached(seq, h, token_ids)  # trailing window: reuse
-        # Fused CSA (feat/csa-swa-fusion): the restore source is the terminal
-        # cached block's LOGICAL c4 swa id — its physical SWA chunk (content-
-        # addressed, retention-pinned) holds the captured boundary in its fused
-        # tail segment. bound_hit already guaranteed that block's SWA window is
-        # present, so its swa id is live (>= 0). The scheduler translates this to
-        # the c4 physical swa page for the restore kernel; no separate pool pin is
-        # needed (the SWA reuse claim + retention pin already protect the chunk).
-        seq.csa_boundary_state_block_id = -1
-        if (
-            self.requires_csa_boundary_state
-            and num_cached_blocks
-            and len(seq.swa_block_table) >= num_cached_blocks
-        ):
-            # Fused CSA lives in the SWA chunk, so it exists only when SWA does.
-            swa_id = seq.swa_block_table[num_cached_blocks - 1]
-            seq.csa_boundary_state_block_id = (
-                int(swa_id) if swa_id is not None and swa_id >= 0 else -1
-            )
+            # Window bookkeeping parallel to this cached block (no-op dense).
+            self._window_claim_cached(seq, i, h, token_ids, num_cached_blocks)
+        # Boundary-state restore source (no-op dense).
+        self._set_boundary_state(seq, num_cached_blocks)
         for _ in range(num_cached_blocks, self._dcp_num_blocks(len(seq))):
             block_id = self._pop_free_block()
             self._allocate_block(block_id)
             seq.block_table.append(block_id)
-            # Uncached blocks: -1 placeholder keeps swa_block_table the same
-            # length as block_table; ensure_for_tokens fills the current chunk's
-            # window slots before each forward, free_after_prefill_chunk releases
-            # out-of-window ones.
-            self.swa.alloc_placeholder(seq)
+            # Window placeholder parallel to this fresh block (no-op dense).
+            self._window_alloc_new(seq)
         seq.num_cached_tokens = num_cached_blocks * self.block_size
 
         # Per-request cache: claim one slot index from the pre-allocated
@@ -545,15 +444,9 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
-            # Publish the parallel SWA block under the same content hash so
-            # cross-request hits can reuse its sliding-window KV (no-op when SWA
-            # disabled or the slot is a -1 window-freed sentinel).
-            # Publishing the SWA block under this hash ALSO publishes its fused
-            # CSA boundary (feat/csa-swa-fusion): the capture kernel wrote the
-            # boundary into this block's SWA chunk during the forward, so a later
-            # prefix hit that reuses the content-addressed SWA block restores the
-            # boundary for free — no separate CSA publish needed.
-            self.swa.publish_hash(seq, i, h, token_ids)
+            # Publish the parallel window block under the same content hash so
+            # cross-request hits can reuse its sliding-window KV (no-op dense).
+            self._publish_window_hash(seq, i, h, token_ids)
             if record:
                 store_run_hashes.append(h)
                 store_run_tokens.extend(token_ids)
@@ -573,12 +466,10 @@ class BlockManager:
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
-        self.swa.release(
-            seq
-        )  # release SWA blocks + clear swa_block_table (no-op if disabled)
+        # Release window blocks + boundary state (no-op dense).
+        self._release_window(seq)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
-        seq.csa_boundary_state_block_id = -1
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
             self.free_per_req_cache_groups.append(seq.per_req_cache_group)
             seq.per_req_cache_group = -1
@@ -589,9 +480,9 @@ class BlockManager:
         ebs = self._effective_block_size()
         needed_blocks = (seq_len + num_new_tokens + ebs - 1) // ebs
         new_blocks_needed = max(0, needed_blocks - current_blocks)
-        if not self._has_free_compressed(new_blocks_needed):
+        if not self._primary_has_free(new_blocks_needed):
             return False
-        if not self.swa.has_free(new_blocks_needed):  # True when SWA disabled
+        if not self._window_has_free(new_blocks_needed):  # True when no window
             return False
         return True
 
@@ -614,9 +505,9 @@ class BlockManager:
                 block_id = self._pop_free_block()
                 self._allocate_block(block_id)
                 block_table.append(block_id)
-                self.swa.append_new(seq)  # lockstep SWA block (no-op if disabled)
-        # Reclaim SWA blocks that just fell out of the window (no-op if disabled).
-        self.swa.free_out_of_window(seq, len(seq))
+                self._window_append_new(seq)  # lockstep window block (no-op dense)
+        # Reclaim window blocks that just fell out of the window (no-op dense).
+        self._window_free_out(seq, len(seq))
 
     # ---------------- KV event API ---------------- #
 
