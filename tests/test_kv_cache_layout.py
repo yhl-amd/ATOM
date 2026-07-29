@@ -2,7 +2,7 @@
 
 from types import SimpleNamespace
 
-from atom.kv_cache.dsv4.layout import compute_dsv4_kv_pool_layout
+from atom.kv_cache.dsv4.kv_pool_layout import compute_dsv4_kv_pool_layout
 from atom.kv_cache.kv_pool_layout import (
     KvLayoutOptions,
     compute_default_kv_pool_layout,

@@ -24,7 +24,7 @@ def make_kv_cache_manager(config: Any) -> "KvCacheManager":
 
         return DenseKvCacheManager(config)
     if manager_kind == "dsv4" or str(manager_kind).startswith("dsv4_"):
-        from atom.kv_cache.dsv4.dsv4_kv_cache_manager import Dsv4KvCacheManager
+        from atom.kv_cache.dsv4.kv_cache_manager import Dsv4KvCacheManager
 
         return Dsv4KvCacheManager(config)
     raise ValueError(f"unknown KV cache manager kind: {manager_kind!r}")

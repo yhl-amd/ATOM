@@ -3,7 +3,7 @@
 
 from conftest import MockConfig
 
-from atom.kv_cache.dsv4.dsv4_kv_cache_manager import Dsv4KvCacheManager
+from atom.kv_cache.dsv4.kv_cache_manager import Dsv4KvCacheManager
 from atom.model_engine.block_manager import BlockManager
 
 # ── compute_hash ───────────────────────────────────────────────────────────
