@@ -10,7 +10,7 @@ SWA and compressed borrow chunks from a shared arena on demand (pool-driven).
 import pytest
 
 from atom.kv_cache.dsv4.dsv4_kv_cache_manager import Dsv4KvCacheManager
-from conftest import MockConfig
+from conftest import MockConfig, ids_conserved
 
 BS = 4  # kv_cache_block_size
 
@@ -106,11 +106,11 @@ def test_compressed_borrows_from_swa_under_pressure(arena_on, seq_factory):
 
 
 def _compressed_ids_conserved(bm):
-    return bm.ids_conserved()
+    return ids_conserved(bm._free_list) and ids_conserved(bm.swa._free_list)
 
 
 def _swa_ids_conserved(bm):
-    return bm.ids_conserved()
+    return ids_conserved(bm._free_list) and ids_conserved(bm.swa._free_list)
 
 
 def test_cross_pool_borrow_does_not_leak_ids(arena_on, seq_factory):

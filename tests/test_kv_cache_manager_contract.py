@@ -2,7 +2,7 @@
 
 import pytest
 
-from conftest import MockConfig
+from conftest import MockConfig, ids_conserved
 
 from atom.kv_cache.dense_kv_cache_manager import DenseKvCacheManager
 from atom.kv_cache.dsv4.dsv4_kv_cache_manager import Dsv4CompressedPool
@@ -59,7 +59,7 @@ def test_factory_dispatches_dsv4_layout_to_dsv4_manager():
     assert isinstance(manager, Dsv4KvCacheManager)
     assert isinstance(manager._free_list, Dsv4CompressedPool)
     assert manager.swa_enabled
-    assert manager.ids_conserved()
+    assert ids_conserved(manager._free_list) and ids_conserved(manager.swa._free_list)
 
 
 def test_dense_manager_ignores_stale_dsv4_geometry():

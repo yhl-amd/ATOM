@@ -174,12 +174,6 @@ class Dsv4UnifiedArena:
     def swa_available(self) -> int:
         return self._available_for(OWNER_SWA) if self.enabled else (1 << 30)
 
-    def can_alloc_compressed(self, count: int) -> bool:
-        return not self.enabled or self.compressed_available() >= count
-
-    def can_alloc_swa(self, count: int) -> bool:
-        return not self.enabled or self.swa_available() >= count
-
     def alloc_compressed(self, block_id: int) -> None:
         if self.enabled:
             self._alloc_owners([OWNER_COMPRESS], block_id)

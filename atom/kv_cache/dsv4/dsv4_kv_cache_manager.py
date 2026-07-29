@@ -290,7 +290,3 @@ class Dsv4KvCacheManager(BlockManager):
         # backed_free ids reuse their held page (0 new pages); the remaining
         # (n - backed_free) must draw a page from `backable`.
         return backed_free + backable >= n
-
-    def ids_conserved(self) -> bool:
-        """Public invariant helper for repeated arena borrow/return tests."""
-        return self._free_list.ids_conserved() and self.swa._free_list.ids_conserved()

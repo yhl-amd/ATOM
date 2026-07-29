@@ -94,16 +94,3 @@ class PooledFreeList:
                 self.unbacked_set.add(logical_id)
         self.backed_set.clear()
         self.backed_ids.clear()
-
-    def ids_conserved(self) -> bool:
-        """Whether every ID belongs to exactly one stable state."""
-        if not self.used_ids.isdisjoint(self.backed_set):
-            return False
-        if not self.used_ids.isdisjoint(self.unbacked_set):
-            return False
-        if not self.backed_set.isdisjoint(self.unbacked_set):
-            return False
-        return (
-            len(self.used_ids) + len(self.backed_set) + len(self.unbacked_set)
-            == self.capacity
-        )

@@ -192,6 +192,24 @@ class MockConfig:
             setattr(self, k, v)
 
 
+# ── 7b. Test-only invariant helpers ─────────────────────────────────────────
+
+
+def ids_conserved(free_list) -> bool:
+    """Whether every id in a PooledFreeList belongs to exactly one stable state
+    (used / backed-free / unbacked-free) and the three partitions cover the
+    full capacity. Lives here (not on the pool) because only tests need it."""
+    used = free_list.used_ids
+    backed = free_list.backed_set
+    unbacked = free_list.unbacked_set
+    return (
+        used.isdisjoint(backed)
+        and used.isdisjoint(unbacked)
+        and backed.isdisjoint(unbacked)
+        and len(used) + len(backed) + len(unbacked) == free_list.capacity
+    )
+
+
 # ── 8. Fixtures ────────────────────────────────────────────────────────────
 
 

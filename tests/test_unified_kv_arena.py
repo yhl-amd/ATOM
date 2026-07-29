@@ -43,7 +43,7 @@ def _arena(c4_chunks=8, c128_chunks=8):
 def test_disabled_is_noop():
     a = UnifiedKvArena(block_size=BLOCK_SIZE, group_specs=[])
     assert not a.enabled
-    assert a.can_alloc_compressed(1000)
+    assert a.compressed_available() >= 1000
     a.alloc_compressed(0)
     a.alloc_swa(0)
     assert a.is_compressed_backed(0)  # disabled -> treated as backed
@@ -77,21 +77,21 @@ def test_compressed_packs_four_per_chunk_c4():
     a = _arena(c4_chunks=1, c128_chunks=64)
     for b in range(4):
         a.alloc_compressed(b)
-    assert not a.can_alloc_compressed(1)  # c4 arena exhausted
+    assert a.compressed_available() < 1  # c4 arena exhausted
     with pytest.raises(ArenaEmpty):
         a.alloc_compressed(4)
     assert not a.is_compressed_backed(4)  # rollback: not half-backed
     # free one block -> a page frees, but the chunk only returns when all 4 free
     for b in range(4):
         a.free_compressed(b)
-    assert a.can_alloc_compressed(4)
+    assert a.compressed_available() >= 4
 
 
 def test_rollback_on_group_exhaustion():
     a = _arena(c4_chunks=64, c128_chunks=1)
     for b in range(128):
         a.alloc_compressed(b)  # fills the single c128 chunk (128 pages)
-    assert not a.can_alloc_compressed(1)
+    assert a.compressed_available() < 1
     with pytest.raises(ArenaEmpty):
         a.alloc_compressed(128)
     assert not a.is_compressed_backed(128)
@@ -113,8 +113,8 @@ def test_free_then_realloc_reuses_capacity():
 
 def test_swa_capacity_bounded_by_tightest_group():
     a = _arena(c4_chunks=2, c128_chunks=5)
-    assert a.can_alloc_swa(2)
-    assert not a.can_alloc_swa(3)  # c4 (2 chunks -> 2 SWA pages) caps it
+    assert a.swa_available() >= 2
+    assert a.swa_available() < 3  # c4 (2 chunks -> 2 SWA pages) caps it
     a.alloc_swa(0)
     a.alloc_swa(1)
     with pytest.raises(ArenaEmpty):
@@ -127,16 +127,16 @@ def test_free_compressed_idempotent():
     a.alloc_compressed(3)
     a.free_compressed(3)
     a.free_compressed(3)
-    assert a.can_alloc_compressed(1)
+    assert a.compressed_available() >= 1
 
 
 def test_cross_pool_free_enables_sibling_alloc():
     # C4 group: 1 chunk. SWA holds it; freeing SWA lets compressed alloc use it.
     a = _arena(c4_chunks=1, c128_chunks=64)
     a.alloc_swa(0)  # SWA takes the single c4 chunk
-    assert not a.can_alloc_compressed(1)  # c4 arena empty
+    assert a.compressed_available() < 1  # c4 arena empty
     a.free_swa(0)  # true eviction -> chunk returns to arena
-    assert a.can_alloc_compressed(1)
+    assert a.compressed_available() >= 1
     a.alloc_compressed(0)
     assert a.compress_page("c4", 0) * C4_STRIDE == 0  # reused freed bytes
 

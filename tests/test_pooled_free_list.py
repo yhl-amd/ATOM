@@ -2,6 +2,8 @@
 
 import pytest
 
+from conftest import ids_conserved
+
 from atom.kv_cache.pools.pooled_free_list import PooledFreeList
 
 
@@ -40,7 +42,7 @@ def test_double_deallocate_does_not_duplicate_id():
     assert pool.deallocate(logical_id)
     assert not pool.deallocate(logical_id)
     assert list(pool.backed_ids).count(logical_id) == 1
-    assert pool.ids_conserved()
+    assert ids_conserved(pool)
 
 
 def test_id_conservation_across_backing_transitions():
@@ -50,7 +52,7 @@ def test_id_conservation_across_backing_transitions():
         pool.deallocate(logical_id)
     for logical_id in used[:2]:
         pool.move_to_unbacked(logical_id)
-    assert pool.ids_conserved()
+    assert ids_conserved(pool)
     assert len(pool.used_ids) == 0
     assert len(pool.backed_set) == 2
     assert len(pool.unbacked_set) == 6

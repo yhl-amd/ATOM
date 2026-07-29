@@ -1,5 +1,7 @@
 """Tests for layout-neutral windowed KV lifecycle."""
 
+from conftest import ids_conserved
+
 from atom.kv_cache.pools.windowed_kv_pool import WindowedKvPool
 from atom.model_engine.sequence import Sequence
 
@@ -28,7 +30,7 @@ def test_materialize_and_release_conserve_ids():
     assert len(pool.used_block_ids) == 1
     pool.release(seq)
     assert seq.swa_block_table == []
-    assert pool._free_list.ids_conserved()
+    assert ids_conserved(pool._free_list)
 
 
 def test_hash_publish_allows_window_bounded_reuse():
