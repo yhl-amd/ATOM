@@ -3,7 +3,7 @@
 import numpy as np
 
 from atom.kv_cache.dsv4.hybrid_tables import build_dsv4_batch_tables
-from atom.kv_cache.dsv4.arena import UnifiedKvArena
+from atom.kv_cache.dsv4.unified_arena import UnifiedKvArena
 
 
 def _group(name, owners, *, num_chunks=4):

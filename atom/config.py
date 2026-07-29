@@ -1205,7 +1205,7 @@ class Config:
     # DSV4 unified-KV chunk arena (ATOM_V4_UNIFIED_KV_ARENA). Per-ratio group
     # specs `[(name, compress_stride, num_chunks), ...]` set by ModelRunner
     # sizing; None/empty disables the arena (BlockManager keeps the two
-    # fixed-size pools). See atom/kv_cache/dsv4/arena.py.
+    # fixed-size pools). See atom/kv_cache/dsv4/unified_arena.py.
     arena_group_specs: list | None = None
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None

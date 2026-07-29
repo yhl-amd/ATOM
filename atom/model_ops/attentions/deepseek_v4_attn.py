@@ -59,7 +59,7 @@ from atom.distributed.pcp_utils import (
     pcp_reindex_ragged,
     pcp_round_robin_query_indices,
 )
-from atom.kv_cache.dsv4.arena import ArenaGroupSpec, group_of_ratio
+from atom.kv_cache.dsv4.unified_arena import ArenaGroupSpec, group_of_ratio
 from atom.model_ops.attentions.backends import (
     AttentionBackend,
     AttentionMetadataBuilder,
@@ -717,7 +717,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         per_req_cache_equiv_blocks: int = 0,
     ) -> "KvPoolLayout":
         """Select the fixed, full-retain, or arena DSV4 pool layout."""
-        from atom.kv_cache.dsv4.layout import compute_dsv4_kv_pool_layout
+        from atom.kv_cache.dsv4.kv_pool_layout import compute_dsv4_kv_pool_layout
 
         return compute_dsv4_kv_pool_layout(
             self,

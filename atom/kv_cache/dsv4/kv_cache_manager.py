@@ -10,7 +10,7 @@ primary-block lifecycle (chained hash, ref counting, KV events) unchanged.
 from collections.abc import Iterable
 
 from atom.config import Config
-from atom.kv_cache.dsv4.arena import Dsv4UnifiedArena
+from atom.kv_cache.dsv4.unified_arena import Dsv4UnifiedArena
 from atom.kv_cache.dsv4.hybrid_tables import build_dsv4_batch_tables
 from atom.kv_cache.dsv4.state_swa_pool import Dsv4StateSwaPool
 from atom.kv_cache.hybrid_tables import HybridKvCacheTables
