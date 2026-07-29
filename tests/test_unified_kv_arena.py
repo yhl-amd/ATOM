@@ -11,8 +11,8 @@ BYTES so SWA / compress owners (different page sizes) share them.
 
 import pytest
 
-from atom.model_engine.chunk_arena import ArenaEmpty
-from atom.model_engine.unified_kv_arena import UnifiedKvArena
+from atom.kv_cache.pools.chunk_arena import ArenaEmpty
+from atom.kv_cache.dsv4.arena import UnifiedKvArena
 
 BLOCK_SIZE = 128
 BYTES_PER_CHUNK = 128  # toy chunk byte size (one SWA block)

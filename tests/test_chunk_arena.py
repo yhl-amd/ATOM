@@ -10,7 +10,7 @@ cross-pool lending live in the pools / BlockManager, not here.
 
 import pytest
 
-from atom.model_engine.chunk_arena import ArenaEmpty, ChunkArena, ChunkBackedFreeList
+from atom.kv_cache.pools.chunk_arena import ArenaEmpty, ChunkArena, ChunkBackedFreeList
 
 ROWS_PER_CHUNK = 128  # one SWA block
 

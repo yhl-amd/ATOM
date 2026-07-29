@@ -8,7 +8,7 @@ from atom.kv_cache.layout import (
     compute_default_kv_pool_layout,
     compute_total_kv_block_bytes,
 )
-from atom.model_engine.unified_kv_arena import ArenaGroupSpec
+from atom.kv_cache.dsv4.arena import ArenaGroupSpec
 
 
 class _Builder:
