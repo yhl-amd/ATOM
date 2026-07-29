@@ -9,17 +9,15 @@ if TYPE_CHECKING:
 
 
 def make_kv_cache_manager(config: Any) -> "KvCacheManager":
-    """Construct the manager selected by the builder-provided pool layout."""
-    manager_kind = getattr(config, "kv_manager_kind", None)
-    if manager_kind is None:
-        # Compatibility for manually-built configs that predate the layout
-        # provider. Production Config declares this field explicitly.
-        manager_kind = (
-            "dsv4"
-            if getattr(config, "num_swa_blocks", 0)
-            or getattr(config, "arena_group_specs", None)
-            else "dense"
-        )
+    """Construct the manager the attention builder selected.
+
+    ``kv_manager_kind`` is the single authority: the model's attention builder
+    declares it via ``compute_kv_pool_layout`` (``"dense"`` by default,
+    ``"dsv4"`` for the DSV4 family), ModelRunner copies it onto the Config, and
+    EngineCore propagates it over IPC. We never sniff geometry fields to guess
+    the kind — a missing value simply falls back to the neutral default.
+    """
+    manager_kind = getattr(config, "kv_manager_kind", None) or "dense"
 
     if manager_kind == "dense":
         from atom.kv_cache.dense_kv_cache_manager import DenseKvCacheManager
