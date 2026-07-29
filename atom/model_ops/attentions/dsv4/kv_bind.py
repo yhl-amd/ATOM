@@ -21,7 +21,7 @@ def _prepare_bind_layout(builder: Any) -> tuple[Any, int, bool]:
     arena_on = bool(getattr(builder, "_arena_on", False))
     if arena_on:
         specs = [
-            ArenaGroupSpec.coerce(spec) for spec in runner.config.v4_arena_group_specs
+            ArenaGroupSpec.coerce(spec) for spec in runner.config.arena_group_specs
         ]
         swa_pages = 0
         # Consumers that build SWA indices run after module binding.  Persisting

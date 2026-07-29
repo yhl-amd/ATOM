@@ -1705,10 +1705,24 @@ class ModelRunner:
         config.kv_pool_layout_kind = layout.layout_kind
         config.num_swa_blocks = int(layout.num_swa_blocks)
         config.swa_window_size = int(layout.swa_window_size)
-        config.v4_arena_group_specs = layout.arena_specs
+        config.arena_group_specs = layout.arena_specs
         self.num_swa_blocks = int(layout.num_swa_blocks)
 
-        if layout.num_swa_blocks:
+        if layout.layout_kind == "arena":
+            # swa + compress share the arena chunks elastically — there is NO
+            # fixed swa/compressed partition. Deliberately DO NOT print a
+            # "swa_reserved" split here: that framing misled readers into
+            # thinking memory was hard-partitioned (num_swa_blocks == num_chunks;
+            # num_kvcache_blocks is the max *elastic* compressed capacity).
+            logger.warning(
+                "unified-KV arena (UNVALIDATED): specs=%s num_chunks=%d "
+                "(swa+compress share chunks elastically) "
+                "num_kvcache_blocks(max compressed)=%d",
+                layout.arena_specs,
+                layout.num_swa_blocks,
+                num_kvcache_blocks,
+            )
+        elif layout.num_swa_blocks:
             swa_reserved = layout.num_swa_blocks * layout.swa_block_bytes
             logger.info(
                 f"KV pool layout={layout.layout_kind}: "
@@ -1717,13 +1731,6 @@ class ModelRunner:
                 f"swa_reserved={swa_reserved / (1 << 30):.2f}GB, "
                 f"primary_block_bytes={layout.primary_block_bytes}, "
                 f"num_kvcache_blocks={num_kvcache_blocks}"
-            )
-        if layout.layout_kind == "arena":
-            logger.warning(
-                "unified-KV arena (UNVALIDATED): specs=%s "
-                "num_kvcache_blocks(max compressed)=%d",
-                layout.arena_specs,
-                num_kvcache_blocks,
             )
 
         logger.info(
@@ -1813,7 +1820,7 @@ class ModelRunner:
             # SWA fields above (else scheduler-side arena=None → tables not shipped
             # → worker uses logical block ids as physical → KV corruption once the
             # mapping is non-identity under eviction).
-            "v4_arena_group_specs": getattr(config, "v4_arena_group_specs", None),
+            "arena_group_specs": getattr(config, "arena_group_specs", None),
             # Factory dispatch is a layout-provider output, propagated to the
             # scheduler process with the rest of the physical pool geometry.
             "kv_manager_kind": config.kv_manager_kind,

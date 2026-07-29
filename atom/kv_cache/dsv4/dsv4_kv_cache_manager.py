@@ -91,7 +91,7 @@ class Dsv4KvCacheManager(BlockManager):
         when ATOM_V4_UNIFIED_KV_ARENA is on; None otherwise (fixed two-pool)."""
         if not envs.ATOM_V4_UNIFIED_KV_ARENA:
             return None
-        specs = getattr(config, "v4_arena_group_specs", None)
+        specs = getattr(config, "arena_group_specs", None)
         if not specs:
             return None
         return Dsv4UnifiedArena(block_size=block_size, group_specs=list(specs))

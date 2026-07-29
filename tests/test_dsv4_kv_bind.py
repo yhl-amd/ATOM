@@ -66,7 +66,7 @@ def _fixture(*, arena: bool = False, fp8: bool = False):
         num_physical_kvcache_blocks=nb,
         device="cpu",
         config=types.SimpleNamespace(
-            v4_arena_group_specs=[
+            arena_group_specs=[
                 {
                     "name": "c4",
                     "num_chunks": 3,

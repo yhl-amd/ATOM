@@ -17,7 +17,7 @@ def make_kv_cache_manager(config: Any) -> "KvCacheManager":
         manager_kind = (
             "dsv4"
             if getattr(config, "num_swa_blocks", 0)
-            or getattr(config, "v4_arena_group_specs", None)
+            or getattr(config, "arena_group_specs", None)
             else "dense"
         )
 

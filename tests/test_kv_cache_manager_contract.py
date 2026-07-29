@@ -68,7 +68,7 @@ def test_dense_manager_ignores_stale_dsv4_geometry():
             kv_manager_kind="dense",
             num_swa_blocks=4,
             swa_window_size=4,
-            v4_arena_group_specs=[{"unexpected": "stale"}],
+            arena_group_specs=[{"unexpected": "stale"}],
         )
     )
     assert isinstance(manager, DenseKvCacheManager)

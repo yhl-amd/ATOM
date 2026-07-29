@@ -865,7 +865,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # (c4 is the tightest compress group), so num_chunks_auth = num_blocks //
         # c4_pages_per_chunk and c4 rows = num_chunks_auth * 224 == num_blocks *
         # k1_csa (the original authoritative c4 formula); c128/dense = ...* 128.
-        arena_specs = getattr(self.model_runner.config, "v4_arena_group_specs", None)
+        arena_specs = getattr(self.model_runner.config, "arena_group_specs", None)
         self._arena_on = bool(arena_specs)
         arena_group_rows: dict[str, int] = {}
         if self._arena_on:

@@ -103,7 +103,7 @@ class EngineCore:
             # Unified-KV arena: propagate the runner-computed per-group specs so
             # BlockManager (built in Scheduler below) constructs the arena and
             # ships per-group physical tables to the worker.
-            config.v4_arena_group_specs = block_info.get("v4_arena_group_specs")
+            config.arena_group_specs = block_info.get("arena_group_specs")
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
             )

@@ -29,7 +29,7 @@ def _cfg(**over):
         enable_prefix_caching=False,
         num_swa_blocks=4,
         swa_window_size=BS,
-        v4_arena_group_specs=[
+        arena_group_specs=[
             {
                 "name": "g",
                 "num_chunks": 6,
