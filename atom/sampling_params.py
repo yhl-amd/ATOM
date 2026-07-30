@@ -20,6 +20,11 @@ class SamplingParams:
     # outputs diverge when temperature > 0.
     n: int = 1
     logprobs: Optional[Union[bool, int]] = None
+    # Serialized xgrammar structural-tag spec (deepseek_v4 DSML) for
+    # grammar-constrained tool-call decoding. None = unconstrained. Built at the
+    # OpenAI entrypoint from request.tools/tool_choice; compiled to a per-seq
+    # GrammarMatcher at admission. See atom/model_engine/grammar_utils.py.
+    structured_outputs: Optional[str] = None
 
     def __post_init__(self):
         if self.top_k != -1 and self.top_k < 1:

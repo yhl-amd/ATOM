@@ -314,6 +314,19 @@ class EngineCore:
         has_seqs = len(scheduled_batch.req_ids) > 0
         if has_seqs:
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
+            # Grammar-constrained tool decoding: compile any missing per-seq
+            # matchers and fill a token bitmask (EngineCore-side, CPU). Only the
+            # numpy bitmask rides ScheduledBatch to the workers; xgrammar
+            # matchers stay in this process (not picklable). None when no seq is
+            # grammar-constrained. Never breaks the forward.
+            try:
+                from atom.model_engine.grammar_utils import ensure_and_fill_bitmask
+
+                scheduled_batch.grammar_bitmask = ensure_and_fill_bitmask(
+                    seqs, self.scheduler.config.model, self.scheduler._grammar_matchers
+                )
+            except Exception as _ge:
+                logger.warning("grammar bitmask fill skipped: %s", _ge)
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )

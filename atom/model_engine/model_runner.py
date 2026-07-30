@@ -112,7 +112,13 @@ class tokenIDProcessor:
         num_spec_tokens: int = 0,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
-        self.is_deferred_out = True
+        # Deferred output (async sampled-token copy, overlaps next forward) puts
+        # the engine-side grammar matcher one real token behind the worker's
+        # sampling position — the applied bitmask lags by one, so in tight
+        # grammar regions the model re-emits structural tokens (doubling). Allow
+        # disabling it via env so grammar-constrained runs are exact. See
+        # grammar_utils.ensure_and_fill_bitmask.
+        self.is_deferred_out = os.environ.get("ATOM_DISABLE_DEFERRED") != "1"
 
         self.runner = runner
         device = runner.device
@@ -2905,6 +2911,47 @@ class ModelRunner:
 
         return logits, hidden_states
 
+    def _apply_grammar_bitmask(self, batch, logits):
+        """Mask disallowed tokens (-inf) per the grammar bitmask before sampling.
+
+        The bitmask (numpy int32, rows aligned to ``batch.req_ids`` / logits
+        rows) is filled EngineCore-side. Non-spec path only: exactly one logits
+        row per sequence, so bitmask row i maps to logits row i. Returns the
+        (possibly cloned) logits. No-op when no grammar constraint is active.
+        """
+        gbm = getattr(batch, "grammar_bitmask", None)
+        if gbm is None:
+            return logits
+        try:
+            import numpy as np
+
+            bmt = torch.from_numpy(np.ascontiguousarray(gbm)).to(logits.device)
+            rows = min(bmt.shape[0], logits.shape[0])
+            if rows <= 0:
+                return logits
+            # Always clone before in-place masking. Even when logits_in_graph is
+            # False (e.g. TP>1), under CUDA graph compute_logits can write into a
+            # persistent buffer that graph replay reuses; an in-place masked_fill_
+            # there is silently overwritten / not seen by the sampler, so the
+            # grammar constraint is intermittently lost at concurrency and the
+            # double-wrap regresses. Cloning gives the sampler our masked copy.
+            logits = logits.clone()
+            target = logits[:rows]
+            # ROCm-safe pure-torch apply: unpack the packed int32 bitmask
+            # (bit=1 -> allowed) into a bool mask and set disallowed logits to
+            # -inf. We deliberately do NOT use xgrammar's apply kernel: on this
+            # ROCm build it silently mis-masks (even all-ones rows), which
+            # collapsed greedy decoding into repeating a single token.
+            vocab = target.shape[1]
+            shifts = torch.arange(32, device=bmt.device, dtype=torch.int32)
+            bits = ((bmt[:rows].unsqueeze(-1) >> shifts) & 1).to(torch.bool)
+            allowed = bits.reshape(rows, -1)[:, :vocab]
+            target.masked_fill_(~allowed, float("-inf"))
+            return logits
+        except Exception as e:  # noqa: BLE001
+            logger.warning("apply grammar bitmask skipped: %s", e)
+            return logits
+
     def postprocess(
         self,
         batch: ScheduledBatch,
@@ -2920,6 +2967,7 @@ class ModelRunner:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         if spec_decode_metadata is None:
+            logits = self._apply_grammar_bitmask(batch, logits)
             sampled_tokens = self.sampler(
                 logits,
                 temperatures,
