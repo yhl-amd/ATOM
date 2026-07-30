@@ -293,6 +293,11 @@ class ScheduledBatch:
         self.remote_kv_seq_blocks = remote_kv_seq_blocks or {}
 
         self.req_ids = list(seqs.keys())
+        # Grammar bitmask (numpy int32, rows aligned to seqs.values() order,
+        # i.e. same order as the per-seq arrays below). Filled EngineCore-side
+        # in EngineCore.step, applied to logits worker-side in
+        # ModelRunner.postprocess. None = no grammar constraint this batch.
+        self.grammar_bitmask = None
         self.num_scheduled_tokens = np.asarray(num_scheduled_tokens, dtype=np.int32)
         self.temperatures = np.asarray(
             [seq.temperature for seq in seqs.values()], dtype=np.float32
@@ -518,6 +523,12 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.config = config
+        # Process-local grammar matchers for constrained tool decoding, keyed by
+        # seq.id. Held here (not on Sequence) because xgrammar matchers are not
+        # picklable and seqs are serialized (API->EngineCore, output sockets).
+        # Compiled/filled in EngineCore.step via grammar_utils, advanced in
+        # postprocess. TODO: pop on seq finish to bound memory on long runs.
+        self._grammar_matchers: dict = {}
 
         # Admit-rejected seqs (those `_unschedulable_reason` flags). Drained
         # by `take_rejected` each EngineCore step; routed through the same
@@ -1649,6 +1660,9 @@ class Scheduler:
                 for i, el in enumerate(token_ids):
                     seq.token_ids[-num_placeholder - offset + i] = el
                     seq.output_tokens[-num_placeholder - offset + i] = el
+                # Grammar matcher advance is driven state-first from
+                # seq.output_tokens in grammar_utils.ensure_and_fill_bitmask
+                # (deferred-timing-safe), not here.
                 if seq.return_logprobs and token_logprob is not None:
                     if seq.logprobs:
                         seq.logprobs[-1] = token_logprob
@@ -1659,6 +1673,8 @@ class Scheduler:
                 num_bonus = 0
                 for token_id in token_ids:
                     seq.append_token(token_id)
+                # Grammar matcher advance is driven state-first from
+                # seq.output_tokens in grammar_utils.ensure_and_fill_bitmask.
                 if seq.return_logprobs and token_logprob is not None:
                     seq.logprobs.append(token_logprob)
             new_tokens = token_ids

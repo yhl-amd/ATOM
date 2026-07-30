@@ -1085,6 +1085,15 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             top_p=request.top_p,
             n=effective_n,
         )
+        # Grammar-constrained tool decoding (DeepSeek-V4 DSML): derive a
+        # structural-tag spec from the request tools so generation is forced
+        # into well-formed tool calls. None when no tools / tool_choice="none";
+        # never raises (falls back to unconstrained decoding).
+        from atom.model_engine.grammar_utils import build_deepseek_v4_spec
+
+        sampling_params.structured_outputs = build_deepseek_v4_spec(
+            getattr(request, "tools", None), getattr(request, "tool_choice", "auto")
+        )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
 
@@ -1260,6 +1269,15 @@ async def completions(request: CompletionRequest, raw_request: Request):
             top_k=request.top_k,
             top_p=request.top_p,
             n=effective_n,
+        )
+        # Grammar-constrained tool decoding (DeepSeek-V4 DSML): derive a
+        # structural-tag spec from the request tools so generation is forced
+        # into well-formed tool calls. None when no tools / tool_choice="none";
+        # never raises (falls back to unconstrained decoding).
+        from atom.model_engine.grammar_utils import build_deepseek_v4_spec
+
+        sampling_params.structured_outputs = build_deepseek_v4_spec(
+            getattr(request, "tools", None), getattr(request, "tool_choice", "auto")
         )
 
         request_id = f"cmpl-{uuid.uuid4().hex}"

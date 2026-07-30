@@ -103,6 +103,13 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p
+        # Grammar-constrained tool decoding. Only the serialized structural-tag
+        # spec (a string) lives on the Sequence, so it survives every pickle
+        # (API->EngineCore, and EngineCore's own output sockets). The compiled
+        # xgrammar matcher is NOT picklable, so it is held OFF the seq, in a
+        # process-local dict keyed by seq.id on the Scheduler (see
+        # grammar_utils.ensure_and_fill_bitmask / Scheduler._grammar_matchers).
+        self.structured_outputs = getattr(sampling_params, "structured_outputs", None)
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.stop_strings = sampling_params.stop_strings
