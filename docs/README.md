@@ -29,4 +29,9 @@ This directory contains guides for installing, configuring, running, and extendi
 - [Online quantization streaming](online_quantization_streaming_guide.md)
 - [vLLM plugin backend](vllm_plugin_backend_guide.md)
 
+## Additional guides
+
+- [Forced acceptance length](forced_acceptance_length.md)
+- [Hermes agent integration](hermes_agent_guide.md)
+
 The complete documentation is also organized through the Sphinx entry point in [index.rst](index.rst).
