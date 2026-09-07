@@ -1,0 +1,601 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DeepSeek-V4-Pro DEP Agentic 性能图谱 · /html-everything</title>
+<meta name="description" content="ATOM DEP Agentic Session Affinity、完整并发扫描、历史 ATOM CI 与 B200 vLLM/SGLang 的可交互性能对比。" />
+<meta name="generator" content="/html-everything · https://github.com/iharnoor/html-everything" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=Inter+Tight:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" />
+<style>
+  :root {
+    --ground: #f4f4ef;
+    --ink: #111317;
+    --accent: #0029ff;
+    --accent-soft: #dfe5ff;
+    --mute: #646871;
+    --hair: #cfd1cb;
+    --panel: #e9e9e3;
+    --chart: #111315;
+    --chart-ink: #f4f5f6;
+    --chart-mute: #a9adb4;
+    --chart-hair: #30343a;
+    --dep: #ff554d;
+    --ci: #878d95;
+    --vllm: #09a76d;
+    --sglang: #9fce4f;
+    --before: #ffb020;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  html, body { margin: 0; padding: 0; background: var(--ground); color: var(--ink); }
+  body { font-family: 'Inter Tight', 'Noto Sans SC', system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+  a { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+  a:hover { text-decoration-thickness: 2px; }
+  button { font: inherit; }
+  .wrap { max-width: 1480px; margin: 0 auto; padding: 64px 52px 80px; display: flex; flex-direction: column; gap: 54px; }
+  .eyebrow { display: flex; align-items: center; gap: 12px; font-weight: 600; font-size: 11px; letter-spacing: .18em; color: var(--mute); text-transform: uppercase; }
+  .eyebrow .dot { width: 8px; height: 8px; background: var(--accent); border-radius: 50%; display: inline-block; box-shadow: 0 0 0 5px var(--accent-soft); }
+  h1.display { font-family: 'Archivo Black', 'Noto Sans SC', system-ui, sans-serif; font-size: clamp(54px, 7vw, 104px); line-height: .92; letter-spacing: -.045em; margin: 0; max-width: 12ch; }
+  h2 { font-family: 'Archivo Black', 'Noto Sans SC', system-ui, sans-serif; font-size: clamp(30px, 4vw, 48px); line-height: 1.02; letter-spacing: -.03em; margin: 0 0 18px; }
+  h3 { font-family: 'Archivo Black', 'Noto Sans SC', system-ui, sans-serif; font-size: 21px; line-height: 1.2; letter-spacing: -.015em; margin: 0 0 8px; }
+  p { font-size: 16px; line-height: 1.55; margin: 0 0 16px; max-width: 76ch; }
+  code, .mono { font-family: 'JetBrains Mono', monospace; font-size: .9em; }
+  .lede { font-size: clamp(20px, 2.1vw, 31px); line-height: 1.28; max-width: 50ch; margin: 0; }
+  .thesis { display: grid; grid-template-columns: 7px 1fr; background: #fff; border: 1px solid var(--hair); }
+  .thesis .strip { background: var(--accent); }
+  .thesis .body { padding: 26px 30px; }
+  .thesis p:last-child { margin-bottom: 0; }
+  .section { padding-top: 28px; border-top: 1px solid var(--hair); }
+  .section-head { display: flex; justify-content: space-between; align-items: end; gap: 24px; margin-bottom: 24px; }
+  .section-head p { color: var(--mute); margin: 0; max-width: 58ch; }
+  .meta-row { display: flex; gap: 22px; align-items: baseline; flex-wrap: wrap; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--mute); }
+  .kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; border: 1px solid var(--ink); background: var(--ink); }
+  .kpi { background: var(--ground); padding: 22px; min-height: 158px; display: flex; flex-direction: column; justify-content: space-between; }
+  .kpi .label { font-size: 13px; color: var(--mute); }
+  .kpi .value { font-family: 'Archivo Black', system-ui, sans-serif; font-size: clamp(37px, 4vw, 58px); letter-spacing: -.04em; line-height: .95; }
+  .kpi .detail { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--mute); }
+  .chart-shell { background: var(--chart); color: var(--chart-ink); border-radius: 22px; border: 1px solid #34383e; overflow: hidden; box-shadow: 0 18px 55px rgba(17,19,23,.16); }
+  .chart-top { padding: 28px 32px 18px; border-bottom: 1px solid var(--chart-hair); }
+  .chart-top h3 { font-size: clamp(22px, 2.5vw, 32px); margin-bottom: 7px; }
+  .chart-top p { color: var(--chart-mute); margin: 0; max-width: none; }
+  .power-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; align-items: center; color: var(--chart-mute); font-size: 14px; }
+  .power-chip { border: 1px solid #353941; border-radius: 999px; padding: 5px 10px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+  .chart-layout { display: grid; grid-template-columns: minmax(0, 1fr) 270px; }
+  .plot-wrap { position: relative; min-width: 0; padding: 16px 8px 8px 18px; }
+  #perf-chart { display: block; width: 100%; height: auto; min-height: 540px; }
+  .chart-panel { border-left: 1px solid var(--chart-hair); padding: 24px 20px; }
+  .panel-title { color: var(--chart-mute); text-transform: uppercase; letter-spacing: .12em; font: 11px 'JetBrains Mono', monospace; margin-bottom: 12px; }
+  .legend-list { display: flex; flex-direction: column; gap: 7px; }
+  .legend-btn { width: 100%; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--chart-ink); padding: 9px 8px; text-align: left; display: grid; grid-template-columns: 13px 1fr; gap: 10px; align-items: center; cursor: pointer; }
+  .legend-btn:hover { background: #1b1e22; border-color: #353941; }
+  .legend-btn.off { opacity: .38; }
+  .swatch { width: 11px; height: 11px; border-radius: 50%; box-shadow: 0 0 0 2px rgba(255,255,255,.12); }
+  .legend-main { font-weight: 600; font-size: 14px; line-height: 1.15; }
+  .legend-sub { display: block; color: var(--chart-mute); font-size: 11px; font-weight: 400; margin-top: 3px; }
+  .panel-rule { border: 0; border-top: 1px solid var(--chart-hair); margin: 18px 0; }
+  .metric-toggle { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; background: #090a0c; border: 1px solid #353941; border-radius: 10px; padding: 4px; }
+  .metric-btn { border: 0; border-radius: 7px; background: transparent; color: var(--chart-mute); padding: 9px 7px; cursor: pointer; font-size: 12px; }
+  .metric-btn.active { background: #eef0f2; color: #111315; font-weight: 600; }
+  .switch-row { display: flex; justify-content: space-between; align-items: center; color: var(--chart-mute); margin-top: 14px; font-size: 13px; }
+  .switch { width: 40px; height: 22px; border: 0; border-radius: 999px; background: #42464d; cursor: pointer; padding: 3px; }
+  .switch::before { content: ''; display: block; width: 16px; height: 16px; border-radius: 50%; background: white; transition: transform .18s ease; }
+  .switch.on { background: var(--accent); }
+  .switch.on::before { transform: translateX(18px); }
+  .reset-btn { margin-top: 18px; width: 100%; border: 1px solid #4a4f57; color: var(--chart-ink); background: transparent; padding: 10px; border-radius: 9px; cursor: pointer; }
+  .reset-btn:hover { background: #1b1e22; }
+  .chart-foot { display: flex; justify-content: space-between; gap: 20px; flex-wrap: wrap; padding: 14px 32px 22px; color: var(--chart-mute); font-size: 12px; border-top: 1px solid var(--chart-hair); }
+  .chart-foot code { color: #d9dce0; }
+  .tooltip { position: absolute; z-index: 10; pointer-events: none; opacity: 0; transform: translate(10px, -105%); background: #f8f8f5; color: #111317; border: 1px solid #111317; border-radius: 9px; padding: 11px 13px; min-width: 205px; box-shadow: 0 10px 30px rgba(0,0,0,.28); font-size: 12px; line-height: 1.5; transition: opacity .1s ease; }
+  .tooltip.show { opacity: 1; }
+  .tooltip b { font-size: 13px; }
+  .tooltip .tt-row { display: flex; justify-content: space-between; gap: 18px; font-family: 'JetBrains Mono', monospace; }
+  .tooltip .tt-row span:first-child { color: #6a6d73; }
+  .insight-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  .insight { background: #fff; padding: 24px; border-top: 5px solid var(--accent); min-height: 220px; }
+  .insight .num { font: 13px 'JetBrains Mono', monospace; color: var(--accent); margin-bottom: 38px; }
+  .insight p { color: var(--mute); margin-bottom: 0; }
+  .table-wrap { overflow-x: auto; background: #fff; border: 1px solid var(--hair); }
+  table { width: 100%; border-collapse: collapse; min-width: 800px; }
+  th, td { padding: 13px 15px; text-align: right; border-bottom: 1px solid #dddeda; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { position: sticky; top: 0; background: #17191d; color: #fff; font-size: 11px; font-family: 'JetBrains Mono', monospace; font-weight: 500; letter-spacing: .03em; }
+  td { font-size: 14px; font-variant-numeric: tabular-nums; }
+  tbody tr:hover { background: #f0f2ff; }
+  tbody tr:last-child td { border-bottom: 0; }
+  .good { color: #007f4e; font-weight: 600; }
+  .warn { color: #9a5b00; font-weight: 600; }
+  .table-note { color: var(--mute); font-size: 13px; margin-top: 10px; }
+  .ab-grid { display: grid; grid-template-columns: 1.1fr .9fr; gap: 24px; }
+  .ab-card { background: #fff; padding: 26px; border: 1px solid var(--hair); }
+  .bar-group { margin-top: 22px; display: grid; gap: 20px; }
+  .bar-label { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; margin-bottom: 7px; }
+  .bar-track { height: 12px; background: #e6e7e2; overflow: hidden; }
+  .bar { height: 100%; background: var(--before); transform-origin: left; }
+  .bar.after { background: var(--accent); }
+  .ab-delta { font-family: 'Archivo Black', system-ui, sans-serif; font-size: clamp(54px, 7vw, 92px); letter-spacing: -.05em; color: var(--accent); line-height: .9; margin: 26px 0 14px; }
+  .callout { background: var(--accent); color: #fff; padding: 25px 28px; display: grid; grid-template-columns: 170px 1fr; gap: 28px; align-items: start; }
+  .callout .tag { font: 12px 'JetBrains Mono', monospace; letter-spacing: .1em; text-transform: uppercase; }
+  .callout p { margin: 0; max-width: none; font-size: 19px; line-height: 1.4; }
+  .sources { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px; border: 1px solid var(--hair); background: var(--hair); }
+  .source-card { background: var(--ground); padding: 20px; min-height: 120px; }
+  .source-card .kind { font: 11px 'JetBrains Mono', monospace; color: var(--mute); text-transform: uppercase; letter-spacing: .1em; margin-bottom: 10px; }
+  .source-card a { font-weight: 600; }
+  footer { padding-top: 30px; border-top: 2px solid var(--ink); font-size: 13px; color: var(--mute); display: flex; justify-content: space-between; align-items: baseline; gap: 16px; }
+  @media (max-width: 1050px) {
+    .chart-layout { grid-template-columns: 1fr; }
+    .chart-panel { border-left: 0; border-top: 1px solid var(--chart-hair); }
+    .legend-list { display: grid; grid-template-columns: repeat(2, 1fr); }
+    .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+    .insight-grid { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 720px) {
+    .wrap { padding: 38px 18px 56px; gap: 38px; }
+    .section-head { display: block; }
+    .section-head p { margin-top: 10px; }
+    .kpi-grid, .ab-grid, .sources { grid-template-columns: 1fr; }
+    .legend-list { grid-template-columns: 1fr; }
+    .chart-top { padding: 22px 20px 16px; }
+    .plot-wrap { padding-left: 0; overflow-x: auto; }
+    #perf-chart { width: 820px; }
+    .callout { grid-template-columns: 1fr; gap: 10px; }
+    footer { display: block; }
+  }
+  @media print {
+    .wrap { max-width: none; padding: 24px; }
+    .chart-shell { break-inside: avoid; box-shadow: none; }
+    .chart-panel { display: none; }
+    .chart-layout { grid-template-columns: 1fr; }
+    .section { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<main class="wrap">
+
+  <div class="eyebrow">
+    <span class="dot"></span>
+    <span>ATOM · DEEPSEEK-V4-PRO · AGENTX</span>
+    <span style="margin-left:auto;">Mood · editorial</span>
+  </div>
+
+  <h1 class="display">DEP Agentic 性能图谱</h1>
+
+  <p class="lede">一张图看清 Session Affinity 的跃迁、DEP 在 c48–c128 的 Pareto 曲线、相对旧 ATOM DPA CI 的改善，以及与 B200 vLLM / SGLang 的跨平台距离。</p>
+
+  <div class="thesis">
+    <div class="strip"></div>
+    <div class="body">
+      <p><b>结论：</b>Session Affinity 是本轮最强的单变量优化；DEP 在四个对齐并发点均超过旧 ATOM DPA CI。当前综合建议是 c64 或 c96；B200 仍在高并发吞吐与交互性上保持明显领先。</p>
+      <div class="meta-row">
+        <span>8× MI355X</span><span>DPA8 + EP8</span><span>AgentX MVP</span><span>MTP-3</span><span>3600 s profile</span>
+      </div>
+    </div>
+  </div>
+
+  <section class="kpi-grid" aria-label="关键结论">
+    <article class="kpi"><span class="label">Affinity · Total throughput</span><strong class="value">+85%</strong><span class="detail">80,101 → 148,171 tok/s</span></article>
+    <article class="kpi"><span class="label">Affinity · P90 Interactivity</span><strong class="value">+266%</strong><span class="detail">11.19 → 40.95 tok/s/user</span></article>
+    <article class="kpi"><span class="label">DEP vs. old CI · best output gain</span><strong class="value">+8.21%</strong><span class="detail">c96 · Output tok/s/chip</span></article>
+    <article class="kpi"><span class="label">DEP · maximum measured output</span><strong class="value">279.94</strong><span class="detail">tok/s/chip · c128</span></article>
+  </section>
+
+  <section class="section" id="frontier">
+    <div class="section-head">
+      <div>
+        <h2>吞吐 × 交互性前沿</h2>
+        <p>横轴越右、纵轴越高越好。默认纵轴按参考图的 All-in Utility 功耗口径归一化；可切换回原始芯片吞吐。</p>
+      </div>
+      <div class="meta-row"><span>Hover 查看详情</span><span>Click 固定提示</span></div>
+    </div>
+
+    <div class="chart-shell">
+      <div class="chart-top">
+        <h3>DeepSeek-V4-Pro Agentic Output Throughput per All-in Utility MW vs. P90 Interactivity</h3>
+        <p>Output-only throughput · 相同 AgentX workload / MTP-3 / DPA8+EP8 大拓扑；跨硬件结果是目标线，不是单变量框架 A/B。</p>
+        <div class="power-row">
+          <span>All-in Power / Chip:</span>
+          <span class="power-chip">MI355X · 2.09 kW</span>
+          <span class="power-chip">B200 · 1.71 kW</span>
+          <span class="power-chip">公式 · output/chip × 1000 ÷ kW</span>
+        </div>
+      </div>
+      <div class="chart-layout">
+        <div class="plot-wrap" id="plot-wrap">
+          <svg id="perf-chart" viewBox="0 0 980 620" role="img" aria-label="P90 interactivity 与单位 All-in Utility MW 输出吞吐的性能曲线"></svg>
+          <div class="tooltip" id="tooltip"></div>
+        </div>
+        <aside class="chart-panel" aria-label="图表筛选器">
+          <div class="panel-title">Series</div>
+          <div class="legend-list" id="legend"></div>
+          <hr class="panel-rule" />
+          <div class="panel-title">Y axis</div>
+          <div class="metric-toggle">
+            <button class="metric-btn active" data-metric="efficiency">Utility MW</button>
+            <button class="metric-btn" data-metric="raw">Raw / chip</button>
+          </div>
+          <div class="switch-row"><span>Point labels</span><button class="switch on" id="labels-switch" role="switch" aria-checked="true" aria-label="切换数据点标签"></button></div>
+          <div class="switch-row"><span>≥30 interactivity 区</span><button class="switch on" id="zone-switch" role="switch" aria-checked="true" aria-label="切换交互性目标区域"></button></div>
+          <button class="reset-btn" id="reset">Reset filters</button>
+        </aside>
+      </div>
+      <div class="chart-foot">
+        <span>默认 Y：<code>Output tok/s/chip × 1000 / All-in kW</code></span>
+        <span>点标签为 concurrency；箭头为 c48 Session Affinity A/B</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-head">
+      <div><h2>读图结论</h2><p>这张图同时保留系统级对比和实验边界，不把跨硬件差异归因给单一框架。</p></div>
+    </div>
+    <div class="insight-grid">
+      <article class="insight">
+        <div class="num">01 · AFFINITY</div>
+        <h3>c48 从左下跃迁到右上</h3>
+        <p>开启 Session Affinity 后，Output throughput 提高 92.0%，P90 Interactivity 提高 265.9%。核心机制是多轮会话保持在同一 DP rank，恢复 prefix KV cache locality。</p>
+      </article>
+      <article class="insight">
+        <div class="num">02 · LOCAL FRONTIER</div>
+        <h3>c64 / c96 是更实用的选择</h3>
+        <p>c64 保持 30.09 tok/s/user；c96 将输出提高到 247.38 tok/s/chip。c128 达到最高吞吐，但从 c96 到 c128 的 Total throughput 仅增 10.81%。</p>
+      </article>
+      <article class="insight">
+        <div class="num">03 · B200 TARGET LINE</div>
+        <h3>B200 高并发扩展更强</h3>
+        <p>同为 c128，vLLM B200 达到 403.29 tok/s/chip、32.73 tok/s/user；DEP 为 279.94、16.41。硬件、MoE backend、调度与 KV offload 均不相同。</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section" id="affinity">
+    <div class="section-head">
+      <div><h2>Session Affinity · 受控 A/B</h2><p>两轮均为 c48、完整 warmup + 3600 秒 profile；唯一变化是 <code>ATOM_DP_SESSION_AFFINITY=1</code>。</p></div>
+    </div>
+    <div class="ab-grid">
+      <article class="ab-card">
+        <h3>吞吐变化</h3>
+        <div class="bar-group">
+          <div><div class="bar-label"><span>无 Affinity · Total</span><b>80,101 tok/s</b></div><div class="bar-track"><div class="bar" style="width:54.1%"></div></div></div>
+          <div><div class="bar-label"><span>开启 Affinity · Total</span><b>148,171 tok/s</b></div><div class="bar-track"><div class="bar after" style="width:100%"></div></div></div>
+          <div><div class="bar-label"><span>无 Affinity · Output</span><b>542.16 tok/s</b></div><div class="bar-track"><div class="bar" style="width:52.1%"></div></div></div>
+          <div><div class="bar-label"><span>开启 Affinity · Output</span><b>1,040.90 tok/s</b></div><div class="bar-track"><div class="bar after" style="width:100%"></div></div></div>
+        </div>
+      </article>
+      <article class="ab-card">
+        <h3>P90 Interactivity</h3>
+        <div class="ab-delta">3.66×</div>
+        <p><b>11.19 → 40.95 tok/s/user</b></p>
+        <p>同时 P90 ITL 从 89.35 ms 降至 24.42 ms，Server prefix hit 从 57.64% 提高到 91.61%。</p>
+      </article>
+    </div>
+    <div class="table-wrap" style="margin-top:24px">
+      <table>
+        <thead><tr><th>指标</th><th>无 Affinity</th><th>开启 Affinity</th><th>变化</th></tr></thead>
+        <tbody>
+          <tr><td>完成请求</td><td>2,314</td><td>3,843</td><td class="good">+66.1%</td></tr>
+          <tr><td>Request throughput</td><td>0.6357 req/s</td><td>1.0558 req/s</td><td class="good">+66.1%</td></tr>
+          <tr><td>Input throughput</td><td>79,559 tok/s</td><td>147,131 tok/s</td><td class="good">+84.9%</td></tr>
+          <tr><td>Output throughput</td><td>542.16 tok/s</td><td>1,040.90 tok/s</td><td class="good">+92.0%</td></tr>
+          <tr><td>Total throughput</td><td>80,101 tok/s</td><td>148,171 tok/s</td><td class="good">+85.0%</td></tr>
+          <tr><td>Mean TTFT</td><td>20.38 s</td><td>10.29 s</td><td class="good">−49.5%</td></tr>
+          <tr><td>P90 ITL</td><td>89.35 ms</td><td>24.42 ms</td><td class="good">−72.7%</td></tr>
+          <tr><td>P90 Interactivity</td><td>11.19 tok/s/user</td><td>40.95 tok/s/user</td><td class="good">+265.9%</td></tr>
+          <tr><td>Server prefix hit</td><td>57.64%</td><td>91.61%</td><td class="good">+33.97 pp</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section" id="dep-sweep">
+    <div class="section-head">
+      <div><h2>DEP AgentX · 完整并发扫描</h2><p>每档独立重启；Session Affinity 开启；完整 warmup + 3600 秒 profile。</p></div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Concurrency</th><th>成功请求</th><th>Req/s</th><th>Input tok/s</th><th>Output tok/s</th><th>Total tok/s</th><th>Output/chip</th><th>P90 Interactivity</th><th>Output/MW*</th></tr></thead>
+        <tbody>
+          <tr><td>c48</td><td>3,843</td><td>1.0558</td><td>147,130.58</td><td>1,040.90</td><td>148,171.48</td><td>130.11</td><td class="good">40.95</td><td>62,254</td></tr>
+          <tr><td>c64</td><td>5,320</td><td>1.4615</td><td>175,554.40</td><td>1,441.53</td><td>176,995.93</td><td>180.19</td><td class="good">30.09</td><td>86,215</td></tr>
+          <tr><td>c96</td><td>7,889</td><td>2.1673</td><td>223,386.25</td><td>1,979.01</td><td>225,365.26</td><td>247.38</td><td>19.07</td><td>118,364</td></tr>
+          <tr><td>c128</td><td>8,723</td><td>2.3964</td><td>247,478.41</td><td>2,239.51</td><td>249,717.92</td><td class="good">279.94</td><td>16.41</td><td class="good">133,943</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="table-note">* 派生指标，按 MI355X 2.09 kW/chip 计算。它不是实测墙上功耗，也不替代原始吞吐和延迟。</p>
+  </section>
+
+  <section class="section" id="old-ci">
+    <div class="section-head">
+      <div><h2>DEP vs. 旧 ATOM DPA CI</h2><p>相同硬件、模型、AgentX、MTP 与 concurrency；但官方 CI 为 DPA + EP1，本地 DEP 为 DPA8 + EP8 + RCCL hybrid + Session Affinity，因此属于系统级对照。</p></div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>c</th><th>CI Output/chip</th><th>DEP Output/chip</th><th>Output 提升</th><th>CI P90 Int.</th><th>DEP P90 Int.</th><th>交互性提升</th><th>Total 提升</th><th>P50 TTFT 改善</th></tr></thead>
+        <tbody>
+          <tr><td>48</td><td>124.75</td><td>130.11</td><td class="good">+4.30%</td><td>37.52</td><td>40.95</td><td class="good">+9.13%</td><td class="good">+4.08%</td><td class="good">−10.95%</td></tr>
+          <tr><td>64</td><td>170.40</td><td>180.19</td><td class="good">+5.75%</td><td>26.38</td><td>30.09</td><td class="good">+14.05%</td><td class="good">+4.81%</td><td class="good">−10.79%</td></tr>
+          <tr><td>96</td><td>228.62</td><td>247.38</td><td class="good">+8.21%</td><td>18.70</td><td>19.07</td><td class="good">+1.99%</td><td class="good">+7.38%</td><td class="good">−13.67%</td></tr>
+          <tr><td>128</td><td>266.80</td><td>279.94</td><td class="good">+4.92%</td><td>16.00</td><td>16.41</td><td class="good">+2.55%</td><td class="good">+4.11%</td><td class="good">−13.75%</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section" id="b200">
+    <div class="section-head">
+      <div><h2>DEP vs. B200 目标线</h2><p>每个单元格保留原始口径：<code>Output tok/s/chip / P90 Interactivity</code>。主图再用参考图中的 All-in 功耗换算。</p></div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>c</th><th>DEP · MI355X</th><th>vLLM · B200</th><th>SGLang · B200</th><th>备注</th></tr></thead>
+        <tbody>
+          <tr><td>64</td><td>180.19 / 30.09</td><td class="good">224.07 / 42.99</td><td>220.42 / 37.74</td><td>共同对齐点</td></tr>
+          <tr><td>96</td><td>247.38 / 19.07</td><td class="good">338.78 / 36.32</td><td>294.07 / 30.67</td><td>共同对齐点</td></tr>
+          <tr><td>128</td><td>279.94 / 16.41</td><td class="good">403.29 / 32.73</td><td>323.22 / 28.02</td><td>共同对齐点</td></tr>
+          <tr><td>160</td><td>—</td><td class="good">437.54 / 28.43</td><td class="warn">300.24 / 16.78</td><td>SGLang 已回落</td></tr>
+          <tr><td>196</td><td>—</td><td class="good">449.91 / 19.90</td><td>—</td><td>vLLM 峰值吞吐</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="table-note">B200 vLLM 使用 DGX B200 + <code>vllm-simple</code> KV offload；SGLang 使用 nscale B200 + HiCache；DEP 无 KV offload。镜像、硬件、MoE backend 与 DP 调度均未完全对齐。</p>
+  </section>
+
+  <div class="callout">
+    <div class="tag">Decision guide</div>
+    <p><b>选 c64</b>：P90 Interactivity 需保持 ≥30；<b>选 c96</b>：追求更高吞吐的综合折中；<b>选 c128</b>：只追求本机最大输出吞吐，并接受交互性下降与边际收益收窄。</p>
+  </div>
+
+  <section class="section" id="method">
+    <div class="section-head">
+      <div><h2>口径与边界</h2><p>读跨平台曲线时，先区分“实测原始值”和“从参考功耗推导的展示值”。</p></div>
+    </div>
+    <div class="insight-grid">
+      <article class="insight"><div class="num">METRIC</div><h3>为什么使用 Output throughput</h3><p>AgentX 长上下文的大量输入 token 来自 prefix-cache read；Total throughput 会把缓存输入计入，因此主图采用更接近 Decode 能力的 Output tok/s/chip。</p></article>
+      <article class="insight"><div class="num">POWER</div><h3>Utility MW 是计算值</h3><p>MI355X 2.09 kW、B200 1.71 kW 来自用户提供参考图。纵轴按每芯片输出吞吐除以每芯片 All-in 功耗换算，未使用本次运行的实时功率遥测。</p></article>
+      <article class="insight"><div class="num">COMPARABILITY</div><h3>B200 只作为目标线</h3><p>模型、AgentX workload、MTP-3 和 DPA8 + EP8 大拓扑对齐；但硬件、EPLB、MoE transport、shared expert、调度和 KV offload 不完全相同。</p></article>
+    </div>
+  </section>
+
+  <section class="section" id="sources">
+    <div class="section-head"><div><h2>数据与来源</h2><p>本地原始 AIPerf 结果已核对存在；外部 CI 链接可直接打开。</p></div></div>
+    <div class="sources">
+      <article class="source-card"><div class="kind">Primary narrative</div><a href="source/ATOM_DEP_AGENTIC_OPTIMIZATION_SUMMARY.md">ATOM DEP Agentic Optimization Summary</a><p>章节 6–9；更新于 2026-09-01。</p></article>
+      <article class="source-card"><div class="kind">Official ATOM CI</div><a href="https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33376779864">InferenceX run #33376779864</a><p>旧 ATOM DPA CI 对齐数据。</p></article>
+      <article class="source-card"><div class="kind">B200 · vLLM</div><a href="https://github.com/SemiAnalysisAI/InferenceX/actions/runs/32526153588/attempts/3">InferenceX vLLM B200 · attempt 3</a><p>DPA8 + EP8；vllm-simple KV offload。</p></article>
+      <article class="source-card"><div class="kind">B200 · SGLang</div><a href="https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33154296172/job/98793577271">InferenceX SGLang B200 job</a><p>DPA8 + EP8；HiCache。</p></article>
+      <article class="source-card"><div class="kind">Local raw · no affinity</div><a href="data/c48-no-affinity.json">c48 · no Session Affinity · JSON</a><p>完整 AIPerf profile export。</p></article>
+      <article class="source-card"><div class="kind">Local raw · affinity</div><a href="data/c48-affinity.json">c48</a> · <a href="data/c64-affinity.json">c64</a> · <a href="data/c96-affinity.json">c96</a> · <a href="data/c128-affinity.json">c128</a><p>四档完整 AIPerf profile export。</p></article>
+      <article class="source-card"><div class="kind">Live dashboard</div><a href="https://inferencex.semianalysis.com/inference">SemiAnalysis InferenceX dashboard</a><p>持续更新的跨硬件 / 跨框架视图。</p></article>
+      <article class="source-card"><div class="kind">Reproduction</div><a href="https://github.com/yhl-amd/ATOM/blob/main/recipes/DeepSeek-V4-Agentic-InferenceX.md">DeepSeek-V4 Agentic InferenceX recipe</a><p>当前命令与运行口径。</p></article>
+    </div>
+  </section>
+
+  <footer>
+    <span>Generated by <a href="https://github.com/iharnoor/html-everything">/html-everything</a> · 2026-09-06</span>
+    <span class="mono">Source · ATOM_DEP_AGENTIC_OPTIMIZATION_SUMMARY.md</span>
+  </footer>
+</main>
+
+<script>
+(() => {
+  const series = [
+    {
+      key: 'dep', name: 'DEP · MI355X', sub: 'DPA8 + EP8 · current', color: '#ff554d', power: 2.09,
+      points: [
+        { c: 48, x: 40.95, raw: 130.11 }, { c: 64, x: 30.09, raw: 180.19 },
+        { c: 96, x: 19.07, raw: 247.38 }, { c: 128, x: 16.41, raw: 279.94 }
+      ]
+    },
+    {
+      key: 'ci', name: 'Official ATOM DPA CI', sub: 'MI355X · previous', color: '#878d95', power: 2.09, dash: '8 7',
+      points: [
+        { c: 48, x: 37.52, raw: 124.75 }, { c: 64, x: 26.38, raw: 170.40 },
+        { c: 96, x: 18.70, raw: 228.62 }, { c: 128, x: 16.00, raw: 266.80 }
+      ]
+    },
+    {
+      key: 'vllm', name: 'B200 · vLLM', sub: 'CI target line', color: '#09a76d', power: 1.71,
+      points: [
+        { c: 64, x: 42.99, raw: 224.07 }, { c: 96, x: 36.32, raw: 338.78 },
+        { c: 128, x: 32.73, raw: 403.29 }, { c: 160, x: 28.43, raw: 437.54 },
+        { c: 196, x: 19.90, raw: 449.91 }
+      ]
+    },
+    {
+      key: 'sglang', name: 'B200 · SGLang', sub: 'CI target line', color: '#9fce4f', power: 1.71,
+      points: [
+        { c: 64, x: 37.74, raw: 220.42 }, { c: 96, x: 30.67, raw: 294.07 },
+        { c: 128, x: 28.02, raw: 323.22 }, { c: 160, x: 16.78, raw: 300.24 }
+      ]
+    },
+    {
+      key: 'before', name: 'DEP c48 · no Affinity', sub: 'MI355X · controlled A/B', color: '#ffb020', power: 2.09, single: true,
+      points: [{ c: 48, x: 11.19, raw: 67.77034378635605, note: 'No Session Affinity' }]
+    }
+  ];
+
+  const state = {
+    metric: 'efficiency', labels: true, zone: true,
+    visible: Object.fromEntries(series.map(s => [s.key, true])), pinned: null
+  };
+
+  const svg = document.getElementById('perf-chart');
+  const legend = document.getElementById('legend');
+  const tooltip = document.getElementById('tooltip');
+  const plotWrap = document.getElementById('plot-wrap');
+  const W = 980, H = 620;
+  const margin = { top: 28, right: 26, bottom: 80, left: 100 };
+  const pw = W - margin.left - margin.right;
+  const ph = H - margin.top - margin.bottom;
+  const xMax = 50;
+
+  const escapeHtml = value => String(value).replace(/[&<>'"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
+  const yValue = (s, p) => state.metric === 'efficiency' ? p.raw * 1000 / s.power : p.raw;
+  const yMax = () => state.metric === 'efficiency' ? 300000 : 500;
+  const xScale = v => margin.left + (v / xMax) * pw;
+  const yScale = v => margin.top + ph - (v / yMax()) * ph;
+  const fmt = value => new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(value);
+  const fmtTick = value => state.metric === 'efficiency' ? (value === 0 ? '0' : `${Math.round(value/1000)}k`) : String(value);
+
+  function buildLegend() {
+    legend.innerHTML = series.map(s => `
+      <button class="legend-btn ${state.visible[s.key] ? '' : 'off'}" data-key="${s.key}" aria-pressed="${state.visible[s.key]}">
+        <span class="swatch" style="background:${s.color}"></span>
+        <span class="legend-main">${escapeHtml(s.name)}<span class="legend-sub">${escapeHtml(s.sub)}</span></span>
+      </button>`).join('');
+    legend.querySelectorAll('.legend-btn').forEach(btn => btn.addEventListener('click', () => {
+      const key = btn.dataset.key;
+      state.visible[key] = !state.visible[key];
+      state.pinned = null;
+      buildLegend();
+      render();
+    }));
+  }
+
+  function render() {
+    const ymax = yMax();
+    const yTicks = state.metric === 'efficiency' ? [0, 50000, 100000, 150000, 200000, 250000, 300000] : [0, 100, 200, 300, 400, 500];
+    const xTicks = [0, 10, 20, 30, 40, 50];
+    let out = `
+      <defs>
+        <marker id="arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#ffb020"/></marker>
+        <filter id="glow"><feGaussianBlur stdDeviation="2.4" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+      </defs>`;
+
+    if (state.zone) {
+      const zx = xScale(30);
+      out += `<rect x="${zx}" y="${margin.top}" width="${xScale(50)-zx}" height="${ph}" fill="#0029ff" opacity=".055"/>
+        <text x="${zx+10}" y="${margin.top+20}" fill="#7488ff" font-size="12" font-family="JetBrains Mono, monospace">P90 INTERACTIVITY ≥ 30</text>`;
+    }
+
+    yTicks.forEach(v => {
+      const y = yScale(v);
+      out += `<line x1="${margin.left}" x2="${W-margin.right}" y1="${y}" y2="${y}" stroke="#30343a" stroke-width="1"/>
+        <text x="${margin.left-13}" y="${y+4}" text-anchor="end" fill="#a9adb4" font-size="12" font-family="Inter Tight, sans-serif">${fmtTick(v)}</text>`;
+    });
+    xTicks.forEach(v => {
+      const x = xScale(v);
+      out += `<line x1="${x}" x2="${x}" y1="${margin.top}" y2="${margin.top+ph}" stroke="#262a2f" stroke-width="1"/>
+        <text x="${x}" y="${margin.top+ph+25}" text-anchor="middle" fill="#a9adb4" font-size="12" font-family="Inter Tight, sans-serif">${v}</text>`;
+    });
+
+    out += `<line x1="${margin.left}" x2="${W-margin.right}" y1="${margin.top+ph}" y2="${margin.top+ph}" stroke="#777d86"/>
+      <line x1="${margin.left}" x2="${margin.left}" y1="${margin.top}" y2="${margin.top+ph}" stroke="#777d86"/>
+      <text x="${margin.left+pw/2}" y="${H-18}" text-anchor="middle" fill="#f4f5f6" font-size="15" font-weight="600">P90 Interactivity (tok/s/user)</text>
+      <text transform="translate(25 ${margin.top+ph/2}) rotate(-90)" text-anchor="middle" fill="#f4f5f6" font-size="15" font-weight="600">${state.metric === 'efficiency' ? 'Output Token Throughput per All-in Utility MW (tok/s/MW)' : 'Output Token Throughput per Chip (tok/s/chip)'}</text>`;
+
+    const before = series.find(s => s.key === 'before');
+    const dep = series.find(s => s.key === 'dep');
+    if (state.visible.before && state.visible.dep) {
+      const a = before.points[0], b = dep.points[0];
+      out += `<path d="M ${xScale(a.x)} ${yScale(yValue(before,a))} Q ${xScale(24)} ${yScale(ymax*.13)} ${xScale(b.x)} ${yScale(yValue(dep,b))}" fill="none" stroke="#ffb020" stroke-width="2" stroke-dasharray="5 5" marker-end="url(#arrowhead)" opacity=".9"/>
+        <text x="${xScale(25)}" y="${yScale(ymax*.145)}" fill="#ffcb6b" font-size="11" font-family="JetBrains Mono, monospace">SESSION AFFINITY</text>`;
+    }
+
+    series.forEach((s, si) => {
+      if (!state.visible[s.key]) return;
+      const sorted = [...s.points].sort((a,b) => a.x-b.x);
+      if (sorted.length > 1) {
+        const d = sorted.map((p,i) => `${i ? 'L' : 'M'} ${xScale(p.x).toFixed(1)} ${yScale(yValue(s,p)).toFixed(1)}`).join(' ');
+        out += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="3.5" stroke-linejoin="round" stroke-linecap="round" ${s.dash ? `stroke-dasharray="${s.dash}"` : ''} opacity=".95"/>`;
+      }
+      s.points.forEach((p, pi) => {
+        const cx = xScale(p.x), cy = yScale(yValue(s,p));
+        const key = `${s.key}-${p.c}`;
+        const labelDy = s.key === 'ci' ? 21 : s.key === 'sglang' ? 22 : s.key === 'before' ? -14 : -13;
+        const labelDx = s.key === 'ci' ? -5 : s.key === 'sglang' ? 6 : 5;
+        out += `<g class="point" tabindex="0" role="button" aria-label="${escapeHtml(s.name)} c${p.c}" data-series="${s.key}" data-index="${pi}" data-key="${key}">
+          <circle cx="${cx}" cy="${cy}" r="10" fill="none" stroke="#d8dbe0" stroke-width="1.5" stroke-dasharray="3 3" opacity=".75"/>
+          <circle cx="${cx}" cy="${cy}" r="5.5" fill="${s.color}" stroke="#111315" stroke-width="2" filter="url(#glow)"/>
+          ${state.labels ? `<text x="${cx+labelDx}" y="${cy+labelDy}" text-anchor="middle" fill="#e8eaed" font-size="11" font-weight="600" font-family="JetBrains Mono, monospace">c${p.c}</text>` : ''}
+        </g>`;
+      });
+    });
+
+    svg.innerHTML = out;
+    bindPoints();
+  }
+
+  function tooltipContent(s, p) {
+    const eff = p.raw * 1000 / s.power;
+    return `<b style="color:${s.color}">${escapeHtml(s.name)} · c${p.c}</b>
+      <div class="tt-row"><span>P90 interactivity</span><strong>${fmt(p.x)}</strong></div>
+      <div class="tt-row"><span>Output / chip</span><strong>${fmt(p.raw)}</strong></div>
+      <div class="tt-row"><span>Output / MW</span><strong>${fmt(eff)}</strong></div>
+      <div class="tt-row"><span>Power assumption</span><strong>${s.power} kW</strong></div>
+      ${p.note ? `<div style="margin-top:5px;color:#6a6d73">${escapeHtml(p.note)}</div>` : ''}`;
+  }
+
+  function showTooltip(node, s, p) {
+    tooltip.innerHTML = tooltipContent(s,p);
+    const wrapRect = plotWrap.getBoundingClientRect();
+    const nodeRect = node.getBoundingClientRect();
+    let left = nodeRect.left - wrapRect.left + nodeRect.width / 2;
+    let top = nodeRect.top - wrapRect.top;
+    left = Math.max(8, Math.min(left, wrapRect.width - 230));
+    top = Math.max(90, top);
+    tooltip.style.left = `${left}px`;
+    tooltip.style.top = `${top}px`;
+    tooltip.classList.add('show');
+  }
+
+  function bindPoints() {
+    svg.querySelectorAll('.point').forEach(node => {
+      const s = series.find(item => item.key === node.dataset.series);
+      const p = s.points[Number(node.dataset.index)];
+      node.addEventListener('pointerenter', () => showTooltip(node,s,p));
+      node.addEventListener('pointerleave', () => { if (state.pinned !== node.dataset.key) tooltip.classList.remove('show'); });
+      node.addEventListener('click', event => {
+        event.stopPropagation();
+        state.pinned = state.pinned === node.dataset.key ? null : node.dataset.key;
+        if (state.pinned) showTooltip(node,s,p); else tooltip.classList.remove('show');
+      });
+      node.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); node.dispatchEvent(new MouseEvent('click', {bubbles:true})); }
+      });
+    });
+  }
+
+  document.querySelectorAll('.metric-btn').forEach(btn => btn.addEventListener('click', () => {
+    state.metric = btn.dataset.metric;
+    state.pinned = null;
+    tooltip.classList.remove('show');
+    document.querySelectorAll('.metric-btn').forEach(b => b.classList.toggle('active', b === btn));
+    render();
+  }));
+
+  function toggleSwitch(id, key) {
+    const btn = document.getElementById(id);
+    btn.addEventListener('click', () => {
+      state[key] = !state[key];
+      btn.classList.toggle('on', state[key]);
+      btn.setAttribute('aria-checked', String(state[key]));
+      render();
+    });
+  }
+  toggleSwitch('labels-switch', 'labels');
+  toggleSwitch('zone-switch', 'zone');
+
+  document.getElementById('reset').addEventListener('click', () => {
+    state.metric = 'efficiency'; state.labels = true; state.zone = true; state.pinned = null;
+    series.forEach(s => state.visible[s.key] = true);
+    document.querySelectorAll('.metric-btn').forEach(b => b.classList.toggle('active', b.dataset.metric === 'efficiency'));
+    document.getElementById('labels-switch').classList.add('on');
+    document.getElementById('labels-switch').setAttribute('aria-checked','true');
+    document.getElementById('zone-switch').classList.add('on');
+    document.getElementById('zone-switch').setAttribute('aria-checked','true');
+    tooltip.classList.remove('show');
+    buildLegend(); render();
+  });
+
+  svg.addEventListener('click', () => { state.pinned = null; tooltip.classList.remove('show'); });
+  buildLegend();
+  render();
+})();
+</script>
+</body>
+</html>
