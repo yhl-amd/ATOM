@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Atom 与 SGLang 在 AMD MI355X 上的 Agentic CI 并发性能对比，以及 Attention D-split、MoE kernel 两个受控 A/B 实验的改动、完整路径计时与适用边界。">
-  <meta name="generator" content="/html-everything">
+  <meta name="description" content="ATOM 与 SGLang 的 MoE 因果图解：MTP verify 的真实路由、32 行 expert tiles、v33/v32 双向路由交换，以及指定镜像 shared expert 重复追加错误。保留原 CI 与端到端 A/B 结果。">
+  <meta name="generator" content="Hand-authored HTML, CSS, SVG and JavaScript">
   <meta name="color-scheme" content="light">
   <title>Atom 与 SGLang · Agentic CI 并发性能对比</title>
   <style>
@@ -273,6 +273,172 @@
       .lab-flow, .lab-overview article { break-inside: avoid; }
       .lab-overview, .lab-scope { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
+    .mv { --mv-blue: #9bbcff; --mv-green: #7ce0bc; --mv-amber: #ffd083; --mv-muted: #aab8cb; color: #eff4ff; background: #111c2d; border: 1px solid #314157; border-radius: 18px; margin-top: 34px; overflow: hidden; scroll-margin-top: 78px; }
+    .mv *, .mv *::before, .mv *::after { box-sizing: border-box; }
+    .mv h2, .mv h3, .mv h4 { color: #f4f7ff; letter-spacing: -.025em; }
+    .mv p { color: #c4cfdf; font-size: 14px; line-height: 1.95; }
+    .mv strong { color: #f4f7ff; }
+    .mv a { color: #b4ccff; }
+    .mv code { color: #d7e5ff; background: #233147; font-size: .86em; }
+    .mv .mv-mono { font-family: Consolas, "Liberation Mono", "Report Sans SC", monospace; font-variant-numeric: tabular-nums; }
+    .mv .mv-label { color: var(--mv-muted); font-size: 10px; font-weight: 650; letter-spacing: .13em; text-transform: uppercase; }
+    .mv .mv-blue { color: var(--mv-blue); }
+    .mv .mv-green { color: var(--mv-green); }
+    .mv .mv-amber { color: var(--mv-amber); }
+    .mv .mv-fine { font-size: 12px; line-height: 1.9; color: var(--mv-muted); }
+    .mv .mv-hero { padding: 39px 38px 30px; background: radial-gradient(ellipse at 93% 0, #24405a 0, transparent 64%), #142135; }
+    .mv .mv-topline { display: flex; align-items: center; flex-wrap: wrap; justify-content: space-between; gap: 12px; }
+    .mv .mv-badge { display: inline-flex; align-items: center; gap: 8px; border: 1px solid #41645f; border-radius: 30px; padding: 5px 10px; color: #a9f0d6; font-size: 10px; letter-spacing: .03em; }
+    .mv .mv-badge::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: var(--mv-green); }
+    .mv .mv-title { margin: 24px 0 17px; font-size: clamp(29px, 4.6vw, 51px); font-weight: 800; line-height: 1.3; letter-spacing: -.045em; }
+    .mv .mv-title span { color: var(--mv-green); }
+    .mv .mv-intro { max-width: 810px; }
+    .mv .mv-context { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
+    .mv .mv-context span { padding: 5px 9px; border: 1px solid #3b4c63; border-radius: 4px; font-size: 10px; color: #cfdaeb; }
+    .mv .mv-index { display: flex; flex-wrap: wrap; gap: 10px 23px; padding: 16px 38px; background: #0c1625; border-top: 1px solid #304058; border-bottom: 1px solid #304058; }
+    .mv .mv-index a { text-decoration: none; font-size: 11px; color: #bbcadf; }
+    .mv .mv-part { padding: 32px 38px; border-bottom: 1px solid #304058; scroll-margin-top: 79px; }
+    .mv .mv-part:last-child { border-bottom: 0; }
+    .mv .mv-part-head { display: flex; gap: 13px; align-items: flex-start; margin-bottom: 21px; }
+    .mv .mv-number { width: 29px; height: 29px; flex: 0 0 29px; display: grid; place-items: center; border: 1px solid #50647c; border-radius: 50%; color: #b8c7dc; font-size: 10px; margin-top: 2px; }
+    .mv .mv-part h3 { font-size: clamp(20px, 2.6vw, 26px); line-height: 1.5; }
+    .mv .mv-part-head p { margin-top: 6px; font-size: 12px; color: var(--mv-muted); }
+    .mv .mv-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+    .mv .mv-card { min-width: 0; padding: 22px; border: 1px solid #3b4d65; border-radius: 10px; background: #172438; }
+    .mv .mv-card-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .mv .mv-card h4 { font-size: 18px; margin: 0; }
+    .mv .mv-key { font-size: 10px; color: #abbdd5; border: 1px solid #4e6077; border-radius: 4px; padding: 3px 6px; white-space: nowrap; }
+    .mv .mv-flow { display: grid; grid-template-columns: 1fr 25px 1fr 25px 1.5fr 25px 1fr; align-items: stretch; margin-bottom: 18px; }
+    .mv .mv-stage { padding: 15px 13px; border: 1px solid #3b4d65; border-radius: 7px; background: #172438; min-width: 0; }
+    .mv .mv-stage strong { display: block; font-size: 14px; margin: 7px 0; }
+    .mv .mv-stage small { color: #aebed3; font-size: 11px; line-height: 1.8; display: block; }
+    .mv .mv-stage.mv-active { background: #183c37; border-color: #66ad95; }
+    .mv .mv-stage.mv-active strong { color: #c0f8e4; }
+    .mv .mv-arrow { display: grid; place-items: center; color: #8ca0ba; font-size: 20px; }
+    .mv .mv-inline-note { padding: 13px 16px; background: #0f1a2a; border-left: 2px solid #6c88b6; margin-top: 17px; }
+    .mv .mv-inline-note p { font-size: 12px; }
+    .mv .mv-warning { border-color: #bd9152; background: #28251f; }
+    .mv .mv-warning p { color: #e1d4bc; }
+    .mv .mv-model-flow { display: flex; flex-direction: column; gap: 11px; margin-top: 17px; }
+    .mv .mv-path { border: 1px solid #405775; border-radius: 6px; padding: 13px; background: #111e31; }
+    .mv .mv-path strong { display: block; font-size: 12px; }
+    .mv .mv-path small { display: block; margin-top: 5px; color: #aebdd1; font-size: 11px; line-height: 1.8; }
+    .mv .mv-path.mv-shared { border-color: #897044; background: #2b2a26; }
+    .mv .mv-path.mv-fused { border-color: #4a8b79; background: #14312d; padding-top: 20px; padding-bottom: 20px; }
+    .mv .mv-path-join { text-align: center; font-size: 11px; color: #9cacbf; }
+    .mv .mv-tokens { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 5px; margin-top: 17px; }
+    .mv .mv-token { padding: 7px 3px; border: 1px solid #52698a; background: #233a59; border-radius: 4px; text-align: center; color: #c8dcff; font-size: 12px; }
+    .mv .mv-token.mv-token-five { background: #254757; border-color: #52788b; color: #c1e9fa; }
+    .mv .mv-token.mv-token-space { background: #224b3d; border-color: #517d68; color: #b0eec8; }
+    .mv .mv-token.mv-token-zero { background: #343146; border-color: #706683; color: #ded1f9; }
+    .mv .mv-routing-arrow { margin: 13px 0; color: #a7bad4; font-size: 11px; text-align: center; }
+    .mv .mv-counts { display: flex; gap: 20px; align-items: baseline; flex-wrap: wrap; margin: 14px 0; }
+    .mv .mv-counts b { font-size: 38px; font-weight: 650; line-height: 1; letter-spacing: -.055em; }
+    .mv .mv-counts span { font-size: 11px; color: #bdcadd; }
+    .mv .mv-tile-bank { display: grid; grid-template-columns: repeat(9, minmax(0, 1fr)); align-content: start; gap: 5px; min-height: 271px; padding: 11px; border: 1px solid #354760; border-radius: 6px; background: #101b2b; }
+    .mv .mv-tile { display: grid; grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(4, 3px); gap: 1px; padding: 3px; border: 1px solid #3a5377; border-radius: 2px; }
+    .mv .mv-tile i { display: block; background: #2a3a52; min-width: 0; }
+    .mv .mv-tile i.mv-filled { background: #a6c2ff; }
+    .mv .mv-tile-bank.mv-green-bank .mv-tile { border-color: #497c6d; }
+    .mv .mv-tile-bank.mv-green-bank .mv-tile i.mv-filled { background: #8ee9c7; }
+    .mv .mv-shared-marker { font-size: 11px; border-left: 2px solid #e0b366; padding-left: 9px; margin-top: 12px; color: #e3c995; }
+    .mv .mv-tile-caption { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; font-size: 10px; color: #bccbe0; margin-top: 11px; }
+    .mv .mv-equation { display: flex; align-items: center; justify-content: center; gap: 17px; padding: 18px 14px; margin-top: 18px; background: #0d1828; border: 1px solid #354760; border-radius: 6px; font-size: 13px; color: #dce8fb; text-align: center; flex-wrap: wrap; }
+    .mv .mv-equation b { color: var(--mv-amber); }
+    .mv .mv-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin: 19px 0; }
+    .mv .mv-switch { display: inline-flex; flex-wrap: wrap; gap: 4px; border: 1px solid #4a5e77; padding: 4px; border-radius: 7px; background: #0c1625; }
+    .mv button { font-family: inherit; cursor: pointer; }
+    .mv .mv-switch button { color: #b6c6dd; background: none; border: 1px solid transparent; padding: 9px 11px; font-size: 12px; border-radius: 4px; line-height: 1.5; }
+    .mv .mv-switch button[aria-pressed="true"] { color: #0c2422; background: #a8edcf; border-color: #b5f9dc; font-weight: 700; }
+    .mv .mv-switch.mv-gpu button[aria-pressed="true"] { background: #c5d6f5; color: #102541; border-color: #d5e3fc; }
+    .mv button:focus-visible, .mv a:focus-visible, .mv summary:focus-visible { outline: 3px solid #ffd083; outline-offset: 3px; }
+    .mv .mv-swap-view { min-width: 0; }
+    .mv .mv-route-source { margin: 16px 0 12px; display: flex; align-items: center; gap: 10px; font-size: 12px; color: #c6d5ec; }
+    .mv .mv-source-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--mv-blue); flex: 0 0 8px; }
+    .mv .mv-route-source[data-origin="sglang"] .mv-source-dot { background: var(--mv-green); }
+    .mv .mv-measure { display: flex; gap: 12px; align-items: baseline; margin-top: 8px; }
+    .mv .mv-measure output { font-size: clamp(34px, 4vw, 48px); color: var(--mv-blue); font-weight: 650; letter-spacing: -.05em; }
+    .mv .mv-sglang-output output { color: var(--mv-green); }
+    .mv .mv-measure small { color: #b9c7da; font-size: 12px; }
+    .mv .mv-bar-track { position: relative; height: 13px; background: #2b3d57; border-radius: 3px; margin: 11px 0 7px; overflow: hidden; }
+    .mv .mv-bar { height: 100%; background: var(--mv-blue); transition: width .45s ease; }
+    .mv .mv-sglang-output .mv-bar { background: var(--mv-green); }
+    .mv .mv-axis { display: flex; justify-content: space-between; color: #9bacc5; font-size: 9px; }
+    .mv .mv-status { padding: 15px 17px; margin-top: 16px; border: 1px solid #49695f; border-radius: 6px; color: #c5f0dc; background: #162d2c; font-size: 13px; line-height: 1.8; }
+    .mv details { margin-top: 17px; padding: 14px 16px; background: #132035; border: 1px solid #3b4d65; border-radius: 6px; }
+    .mv summary { color: #cedaf0; font-size: 12px; cursor: pointer; line-height: 1.8; }
+    .mv .mv-scroll { overflow-x: auto; margin-top: 14px; }
+    .mv table { width: 100%; border-collapse: collapse; font-size: 11px; color: #d8e3f5; }
+    .mv th { background: #22334c; color: #d2dff3; font-size: 11px; text-align: left; }
+    .mv td, .mv th { padding: 10px 9px; border-bottom: 1px solid #3a4d69; }
+    .mv td { background: transparent; }
+    .mv tbody tr:hover td { background: #20334c; }
+    .mv caption { text-align: left; padding-bottom: 10px; color: #acbfd7; line-height: 1.8; font-size: 11px; }
+    .mv .mv-bug-flow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 19px 0; }
+    .mv .mv-bug-step { background: #172438; border: 1px solid #445670; border-radius: 6px; padding: 16px; }
+    .mv .mv-bug-step p { font-size: 12px; margin-top: 7px; }
+    .mv .mv-bug-step .mv-formula { font-size: 22px; margin: 14px 0 8px; color: #ffd083; }
+    .mv .mv-bug-step.mv-error { border-color: #b48657; background: #302922; }
+    .mv .mv-bug-step.mv-correct { border-color: #568c75; background: #15342b; }
+    .mv .mv-slot-row { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 7px; margin: 12px 0; }
+    .mv .mv-slot { border: 1px solid #5575a2; background: #233854; border-radius: 5px; text-align: center; min-width: 0; padding: 12px 2px; }
+    .mv .mv-slot b { display: block; font-size: 18px; font-weight: 650; color: #c7dcff; }
+    .mv .mv-slot small { display: block; font-size: 9px; color: #aabcda; margin-top: 7px; }
+    .mv .mv-slot.mv-slot-shared { background: #363024; border-color: #9c7e4c; }
+    .mv .mv-slot.mv-slot-shared b, .mv .mv-slot.mv-slot-shared small { color: #f0ce95; }
+    .mv .mv-slot.mv-slot-missing { background: #2b2528; border: 1px dashed #d3a078; }
+    .mv .mv-slot.mv-slot-missing b { color: #ffd1ac; }
+    .mv .mv-slot.mv-slot-missing small { color: #c7afa3; }
+    .mv .mv-slot.mv-slot-restored { border-color: #82d8b8; background: #1f493d; }
+    .mv .mv-slot.mv-slot-restored b { color: #bcf7df; }
+    .mv .mv-slots-panel { border: 1px solid #465a73; padding: 21px; background: #132136; border-radius: 8px; }
+    .mv .mv-sort-label { font-size: 11px; color: #b7c8df; text-align: center; padding: 8px; }
+    .mv .mv-slot-result { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 15px; margin-top: 17px; border-top: 1px solid #41546c; padding-top: 16px; }
+    .mv .mv-slot-result output { font-size: 31px; color: #ffd083; font-variant-numeric: tabular-nums; }
+    .mv .mv-slot-result span { color: #c4d2e6; font-size: 12px; }
+    .mv .mv-findings { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 15px; margin-top: 19px; }
+    .mv .mv-finding { padding: 17px; border-top: 2px solid #6592bb; background: #172438; }
+    .mv .mv-finding h4 { margin: 10px 0; font-size: 15px; }
+    .mv .mv-finding p { font-size: 12px; }
+    .mv .mv-finding.mv-unknown { border-color: #c59652; }
+    .mv .mv-footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 13px; align-items: center; margin-top: 23px; }
+    .mv .mv-export { border: 1px solid #658a79; padding: 10px 14px; color: #c4f2dd; background: #203b34; border-radius: 5px; font-size: 12px; }
+    .mv [hidden] { display: none !important; }
+    @media (max-width: 980px) { .mv .mv-hero, .mv .mv-part { padding: 28px 23px; } .mv .mv-index { padding: 15px 23px; } .mv .mv-card { padding: 17px; } .mv .mv-tile-bank { grid-template-columns: repeat(7, minmax(0, 1fr)); min-height: 287px; } .mv .mv-flow { grid-template-columns: 1fr 21px 1fr 21px 1.25fr 21px 1fr; } .mv .mv-stage { padding: 12px 9px; } }
+    @media (max-width: 700px) {
+      .mv { border-radius: 11px; }
+      .mv .mv-grid, .mv .mv-findings, .mv .mv-bug-flow { grid-template-columns: 1fr; }
+      .mv .mv-hero, .mv .mv-part { padding: 25px 17px; }
+      .mv .mv-index { padding: 14px 17px; gap: 10px 17px; }
+      .mv .mv-title { font-size: 32px; }
+      .mv .mv-flow { grid-template-columns: 1fr; gap: 5px; }
+      .mv .mv-arrow { transform: rotate(90deg); height: 15px; font-size: 17px; }
+      .mv .mv-stage { padding: 13px 15px; }
+      .mv .mv-stage strong { display: inline; margin-left: 8px; }
+      .mv .mv-stage small { margin-top: 5px; }
+      .mv .mv-tile-bank { grid-template-columns: repeat(8, minmax(0, 1fr)); min-height: 0; }
+      .mv .mv-card { padding: 17px; }
+      .mv .mv-tile-caption { font-size: 10px; }
+      .mv .mv-slot-row { gap: 4px; }
+      .mv .mv-slot { padding: 10px 1px; }
+      .mv .mv-slot b { font-size: 12px; }
+      .mv .mv-slot small { font-size: 8px; }
+      .mv .mv-slots-panel { padding: 13px 9px; }
+      .mv .mv-switch button { font-size: 11px; padding: 8px; }
+      .mv .mv-counts b { font-size: 34px; }
+      .mv .mv-topline { align-items: flex-start; flex-direction: column; }
+      .mv .mv-equation { gap: 9px; font-size: 12px; }
+    }
+    @media (prefers-reduced-motion: reduce) { .mv .mv-bar { transition: none; } }
+    @media print {
+      .mv { overflow: visible; border-radius: 0; }
+      .mv .mv-switch, .mv .mv-export, .mv .mv-index { display: none; }
+      .mv .mv-part { padding: 22px; }
+      .mv .mv-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .mv .mv-card, .mv .mv-slots-panel, .mv .mv-bug-flow { break-inside: avoid; }
+      .mv .mv-tile-bank { grid-template-columns: repeat(7, minmax(0, 1fr)); min-height: 0; }
+    }
+    @font-face { font-family: "Report Sans SC"; font-style: normal; font-weight: 400 900; font-display: swap; src: url("data:font/woff2;base64,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") format("woff2"); unicode-range: U+4E03,U+4E13,U+4E94,U+4EAB,U+4EAE,U+4EB2,U+4FA7,U+516D,U+5199,U+51B7,U+51FD,U+5220,U+5373,U+5374,U+53C8,U+56DB,U+5907,U+591F,U+5BB6,U+5C04,U+5C31,U+5DF1,U+5E95,U+5FC5,U+610F,U+6211,U+624B,U+6263,U+626B,U+6355,U+6620,U+666E,U+6697,U+69FD,U+6DFB,U+6E38,U+753B,U+77E9,U+786C,U+7A76,U+7ADF,U+7CFB,U+7EA7,U+7ED8,U+7EE9,U+7F16,U+83B7,U+867D,U+89C4,U+8BA9,U+8BBF,U+8BCA,U+8BD1,U+8C01,U+8C08,U+8D1F,U+8D70,U+8DDF,U+95EE,U+9635,U+9762,U+987B,U+9898; }
   </style>
 </head>
 <body>
@@ -282,9 +448,119 @@
       <h1 class="display"><span class="atom-text">Atom</span><span class="versus">与</span><span class="sglang-text">SGLang</span><span class="headline-cn">Agentic CI 并发性能对比</span></h1>
       <p class="lead">同一模型，两套部署方案。把吞吐、用户交互速度与配置放在一起看，<br class="desktop-break">才能分清单 chip 效率、整机能力，以及高并发下的取舍。</p>
       <div class="meta-row"><span class="tag mono">AMD MI355X</span><span class="tag mono">deepseek-ai/DeepSeek-V4-Pro</span><span class="tag mono">FP4</span><span class="tag mono">MTP</span><span class="tag">2 sweeps · 20 个结果点 · 8 个共同并发点</span></div>
-      <div class="lab-jump"><a href="#e2e-kernel-ab">新增：两处改动一起开，整体 TPOT 提升了吗？ ↗</a><span>2026-09-07 端到端验证 · P90 改善，但均值与严格配对请求退化 · 原 CI 数据未改动</span></div>
+      <div class="lab-jump"><a href="#moe-causal-map">最新图解：同名 MoE，为什么会差这么多？ ↗</a><span>2026-09-08 更新 · 双向交换路由的因果证据 + shared 重复追加复现 · 原 CI 数据不变</span></div>
     </header>
-    <nav class="nav" aria-label="报告导航"><div class="nav-inner"><a href="#performance">关键曲线</a><a href="#compare">同并发对照</a><a href="#e2e-kernel-ab">端到端组合 A/B</a><a href="#kernel-experiments">两个局部实验</a><a href="#configuration">配置差异</a><a href="#reliability">延迟与能效</a><a href="#atom-results">全部数据</a><a href="#conclusions">结论</a><a href="#sources">数据来源</a><button class="button download" id="download-csv" type="button">导出 CSV ↓</button></div></nav>
+    <nav class="nav" aria-label="报告导航"><div class="nav-inner"><a href="#moe-causal-map">MoE 因果图解</a><a href="#performance">关键曲线</a><a href="#compare">同并发对照</a><a href="#e2e-kernel-ab">端到端组合 A/B</a><a href="#kernel-experiments">两个局部实验</a><a href="#configuration">配置差异</a><a href="#reliability">延迟与能效</a><a href="#atom-results">全部数据</a><a href="#conclusions">结论</a><a href="#sources">数据来源</a><button class="button download" id="download-csv" type="button">导出 CSV ↓</button></div></nav>
+
+    <section class="mv" id="moe-causal-map" aria-labelledby="mv-title" data-revision="moe-causal-20260908-v1">
+      <div class="mv-hero">
+        <div class="mv-topline"><span class="mv-label">Kernel anatomy / 2026.09.08</span><span class="mv-badge">真实输入 · 双向干预 · 两张 GPU 复现</span></div>
+        <h2 class="mv-title" id="mv-title">不是名字更快。<br><span>是交给它的工作不同。</span></h2>
+        <p class="mv-intro">ATOM 的 <strong>v33</strong> 与 SGLang 的 <strong>v32</strong>，同为 BF16 / kw2 的 stage1 kernel。把真实 expert 路由互换，快慢也随之反转。关键不是版本号，而是 <strong>16 个 token 究竟落到多少个 experts</strong>。</p>
+        <div class="mv-context"><span>DSv4 Pro · MI355X · TP8 / C16</span><span>MTP target verify · T=16</span><span>tile 32 × 64 × 256 · BF16 output</span><span>实验 09.07 · 图解 09.08</span></div>
+        <div class="mv-inline-note mv-warning"><p><strong>不要把观测结果写成“刻意少算的优化”。</strong> 路由集中可以自然降低块级开销；但本镜像重复追加 shared、少选 routed expert，是另一个正确性问题。我们没有证据说明 SGLang 有意制造重复 token，也没有证明两件事互为因果。</p></div>
+      </div>
+      <nav class="mv-index" aria-label="MoE 图解章节"><a href="#mv-phase">01 发生在哪里</a><a href="#mv-paths">02 两条 MoE 路径</a><a href="#mv-routing">03 工作量怎么变小</a><a href="#mv-swap">04 亲自交换路由</a><a href="#mv-gate">05 少一个 expert 的错误</a><a href="#mv-boundary">06 能得出什么结论</a></nav>
+
+      <article class="mv-part" id="mv-phase" aria-labelledby="mv-phase-title">
+        <div class="mv-part-head"><span class="mv-number mv-mono">01</span><div><h3 id="mv-phase-title">在生成阶段，但不是普通单 token decode。</h3><p>取样发生在 warmup 完成后的工作负载中，不是启动时 graph capture 的假输入。</p></div></div>
+        <div class="mv-flow" aria-label="prefill 后进入 MTP draft，随后主模型 target verify，再接受候选并继续生成">
+          <div class="mv-stage"><span class="mv-label">Prefill</span><strong>处理 prompt</strong><small>建立上下文与 KV cache</small></div><span class="mv-arrow" aria-hidden="true">→</span>
+          <div class="mv-stage"><span class="mv-label">MTP draft</span><strong>提出候选</strong><small>本次配置：3 个 draft token</small></div><span class="mv-arrow" aria-hidden="true">→</span>
+          <div class="mv-stage mv-active"><span class="mv-label">Target verify · 本次取样</span><strong>主模型验证 4 个位置</strong><small>layer0：hash 路由集中<br>layer30：普通 gate 缺槽位</small></div><span class="mv-arrow" aria-hidden="true">→</span>
+          <div class="mv-stage"><span class="mv-label">Accept / advance</span><strong>推进生成</strong><small>接受候选后进入下一轮<br>不代表 4 个位置全部被接受</small></div>
+        </div>
+        <p class="mv-fine"><strong>T=16 = 4 个请求槽位 × 4 个 verify 位置。</strong> 有 graph padding 时，槽位数不一定是真实请求数。这里的“普通路由”指非 hash gate，不是“关闭 MTP 的普通 decode”。</p>
+      </article>
+
+      <article class="mv-part" id="mv-paths" aria-labelledby="mv-paths-title">
+        <div class="mv-part-head"><span class="mv-number mv-mono">02</span><div><h3 id="mv-paths-title">先分清实现差异，再谈谁更快。</h3><p>模型本来需要：每个 token 选择 6 个 routed experts，再计算 1 个 always-on shared expert。</p></div></div>
+        <div class="mv-grid">
+          <div class="mv-card"><div class="mv-card-top"><h4 class="mv-blue">ATOM</h4><span class="mv-key">shared 分开计算</span></div><div class="mv-model-flow">
+            <div class="mv-path"><strong>384 个 routed experts 中选 6 个</strong><small>FP4 权重 → 本次 BF16 / kw2 v33 stage1 → 中间量化 → stage2</small></div>
+            <div class="mv-path-join">＋ 独立 shared 分支</div>
+            <div class="mv-path mv-shared"><strong>1 个 shared expert · FP8 权重</strong><small>shared 不在上述 routed kernel 的 E384 / top-k6 里面</small></div>
+            <div class="mv-path-join">↓ 合并分支输出</div>
+          </div></div>
+          <div class="mv-card"><div class="mv-card-top"><h4 class="mv-green">SGLang</h4><span class="mv-key">shared 融入 MoE</span></div><div class="mv-model-flow">
+            <div class="mv-path mv-fused"><strong>384 routed ＋ expert384（shared）</strong><small>shared 转为 FP4 后合入专家池<br>预期 top-k7 = 6 routed ＋ 1 shared<br>共同经过 BF16 / kw2 v32 stage1 与后续路径</small></div>
+            <div class="mv-path-join">↓ 同一 MoE 路径聚合输出</div>
+            <p class="mv-fine">融合有机会减少独立分支开销；但量化和执行路径也改变了。<strong>本轮没有单独测出 shared fusion 的收益。</strong></p>
+          </div></div>
+        </div>
+        <div class="mv-inline-note"><p>比较的是两个 <strong>BF16 输出</strong>的 stage1 kernel，不是早先带 <code>fp8q_sort</code> 的 FP8 输出版本。也不能把“多融合了一个 shared”直接解释成单条 kernel 快约 79%。真正的因果证据在下面。</p></div>
+      </article>
+
+      <article class="mv-part" id="mv-routing" aria-labelledby="mv-routing-title">
+        <div class="mv-part-head"><span class="mv-number mv-mono">03</span><div><h3 id="mv-routing-title">同样 96 次分配，可以铺开 79 块，也可以只用 18 块。</h3><p>真实 layer0 / step65 快照。首层按 token ID 查表选 expert：同 ID → 同一组六个 routed experts。</p></div></div>
+        <div class="mv-grid">
+          <div class="mv-card"><div class="mv-card-top"><h4 class="mv-blue">ATOM · 分散</h4><span class="mv-key">14 种 token ID</span></div>
+            <div class="mv-tokens mv-mono" id="mv-atom-tokens" aria-label="ATOM 的 16 个真实 token ID"><span class="mv-token">17249</span><span class="mv-token">16</span><span class="mv-token">455</span><span class="mv-token">5610</span><span class="mv-token">16</span><span class="mv-token">455</span><span class="mv-token">3967</span><span class="mv-token">4496</span><span class="mv-token">33</span><span class="mv-token">342</span><span class="mv-token">4571</span><span class="mv-token">11568</span><span class="mv-token">362</span><span class="mv-token">1694</span><span class="mv-token">418</span><span class="mv-token">260</span></div>
+            <div class="mv-routing-arrow">↓ hash lookup → sort by expert</div>
+            <div class="mv-counts"><b class="mv-blue mv-mono">79</b><span>个 routed expert M blocks</span></div>
+            <div class="mv-tile-bank" id="mv-atom-tiles" role="img" aria-label="79 个 expert blocks，32 行一块；一共 96 个有效分配，多数块仅一两个有效 token"></div>
+            <div class="mv-tile-caption"><span>96 个有效分配</span><span>79 × 32 = 2,528 行 tile 容量</span></div>
+            <p class="mv-shared-marker">另有独立 shared 分支，不计入这里的 79 块。</p>
+          </div>
+          <div class="mv-card"><div class="mv-card-top"><h4 class="mv-green">SGLang · 集中</h4><span class="mv-key">3 种 token ID</span></div>
+            <div class="mv-tokens mv-mono" id="mv-sglang-tokens" aria-label="SGLang 的 16 个真实 token ID，是 5、223、0、0 重复四次"><span class="mv-token mv-token-five">5</span><span class="mv-token mv-token-space">223</span><span class="mv-token mv-token-zero">0</span><span class="mv-token mv-token-zero">0</span><span class="mv-token mv-token-five">5</span><span class="mv-token mv-token-space">223</span><span class="mv-token mv-token-zero">0</span><span class="mv-token mv-token-zero">0</span><span class="mv-token mv-token-five">5</span><span class="mv-token mv-token-space">223</span><span class="mv-token mv-token-zero">0</span><span class="mv-token mv-token-zero">0</span><span class="mv-token mv-token-five">5</span><span class="mv-token mv-token-space">223</span><span class="mv-token mv-token-zero">0</span><span class="mv-token mv-token-zero">0</span></div>
+            <div class="mv-routing-arrow">↓ hash lookup → sort by expert</div>
+            <div class="mv-counts"><b class="mv-green mv-mono">18</b><span>个 routed expert M blocks</span></div>
+            <div class="mv-tile-bank mv-green-bank" id="mv-sglang-tiles" role="img" aria-label="18 个 routed expert blocks，32 行一块；一共 96 个有效分配，每块有 4 或 8 个有效 token"></div>
+            <div class="mv-tile-caption"><span>仍是 96 个有效分配</span><span>18 × 32 = 576 行 tile 容量</span></div>
+            <p class="mv-shared-marker">加上 fused shared 的 1 块，实际 stage1 共 19 块。</p>
+          </div>
+        </div>
+        <p class="mv-fine" style="margin-top:13px">每个小框表示一个 expert 的 32 行 tile 容量；亮格是有效 token→expert 分配，暗格是 padding。按真实 expert 计数绘制，格子位置仅作容量示意，不代表实际线程布局；悬停可看 expert ID。<noscript>启用 JavaScript 可显示逐块细节，所有计数与结论仍可直接阅读。</noscript></p>
+        <div class="mv-equation"><span>同样 <strong>16 × 6 = 96</strong> 次有效分配</span><span aria-hidden="true">≠</span><span>相同的 <b>矩阵块数量 / 权重访问</b></span></div>
+        <p style="margin-top:16px">这就是“性能为什么好”的直接机制：多个 token 命中同一个 expert，能够共用一块矩阵计算；分散到不同 experts，即使一块只有一两个有效 token，也要处理更多 tiles、访问更多不同的权重。<strong>这里没有删除重复 token，也不是复用整段输出或 prefix cache。</strong></p>
+        <div class="mv-inline-note mv-warning"><p><strong>集中是已观测到的事实，不是已证实的设计意图。</strong> token ID 从 checkpoint 的 hash 映射唯一反查得到。ID 0 不等于零激活，也不能自动认定为 padding；重复/零 token 的更上游来源尚未查明。首层 hash 的规则也不能直接套到所有后续 gate 层。</p></div>
+      </article>
+
+      <article class="mv-part" id="mv-swap" aria-labelledby="mv-swap-title">
+        <div class="mv-part-head"><span class="mv-number mv-mono">04</span><div><h3 id="mv-swap-title">kernel 留下，路由换位。</h3><p>点击切换：各自的真实 HSACO、模型权重、输入激活都不变，只交换六个 routed expert IDs。SGLang 保留自己的 shared。</p></div></div>
+        <div class="mv-toolbar"><div class="mv-switch" role="group" aria-label="选择路由干预状态"><button type="button" data-mv-routing="native" aria-pressed="true" aria-controls="mv-swap-view">原始路由</button><button type="button" data-mv-routing="swapped" aria-pressed="false" aria-controls="mv-swap-view">⇄ 交换路由</button></div><div class="mv-switch mv-gpu" role="group" aria-label="选择实际测量 GPU"><button type="button" data-mv-gpu="0" aria-pressed="true">GPU 0</button><button type="button" data-mv-gpu="4" aria-pressed="false">GPU 4</button></div></div>
+        <div class="mv-grid mv-swap-view" id="mv-swap-view">
+          <div class="mv-card"><div class="mv-card-top"><h4 class="mv-blue">ATOM v33</h4><span class="mv-key">二进制不变</span></div><div class="mv-route-source" id="mv-atom-origin" data-origin="atom"><span class="mv-source-dot"></span><span id="mv-atom-origin-text">← ATOM 路由 · 79 routed blocks</span></div><p class="mv-fine">E384 / top-k6 · 96 个计算槽位始终保留</p><div class="mv-measure mv-mono"><output id="mv-atom-time">41.420</output><small>μs / stage1</small></div><div class="mv-bar-track" aria-hidden="true"><div class="mv-bar" id="mv-atom-bar" style="width:82.84%"></div></div><div class="mv-axis mv-mono" aria-hidden="true"><span>0</span><span>25</span><span>50 μs</span></div></div>
+          <div class="mv-card mv-sglang-output"><div class="mv-card-top"><h4 class="mv-green">SGLang v32</h4><span class="mv-key">二进制不变</span></div><div class="mv-route-source" id="mv-sglang-origin" data-origin="sglang"><span class="mv-source-dot"></span><span id="mv-sglang-origin-text">← SGLang 路由 · 18 routed + 1 shared</span></div><p class="mv-fine">E385 / top-k7 · 112 个计算槽位始终保留</p><div class="mv-measure mv-mono"><output id="mv-sglang-time">14.449</output><small>μs / stage1</small></div><div class="mv-bar-track" aria-hidden="true"><div class="mv-bar" id="mv-sglang-bar" style="width:28.898%"></div></div><div class="mv-axis mv-mono" aria-hidden="true"><span>0</span><span>25</span><span>50 μs</span></div></div>
+        </div>
+        <div class="mv-status" id="mv-swap-status" role="status" aria-live="polite">原始路由：v33 约 41 μs，v32 约 14 μs。交换后，快慢关系会反转。</div>
+        <p class="mv-fine" style="margin-top:14px"><strong>这是单层受控 replay，不是整机 TPOT。</strong> 原输入 replay 与捕获输出逐位相等；重新生成原路由的控制组也逐位相等。交换后保持完整槽位、输出全部有限，激活 scale 仅随路由重排、不重新量化。不同路由会改变模型输出，因此不是可直接部署的提速补丁。</p>
+        <details open><summary>展开原始数值与计时方法 · 两张 GPU、每组 8 轮</summary><div class="mv-scroll"><table id="mv-swap-table"><caption>Graph replay 单次 stage1 中位数，μs，越低越好；非 CPU launch 时间。</caption><thead><tr><th scope="col">固定实现</th><th scope="col">路由来源</th><th scope="col">有效 blocks</th><th scope="col">GPU0</th><th scope="col">GPU4</th></tr></thead><tbody><tr><td>ATOM v33</td><td>ATOM</td><td>79</td><td>41.420</td><td>41.642</td></tr><tr><td>ATOM v33</td><td>SGLang</td><td>18</td><td>14.378</td><td>14.463</td></tr><tr><td>SGLang v32</td><td>SGLang</td><td>19</td><td>14.449</td><td>14.514</td></tr><tr><td>SGLang v32</td><td>ATOM</td><td>80</td><td>41.832</td><td>42.160</td></tr></tbody></table></div><p class="mv-fine" style="margin-top:12px">固定运行环境、同一 GPU 串行测量，直接加载服务中实际使用的 HSACO，不重新编译。另做前置 512 MiB 内存扫过，路由导致的快慢反转仍存在；这不是硬件计数器证明的完全冷缓存。</p></details>
+      </article>
+
+      <article class="mv-part" id="mv-gate" aria-labelledby="mv-gate-title">
+        <div class="mv-part-head"><span class="mv-number mv-mono">05</span><div><h3 id="mv-gate-title">另一件事：七个槽位，不一定真有 6＋1 个专家。</h3><p>指定 ROCm724 SGLang 镜像的普通 gate / TP shared-fusion 路径：调用者与 gate 对 topk 的定义不一致。</p></div></div>
+        <div class="mv-toolbar"><div class="mv-switch" role="group" aria-label="选择 gate 最小复现状态"><button type="button" data-mv-gate="current" aria-pressed="true" aria-controls="mv-gate-view">实测错误路径</button><button type="button" data-mv-gate="control" aria-pressed="false" aria-controls="mv-gate-view">最小复现：只改 gate 参数</button></div><span class="mv-fine">不代表生产服务已修复</span></div>
+        <div id="mv-gate-view">
+          <div class="mv-bug-flow">
+            <div class="mv-bug-step"><span class="mv-label">01 / Caller</span><div class="mv-formula mv-mono">7 − 1 = 6</div><p>外层先扣掉一个 shared，准备让 gate 选六个 routed。</p></div>
+            <div class="mv-bug-step mv-error" id="mv-gate-middle"><span class="mv-label">02 / Gate</span><div class="mv-formula mv-mono" id="mv-gate-formula">6 − 1 = 5</div><p id="mv-gate-explanation">却仍传 shared=1。底层把 topk 当作含 shared 的总数，于是又减一次，只选五个 routed。</p></div>
+            <div class="mv-bug-step"><span class="mv-label">03 / Append</span><div class="mv-formula mv-mono" id="mv-gate-append">5 routed + 2 shared</div><p id="mv-append-explanation">外层再追加 shared384。列表虽长七，但 shared 重复，缺第六个 routed。</p></div>
+          </div>
+          <div class="mv-slots-panel"><div class="mv-card-top"><strong style="font-size:13px">最小 GPU 复现：实际 expert IDs</strong><span class="mv-fine">示例来自随机 logits 控制实验</span></div>
+            <div class="mv-slot-row" id="mv-before-sort" aria-label="append 后的七个 expert 槽位"><div class="mv-slot"><b>118</b><small>routed 1</small></div><div class="mv-slot"><b>354</b><small>routed 2</small></div><div class="mv-slot"><b>120</b><small>routed 3</small></div><div class="mv-slot"><b>220</b><small>routed 4</small></div><div class="mv-slot"><b>302</b><small>routed 5</small></div><div class="mv-slot mv-slot-shared" id="mv-before-sixth"><b id="mv-before-sixth-id">384</b><small id="mv-before-sixth-label">shared</small></div><div class="mv-slot mv-slot-shared"><b>384</b><small>shared</small></div></div>
+            <div class="mv-sort-label" id="mv-sort-description">↓ 原 sorter 处理后：重复 expert/token 组合只保留最后一个槽位</div>
+            <div class="mv-slot-row" id="mv-after-sort" aria-label="排序后，前五个 routed 存在，第六槽缺失，最后一个 shared 存在"><div class="mv-slot"><b>118</b><small>slot 0</small></div><div class="mv-slot"><b>354</b><small>slot 1</small></div><div class="mv-slot"><b>120</b><small>slot 2</small></div><div class="mv-slot"><b>220</b><small>slot 3</small></div><div class="mv-slot"><b>302</b><small>slot 4</small></div><div class="mv-slot mv-slot-missing" id="mv-after-sixth"><b id="mv-after-sixth-id">缺失</b><small>slot 5</small></div><div class="mv-slot mv-slot-shared"><b>384</b><small>slot 6</small></div></div>
+            <div class="mv-slot-result"><output class="mv-mono" id="mv-slot-count">96 / 112</output><span id="mv-slot-count-description">16 个 token × 6 个有效槽位；每个 token 真正少选一个 routed expert。</span></div>
+          </div>
+        </div>
+        <div class="mv-inline-note mv-warning"><p id="mv-gate-status" role="status" aria-live="polite"><strong>这是正确性问题，不是合法的性能优化。</strong> 真实 layer30 的三份快照同样缺 slot5。该缺槽会减少 routed 工作，但不能据此推断对输出质量或 TPOT 的全部影响。</p></div>
+        <details><summary>修正参数的正控制与源码逻辑 · 为什么 shared 必须只添加一次？</summary><p class="mv-fine" style="margin-top:12px">原调用传 <code>topk=6, shared=1</code>，gate 内部按 <code>routed=topk−shared</code> 只选五个；之后外层又 append。正控制改为 <code>topk=6, shared=0</code>，gate 只生成六个 routed，再由外层追加一个 shared，恢复 112/112 槽位。</p><p class="mv-fine" style="margin-top:9px">范围限定：<code>rocm/sgl-dev:v0.5.19-rocm724-mi35x-20260906</code> 的 TP、非 DPA、shared fusion 路径；不是所有 SGLang 版本或后端。这个问题也不是路由交换实验的前提：layer0 保留完整六 routed 时，仍有 79 vs 18 的差异。</p></details>
+      </article>
+
+      <article class="mv-part" id="mv-boundary" aria-labelledby="mv-boundary-title">
+        <div class="mv-part-head"><span class="mv-number mv-mono">06</span><div><h3 id="mv-boundary-title">真正该比较的是“同样的正确工作”。</h3><p>不把低工作量当作 kernel 能力，也不把低层实验直接换算成整机 TPOT 收益。</p></div></div>
+        <div class="mv-findings">
+          <div class="mv-finding"><span class="mv-label mv-green">已完成因果验证</span><h4>集中路由 → 更少 expert tiles</h4><p>保持完整槽位，换路由后快慢反转。v33 也能约 14 μs，v32 也会约 42 μs。主要差异跟随实际路由工作量。</p></div>
+          <div class="mv-finding"><span class="mv-label mv-amber">已复现实现错误</span><h4>重复 shared → 少一个 routed</h4><p>这不是正确模型应享有的“提速”。当前只完成原函数的最小复现与参数正控制，未做全模型修复验证。</p></div>
+          <div class="mv-finding mv-unknown"><span class="mv-label mv-amber">仍未查明 / 不能断言</span><h4>零 token 从哪里来？</h4><p>还没有证明是 draft、采样、graph buffer 或上述 gate 错误导致。不能画成“gate bug → 零 token → 全部差距”的确定因果链。</p></div>
+        </div>
+        <div class="mv-inline-note"><p><strong>下一步不是继续把 v33 换成 v32。</strong> 先修正对照侧的 shared 路由，验证六 routed + 一 shared 及 draft/verify 输入；再在正确、可比的工作量下看完整 MoE 路径和端到端 TPOT。shared 融合的独立收益与量化代价，也需要另做 A/B。</p></div>
+        <details><summary>证据边界、数值校验与历史 trace 的区别</summary><p class="mv-fine" style="margin-top:12px">历史 rank0 / batch4 trace 的 stage1 均值为 ATOM window1 34.335 μs、SGLang 19.134 μs，覆盖 61 层。图解中的 41/14 μs 则是新采样 layer0 / step65 的受控 replay，不是历史 trace 的同一统计口径，也不代表所有层都快了三倍。</p><p class="mv-fine" style="margin-top:10px">服务中采样 layer0 与 layer30，各三次，共十二份快照；两张 GPU 的原二进制 replay 对所有实际路由槽位均逐位一致。复制 hook 带有诊断开销，本轮服务延迟不作新成绩。ATOM 与 SGLang 的请求身份和时间步未成对；因果实验通过在各自固定输入上改变路由完成隔离。</p><p class="mv-fine" style="margin-top:10px">ATOM HSACO：<code>acebfb325d25…4ed4617</code>；SGLang HSACO：<code>6f52ee8e336a…8da469</code>。加载产物均为 LDS 41088 bytes、VGPR 142、无 spill。完整 hash 和图中数据可从下方下载；不包含模型权重或原始 tensor。</p></details>
+        <div class="mv-footer"><button class="mv-export" id="mv-export-evidence" type="button">下载图解证据 JSON ↓</button><span class="mv-fine">手写 HTML / CSS / JavaScript · 本节不改动原 CI 数据</span><a class="mv-fine" href="#e2e-kernel-ab">回看端到端 A/B 与原 trace ↓</a></div>
+      </article>
+    </section>
 
     <section class="section" id="summary">
       <div class="section-head"><div><div class="kicker">01 / Executive summary</div><h2>先看结论，再看边界。</h2></div><span class="subtext">执行摘要 · 仅描述本次 CI 实测</span></div>
@@ -618,6 +894,136 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
   </main>
   <div id="tooltip" class="tooltip" role="tooltip" hidden></div>
   <div id="interaction-status" class="sr-only" role="status"></div>
+  <script type="application/json" id="mv-evidence-data">
+  {
+    "schema": "moe-causal-explainer-v1",
+    "experiment_date_utc": "2026-09-07",
+    "document_date_utc": "2026-09-08",
+    "scope": "rank0 target verify, layer0 step65, T16; isolated stage1 graph replay, not end-to-end TPOT",
+    "timing_unit": "microseconds, median of 8 rounds, rounded to 3 decimals",
+    "timings": {
+      "0": {"native": {"atom": 41.420, "sglang": 14.449}, "swapped": {"atom": 14.378, "sglang": 41.832}},
+      "4": {"native": {"atom": 41.642, "sglang": 14.514}, "swapped": {"atom": 14.463, "sglang": 42.160}}
+    },
+    "active_blocks": {"native": {"atom": 79, "sglang": 19}, "swapped": {"atom": 18, "sglang": 80}},
+    "token_slot_assignments": {"atom": 96, "sglang": 112},
+    "native_layer0_inputs": {
+      "atom": [17249,16,455,5610,16,455,3967,4496,33,342,4571,11568,362,1694,418,260],
+      "sglang": [5,223,0,0,5,223,0,0,5,223,0,0,5,223,0,0]
+    },
+    "native_layer0_expert_counts": {
+      "atom": {"9":1,"10":1,"16":1,"17":2,"19":1,"25":1,"29":1,"30":1,"35":2,"46":1,"54":1,"55":1,"60":1,"69":1,"72":2,"75":1,"79":1,"91":1,"92":1,"94":1,"103":1,"111":2,"113":1,"117":1,"122":2,"126":1,"131":1,"135":2,"136":1,"144":1,"145":1,"153":1,"158":1,"160":1,"162":3,"169":1,"178":1,"188":1,"189":1,"201":1,"208":2,"211":1,"216":2,"217":1,"223":1,"229":1,"236":2,"240":1,"241":1,"242":1,"244":1,"245":1,"247":1,"256":2,"259":1,"264":1,"265":1,"277":2,"282":1,"283":1,"290":1,"291":1,"302":1,"304":1,"311":2,"317":2,"320":1,"322":1,"323":1,"333":1,"341":1,"346":2,"349":1,"358":1,"359":1,"365":2,"368":1,"376":1,"379":1},
+      "sglang": {"4":4,"60":4,"94":4,"135":4,"179":4,"184":4,"204":4,"222":8,"245":8,"254":8,"262":4,"279":8,"301":4,"322":4,"345":4,"351":4,"371":8,"378":8,"384":16}
+    },
+    "shared_gate_probe": {
+      "scope": "random logits minimum reproduction in pinned SGLang image; not a full-model patch validation",
+      "current": {"gate_topk":6,"gate_shared":1,"example_post_append_ids":[118,354,120,220,302,384,384],"present_slots":[true,true,true,true,true,false,true],"valid_assignments":96},
+      "control": {"gate_topk":6,"gate_shared":0,"example_post_append_ids":[118,354,120,220,302,54,384],"present_slots":[true,true,true,true,true,true,true],"valid_assignments":112}
+    },
+    "loaded_hsaco_sha256": {
+      "atom":"acebfb325d25ef93e30d615b1167f8f8c59d4402daab1edecc3bcc33a4ed4617",
+      "sglang":"6f52ee8e336a7154e1cf1a3234f63f300b28bbd3350f83dfc1b09862888da469"
+    },
+    "source_artifacts": ["route-summary.json", "route-swap-gpu0-r4/results.json", "route-swap-gpu4-r4/results.json", "shared-topk-probe/results.json"],
+    "caveats": ["No attribution of repeated zero token IDs to a specific upstream bug.", "No claim that SGLang intentionally creates concentrated routes.", "Routing swap is counterfactual, not a quality-preserving optimization.", "Shared fusion savings were not separately isolated.", "Historical 61-layer trace averages and this single-layer replay are different statistics."]
+  }
+  </script>
+  <script>
+    (() => {
+      const root = document.getElementById('moe-causal-map');
+      const evidence = JSON.parse(document.getElementById('mv-evidence-data').textContent);
+      const viewState = { gpu: '0', routing: 'native', gate: 'current' };
+      const element = name => document.getElementById(name);
+
+      for (const framework of ['atom', 'sglang']) {
+        const bank = element(`mv-${framework}-tiles`);
+        const fragment = document.createDocumentFragment();
+        for (const [expert, count] of Object.entries(evidence.native_layer0_expert_counts[framework])) {
+          if (Number(expert) === 384) continue;
+          const tile = document.createElement('div');
+          tile.className = 'mv-tile';
+          tile.title = `Expert ${expert}：${count} 个有效 token 分配 / 32 行容量`;
+          tile.dataset.expert = expert;
+          for (let row = 0; row < 32; row += 1) {
+            const cell = document.createElement('i');
+            if (row < count) cell.className = 'mv-filled';
+            tile.appendChild(cell);
+          }
+          fragment.appendChild(tile);
+        }
+        bank.replaceChildren(fragment);
+      }
+
+      function renderSwap() {
+        const swapped = viewState.routing === 'swapped';
+        const timings = evidence.timings[viewState.gpu][viewState.routing];
+        for (const framework of ['atom', 'sglang']) {
+          element(`mv-${framework}-time`).value = timings[framework].toFixed(3);
+          element(`mv-${framework}-bar`).style.width = `${timings[framework] / 50 * 100}%`;
+          element(`mv-${framework}-origin`).dataset.origin = swapped ? (framework === 'atom' ? 'sglang' : 'atom') : framework;
+        }
+        element('mv-atom-origin-text').textContent = swapped ? '← SGLang 路由 · 18 routed blocks' : '← ATOM 路由 · 79 routed blocks';
+        element('mv-sglang-origin-text').textContent = swapped ? '← ATOM 路由 · 79 routed + 1 shared' : '← SGLang 路由 · 18 routed + 1 shared';
+        element('mv-swap-status').textContent = swapped
+          ? `GPU${viewState.gpu}：v33 换集中路由后 ${timings.atom.toFixed(3)} μs；v32 换分散路由后 ${timings.sglang.toFixed(3)} μs。快慢反转，完整计算槽位保留。`
+          : `GPU${viewState.gpu} 原始路由：v33 为 ${timings.atom.toFixed(3)} μs，v32 为 ${timings.sglang.toFixed(3)} μs。点“交换路由”检验差异跟谁走。`;
+        root.querySelectorAll('[data-mv-routing]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.mvRouting === viewState.routing)));
+        root.querySelectorAll('[data-mv-gpu]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.mvGpu === viewState.gpu)));
+      }
+
+      function renderGate() {
+        const corrected = viewState.gate === 'control';
+        element('mv-gate-middle').className = `mv-bug-step ${corrected ? 'mv-correct' : 'mv-error'}`;
+        element('mv-gate-formula').textContent = corrected ? '6 − 0 = 6' : '6 − 1 = 5';
+        element('mv-gate-explanation').textContent = corrected
+          ? '只把 gate 的 shared 参数改成 0：六个槽位全部留给 routed，shared 由外层统一追加。'
+          : '却仍传 shared=1。底层把 topk 当作含 shared 的总数，于是又减一次，只选五个 routed。';
+        element('mv-gate-append').textContent = corrected ? '6 routed + 1 shared' : '5 routed + 2 shared';
+        element('mv-append-explanation').textContent = corrected
+          ? '只追加一次 shared384。每个 token 的七个槽位对应七个不同的 experts。'
+          : '外层再追加 shared384。列表虽长七，但 shared 重复，缺第六个 routed。';
+        element('mv-before-sixth').className = `mv-slot ${corrected ? 'mv-slot-restored' : 'mv-slot-shared'}`;
+        element('mv-before-sixth-id').textContent = corrected ? '54' : '384';
+        element('mv-before-sixth-label').textContent = corrected ? 'routed 6' : 'shared';
+        element('mv-after-sixth').className = `mv-slot ${corrected ? 'mv-slot-restored' : 'mv-slot-missing'}`;
+        element('mv-after-sixth-id').textContent = corrected ? '54' : '缺失';
+        element('mv-sort-description').textContent = corrected
+          ? '↓ 原 sorter 处理后：七个 expert/token 组合各自保留，slot5 恢复'
+          : '↓ 原 sorter 处理后：重复 expert/token 组合只保留最后一个槽位';
+        element('mv-after-sort').setAttribute('aria-label', corrected
+          ? '排序后，六个 routed 和一个 shared 槽位全部存在'
+          : '排序后，前五个 routed 存在，第六槽缺失，最后一个 shared 存在');
+        element('mv-slot-count').value = `${evidence.shared_gate_probe[viewState.gate].valid_assignments} / 112`;
+        element('mv-slot-count-description').textContent = corrected
+          ? '16 个 token × 7 个有效槽位；六 routed + 一 shared，全部恢复。'
+          : '16 个 token × 6 个有效槽位；每个 token 真正少选一个 routed expert。';
+        element('mv-gate-status').textContent = corrected
+          ? '正控制通过：只修改低层 gate 参数，原函数恢复 112/112 槽位。这不是已部署的全模型修复，也尚未证明能消除重复零 token。'
+          : '这是正确性问题，不是合法的性能优化。真实 layer30 的三份快照同样缺 slot5。该缺槽会减少 routed 工作，但不能据此推断对输出质量或 TPOT 的全部影响。';
+        root.querySelectorAll('[data-mv-gate]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.mvGate === viewState.gate)));
+      }
+
+      root.addEventListener('click', event => {
+        const routingButton = event.target.closest('[data-mv-routing]');
+        const gpuButton = event.target.closest('[data-mv-gpu]');
+        const gateButton = event.target.closest('[data-mv-gate]');
+        if (routingButton) { viewState.routing = routingButton.dataset.mvRouting; renderSwap(); }
+        if (gpuButton) { viewState.gpu = gpuButton.dataset.mvGpu; renderSwap(); }
+        if (gateButton) { viewState.gate = gateButton.dataset.mvGate; renderGate(); }
+      });
+
+      element('mv-export-evidence').addEventListener('click', () => {
+        const url = URL.createObjectURL(new Blob([JSON.stringify(evidence, null, 2) + '\n'], { type: 'application/json;charset=utf-8' }));
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = 'atom-sglang-moe-causal-evidence-20260907.json';
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      });
+    })();
+  </script>
   <script>
     const fields = ['conc', 'successRequests', 'totalRequests', 'successRate', 'totalThroughput', 'chipThroughput', 'outputPerChip', 'interactivity', 'ttft', 'tpot', 'e2e', 'cacheHit', 'power', 'energy'];
     const rawData = {
