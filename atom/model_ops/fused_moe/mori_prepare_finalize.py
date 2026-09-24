@@ -214,6 +214,43 @@ def mori_tuned_launch_table(
 
 _MXFP8_DISPATCH = envs.ATOM_MORI_FP8_DISPATCH
 _MASK_PAD_ROWS = envs.ATOM_MORI_MASK_PAD_ROWS
+_TBO_HALF_BUFFERS = envs.ATOM_MORI_TBO_HALF_BUFFERS
+
+
+def tbo_max_tokens_per_rank(max_num_tokens: int, atom_config: Any) -> int:
+    """Per-rank input capacity of the two TBO ubatch ops.
+
+    Each op's symmetric buffers scale with this (~4 GB at 16384 bf16 rows on
+    EP8), and TBO adds two of them to the sync op. A token-midpoint prefill
+    split cuts a rank's tokens at floor(n / 2), so neither ubatch exceeds
+    ceil(max_num_tokens / 2); ATOM_MORI_TBO_HALF_BUFFERS sizes the ops to that.
+    Every other split can be uneven -- request boundaries (PCP, or
+    ATOM_TBO_PREFILL_TOKEN_SPLIT=0) put up to n - 1 rows in one ubatch -- so
+    those keep the full budget.
+    """
+    if not _TBO_HALF_BUFFERS:
+        return max_num_tokens
+    reason = None
+    if getattr(atom_config, "enable_tbo_decode", False):
+        reason = "decode TBO (--enable-tbo all) splits by request count"
+    elif getattr(atom_config, "prefill_context_parallel_size", 1) > 1:
+        reason = "PCP+TBO splits prefill on request boundaries"
+    elif not envs.ATOM_TBO_PREFILL_TOKEN_SPLIT:
+        reason = "ATOM_TBO_PREFILL_TOKEN_SPLIT=0 splits on request boundaries"
+    capacity = max_num_tokens if reason else (max_num_tokens + 1) // 2
+    _log_tbo_capacity(capacity, max_num_tokens, reason)
+    return capacity
+
+
+@cache
+def _log_tbo_capacity(capacity: int, max_num_tokens: int, reason: str | None) -> None:
+    if reason is None:
+        logger.info(
+            f"[MORI] TBO ubatch ops sized for {capacity} of {max_num_tokens} "
+            "tokens per rank (token-midpoint prefill split)"
+        )
+    else:
+        logger.warning(f"[MORI] ATOM_MORI_TBO_HALF_BUFFERS=1 ignored: {reason}")
 
 
 @cache
@@ -393,6 +430,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         is_async: bool = False,
         tbo_mori_ops: list | None = None,
         low_latency: bool = False,
+        tbo_max_tokens_per_rank: int | None = None,
     ):
         if not MORI_AVAILABLE:
             raise ImportError(
@@ -402,6 +440,12 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         super().__init__()
         self._sync_mori_op = mori_op
         self._tbo_mori_ops = tbo_mori_ops  # per-ubatch ops for TBO (IntraNode)
+        # What the TBO ops were sized for; see tbo_max_tokens_per_rank.
+        self._tbo_max_tokens_per_rank = (
+            max_tokens_per_rank
+            if tbo_max_tokens_per_rank is None
+            else tbo_max_tokens_per_rank
+        )
         self.num_dispatchers_ = num_dispatchers
         self.max_tokens_per_rank = max_tokens_per_rank
         self.dispatch_format = dispatch_format
@@ -722,6 +766,15 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         assert (
             not apply_router_weight_on_input
         ), "mori does not support apply_router_weight_on_input=True now."
+        # MoRI does not bound-check its input against the op's capacity, so an
+        # oversized ubatch would write past the symmetric buffers. Host shape,
+        # eager prefill: no sync.
+        if a1.shape[0] > self._tbo_max_tokens_per_rank:
+            raise RuntimeError(
+                f"TBO ubatch has {a1.shape[0]} tokens but its MoRI op holds "
+                f"{self._tbo_max_tokens_per_rank} per rank; unset "
+                "ATOM_MORI_TBO_HALF_BUFFERS"
+            )
 
         scale = None
         if self.use_fp4_dispatch:

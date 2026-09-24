@@ -740,6 +740,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             }
 
             tbo_mori_ops = None
+            tbo_max_tokens = None
             # Prefill (sync path). aiter picks its kernel from the same
             # internode probe, so this is not necessarily IntraNode.
             sync_handle = handle
@@ -747,8 +748,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 from atom.model_ops.fused_moe.mori_prepare_finalize import (
                     _NUM_TBO_UBATCHES,
                     init_mori_op,
+                    tbo_max_tokens_per_rank,
                 )
 
+                tbo_max_tokens = tbo_max_tokens_per_rank(
+                    moe.max_num_tokens, atom_config
+                )
+                common_args["max_num_inp_token_per_rank"] = tbo_max_tokens
                 tbo_mori_ops = [
                     init_mori_op(
                         **common_args,
@@ -766,6 +772,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 is_async=is_async,
                 tbo_mori_ops=tbo_mori_ops,
                 low_latency=low_latency,
+                tbo_max_tokens_per_rank=tbo_max_tokens,
             )
 
         return prepare_finalize
