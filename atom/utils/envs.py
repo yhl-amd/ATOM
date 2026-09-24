@@ -572,6 +572,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # largest per-rank token count; "legacy" restores the old grid (128 blocks
     # on a prefilling rank, 64 otherwise, 16 warps per block for both phases).
     "ATOM_MORI_LAUNCH_POLICY": lambda: os.getenv("ATOM_MORI_LAUNCH_POLICY", "tuned"),
+    # Route DP pad rows (past this rank's scheduled tokens) to expert -1, which
+    # the IntraNode dispatch drops, so padding costs no transport or GEMM.
+    "ATOM_MORI_MASK_PAD_ROWS": lambda: os.getenv("ATOM_MORI_MASK_PAD_ROWS", "0") == "1",
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
