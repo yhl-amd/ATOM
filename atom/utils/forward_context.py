@@ -826,6 +826,39 @@ _forward_kv_cache_context: ForwardContext | None = ForwardContext()
 # runtime, so we don't pay torch.cuda.is_available() per set_forward_context().
 _CUDA_AVAILABLE: bool = torch.cuda.is_available()
 
+# Device copy of `Context.scheduled_tokens`, for a consumer recorded into a
+# CUDA graph: a replay runs none of the Python that reads the host field, so the
+# recording reads this step's count from here instead. Nothing is allocated,
+# and nothing written per step, until a consumer asks for it. Starts at int32
+# max, i.e. "every row is real", so a replay before the first publish masks
+# nothing. Every graph replay must be preceded by a publish for its own pass --
+# `set_forward_context` and `_publish_draft_shape` do it -- or it reads the last.
+_scheduled_tokens_device: torch.Tensor | None = None
+
+
+def enable_scheduled_tokens_device(device: torch.device) -> torch.Tensor:
+    """Allocate (once) and return the device copy of `scheduled_tokens`."""
+    global _scheduled_tokens_device
+    if _scheduled_tokens_device is None:
+        _scheduled_tokens_device = torch.full(
+            (1,), torch.iinfo(torch.int32).max, dtype=torch.int32, device=device
+        )
+    return _scheduled_tokens_device
+
+
+def publish_scheduled_tokens(scheduled_tokens: int) -> None:
+    """Write this pass's `scheduled_tokens` to its device copy, if one exists.
+
+    A fill on the current stream, so it is ordered before the forward (or the
+    replay) enqueued after it, with no host sync. Skipped while capturing: a
+    fill recorded into a graph would replay the capture's count every step.
+    """
+    buf = _scheduled_tokens_device
+    if buf is None or torch.cuda.is_current_stream_capturing():
+        return
+    buf.fill_(scheduled_tokens)
+
+
 # Thread-local storage for TBO dual-thread execution
 
 _forward_context_local = threading.local()
@@ -925,6 +958,7 @@ def set_forward_context(
     context.running_tokens_across_dp = (
         None if num_tokens_across_dp is None else tuple(num_tokens_across_dp.tolist())
     )
+    publish_scheduled_tokens(context.scheduled_tokens)
 
     _forward_context = ForwardContext(
         attn_metadata=attn_metadata,

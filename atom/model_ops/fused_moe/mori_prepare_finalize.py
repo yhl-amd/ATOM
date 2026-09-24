@@ -4,7 +4,7 @@
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache, lru_cache
 from typing import Any
 
 import torch
@@ -13,8 +13,12 @@ from aiter.jit.utils.chip_info import get_cu_num
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
+from atom.plugin import is_plugin_mode
 from atom.utils import envs
-from atom.utils.forward_context import get_forward_context
+from atom.utils.forward_context import (
+    enable_scheduled_tokens_device,
+    get_forward_context,
+)
 
 try:
     import mori
@@ -127,6 +131,38 @@ _FP8_DTYPES = (
 # make_prepare_finalize runs per MoE layer (58x for DSR1). envs.__getattr__ does
 # not cache, so binding here also keeps it to a single getenv.
 _FP4_DISPATCH = envs.ATOM_MORI_FP4_DISPATCH
+_MASK_PAD_ROWS = envs.ATOM_MORI_MASK_PAD_ROWS
+
+
+@cache
+def _row_index(num_rows: int, device_index: int) -> torch.Tensor:
+    """`[num_rows, 1]` int32 row numbers, one buffer for every MoE layer."""
+    return torch.arange(
+        num_rows, dtype=torch.int32, device=torch.device("cuda", device_index)
+    ).unsqueeze(1)
+
+
+@cache
+def _log_pad_masking(active: bool) -> None:
+    """Say once, not per MoE layer, whether ATOM_MORI_MASK_PAD_ROWS took."""
+    if active:
+        logger.info("[MORI] DP pad rows are routed to expert -1 before dispatch")
+    else:
+        logger.warning(
+            "[MORI] ATOM_MORI_MASK_PAD_ROWS=1 ignored: needs the IntraNode "
+            "kernel and native ATOM serving"
+        )
+
+
+def _drops_negative_ids(mori_op: Any) -> bool:
+    """Whether this op's dispatch skips a (token, k) whose expert id is < 0.
+
+    Read in intranode.hpp: IntraNode dispatch writes such a pair's destination
+    as `worldSize`, sends nothing for it, and its combine then treats that
+    destination as absent. Other kernels are unverified, so they keep the ids.
+    """
+    kernel_type = getattr(getattr(mori_op, "config", None), "kernel_type", None)
+    return kernel_type == mori.ops.EpDispatchCombineKernelType.IntraNode
 
 
 @dataclass(frozen=True)
@@ -198,6 +234,19 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.quant_dtype = quant_dtype
         self._is_async = is_async
         self._low_latency = low_latency
+        # See mask_pad_topk_ids. Plugin frontends own their own step shapes
+        # and never publish the device count, so they are left out.
+        self._pad_row_index = None
+        self._scheduled_tokens_device = None
+        if _MASK_PAD_ROWS:
+            active = not is_plugin_mode() and _drops_negative_ids(mori_op)
+            _log_pad_masking(active)
+            if active:
+                device_index = torch.cuda.current_device()
+                self._pad_row_index = _row_index(max_tokens_per_rank, device_index)
+                self._scheduled_tokens_device = enable_scheduled_tokens_device(
+                    torch.device("cuda", device_index)
+                )
 
     # Derived from the resolved format so there is no second copy to keep in
     # sync with the staging config.
@@ -259,6 +308,37 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         if context.is_prefill:
             return min(128, mp), 16
         return min(64, mp), 4
+
+    def mask_pad_topk_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        """Route this rank's DP pad rows to expert -1.
+
+        A padded decode step runs `running_tokens` rows, of which only the
+        leading `scheduled_tokens` carry a request; the tail is there to match
+        the group's graph width. Its routing is real, so it pays dispatch, GEMM
+        and combine like any token, and being identical rows it piles onto the
+        same experts. IntraNode dispatch sends nothing for a negative id, and
+        combine sums nothing for a token sent nowhere, so a masked row costs
+        neither and comes back as zeros that are sliced off with the padding.
+
+        Eager steps take the count from the host. A capture records a compare
+        against the device copy of the same count, which is published before
+        every forward and draft pass. Only rows that ARE the step's
+        `running_tokens` are touched: nothing else has a padded tail. TBO
+        ubatches are left alone, a ubatch's rows not being the step's prefix.
+        """
+        if self._pad_row_index is None or self.supports_async():
+            return topk_ids
+        context = get_forward_context().context
+        num_rows = topk_ids.shape[0]
+        if context is None or num_rows != context.running_tokens:
+            return topk_ids
+        if torch.cuda.is_current_stream_capturing():
+            num_valid = self._scheduled_tokens_device
+        elif context.scheduled_tokens < num_rows:
+            num_valid = context.scheduled_tokens
+        else:
+            return topk_ids
+        return topk_ids.masked_fill(self._pad_row_index[:num_rows] >= num_valid, -1)
 
     # ---- Synchronous (non-TBO) path ----
 
