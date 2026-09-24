@@ -248,9 +248,10 @@ def check_mxfp8_dispatch_consumable(
 def _mxfp8_quant(a1: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-1x32 fp8 with e8m0 scales, row-major and unshuffled.
 
-    The same kernel (per_1x32_mx_quant_hip, e8m0) aiter's fused_moe runs on
-    the received rows when it quantizes them itself; it sorts these scales
-    into the GEMM layout with mxfp4_moe_sort_fwd either way.
+    The kernel aiter's fused_moe runs on the received rows for its split path
+    (more than 8*256/topk rows); below that it runs a fused quant+sort kernel
+    with the same e8m0 RoundUp scale. Given these scales, fused_moe only
+    sorts them into the GEMM layout (mxfp4_moe_sort_fwd).
     """
     if a1.shape[0] == 0:
         # e8m0 scales are one byte each -- must match the scale_type_size
