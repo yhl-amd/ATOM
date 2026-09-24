@@ -826,37 +826,52 @@ _forward_kv_cache_context: ForwardContext | None = ForwardContext()
 # runtime, so we don't pay torch.cuda.is_available() per set_forward_context().
 _CUDA_AVAILABLE: bool = torch.cuda.is_available()
 
-# Device copy of `Context.scheduled_tokens`, for a consumer recorded into a
+# Device form of `Context.scheduled_tokens`, for a consumer recorded into a
 # CUDA graph: a replay runs none of the Python that reads the host field, so the
-# recording reads this step's count from here instead. Nothing is allocated,
-# and nothing written per step, until a consumer asks for it. Starts at int32
-# max, i.e. "every row is real", so a replay before the first publish masks
-# nothing. Every graph replay must be preceded by a publish for its own pass --
-# `set_forward_context` and `_publish_draft_shape` do it -- or it reads the last.
-_scheduled_tokens_device: torch.Tensor | None = None
+# recording reads this step's count from here instead. Kept as the per-row mask
+# `row >= scheduled_tokens` rather than the count, so each consumer applies it
+# with one kernel and the compare is paid once per pass, not once per layer.
+# Nothing is allocated, and nothing written per step, until a consumer asks for
+# it. Starts all False, i.e. "every row is real", so a replay before the first
+# publish masks nothing. Every graph replay must be preceded by a publish for
+# its own pass -- `set_forward_context` and `_publish_draft_shape` do it -- or it
+# reads the last.
+_pad_rows_device: torch.Tensor | None = None
+_row_index_device: torch.Tensor | None = None
 
 
-def enable_scheduled_tokens_device(device: torch.device) -> torch.Tensor:
-    """Allocate (once) and return the device copy of `scheduled_tokens`."""
-    global _scheduled_tokens_device
-    if _scheduled_tokens_device is None:
-        _scheduled_tokens_device = torch.full(
-            (1,), torch.iinfo(torch.int32).max, dtype=torch.int32, device=device
-        )
-    return _scheduled_tokens_device
+def enable_pad_rows_device(num_rows: int, device: torch.device) -> None:
+    """Allocate the `[rows, 1]` bool "is a pad row" mask, or grow it.
+
+    Call before any capture: a recording holds the buffer's address, so it
+    must not be replaced once a graph has read it. Consumers look it up per
+    call (`get_pad_rows_device`) rather than keep a reference, so a later,
+    larger request cannot leave one of them reading a buffer nobody publishes.
+    """
+    global _pad_rows_device, _row_index_device
+    if _pad_rows_device is None or _pad_rows_device.shape[0] < num_rows:
+        _row_index_device = torch.arange(
+            num_rows, dtype=torch.int32, device=device
+        ).unsqueeze(1)
+        _pad_rows_device = torch.zeros((num_rows, 1), dtype=torch.bool, device=device)
+
+
+def get_pad_rows_device() -> torch.Tensor | None:
+    """The mask `publish_scheduled_tokens` writes; None until enabled."""
+    return _pad_rows_device
 
 
 def publish_scheduled_tokens(scheduled_tokens: int) -> None:
-    """Write this pass's `scheduled_tokens` to its device copy, if one exists.
+    """Mark the rows at or past this pass's `scheduled_tokens` as padding.
 
-    A fill on the current stream, so it is ordered before the forward (or the
-    replay) enqueued after it, with no host sync. Skipped while capturing: a
-    fill recorded into a graph would replay the capture's count every step.
+    One compare on the current stream, so it is ordered before the forward (or
+    the replay) enqueued after it, with no host sync. Skipped while capturing:
+    a compare recorded into a graph would replay the capture's count every step.
     """
-    buf = _scheduled_tokens_device
-    if buf is None or torch.cuda.is_current_stream_capturing():
+    pad = _pad_rows_device
+    if pad is None or torch.cuda.is_current_stream_capturing():
         return
-    buf.fill_(scheduled_tokens)
+    torch.ge(_row_index_device, scheduled_tokens, out=pad)
 
 
 # Thread-local storage for TBO dual-thread execution

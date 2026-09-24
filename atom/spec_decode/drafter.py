@@ -599,7 +599,7 @@ class Drafter(abc.ABC):
         context = forward_context.context
         context.scheduled_tokens = scheduled_tokens
         context.running_tokens = running_tokens
-        # The draft replays against the device copy too; see its publisher.
+        # The draft replays against the device pad-row mask too; see its publisher.
         publish_scheduled_tokens(scheduled_tokens)
         parallel_config = self.config.parallel_config
         # A group of one is uniform whatever it runs; only the table needs peers.
