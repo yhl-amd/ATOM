@@ -215,6 +215,7 @@ def mori_tuned_launch_table(
 _MXFP8_DISPATCH = envs.ATOM_MORI_FP8_DISPATCH
 _MASK_PAD_ROWS = envs.ATOM_MORI_MASK_PAD_ROWS
 _ZERO_COPY_COMBINE = envs.ATOM_MORI_ZERO_COPY_COMBINE
+_PULL_COMBINE_MIN_TOKENS = envs.ATOM_MORI_PULL_COMBINE_MIN_TOKENS
 
 # ATOM_MORI_ZERO_COPY_COMBINE value -> how the expert output reaches MoRI's
 # registered combine input buffer (None: push combine, as before).
@@ -601,17 +602,21 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
 
     def _tuned_launch_table(
-        self, phase: str, mori_op: Any, dtype: torch.dtype, hidden_dim: int
+        self,
+        phase: str,
+        mori_op: Any,
+        dtype: torch.dtype,
+        hidden_dim: int,
+        pull: bool | None = None,
     ):
-        key = (phase, id(mori_op), dtype, hidden_dim)
+        key = (phase, id(mori_op), dtype, hidden_dim, pull)
         if key in self._launch_tables:
             return self._launch_tables[key]
         config = mori_op.config
         kernel_type = getattr(config.kernel_type, "name", str(config.kernel_type))
-        # MoRI tunes the pull combine separately; only the sync op pulls.
-        zero_copy = not config.use_external_inp_buf or (
-            self._zero_copy_combine is not None and mori_op is self._sync_mori_op
-        )
+        # MoRI tunes the pull combine separately; only the sync op pulls, and
+        # it decides per step (see _pull_combine).
+        zero_copy = not config.use_external_inp_buf or bool(pull)
         table = None
         # Only the IntraNode kernels' tables and co-residency limits are
         # accounted for here; other kernel types keep the legacy grid.
@@ -662,6 +667,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         num_tokens: int,
         dtype: torch.dtype,
         hidden_dim: int,
+        pull: bool | None = None,
     ) -> tuple[int, int]:
         """Return (block_num, warp_per_block) for one dispatch or combine launch.
 
@@ -679,12 +685,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         """
         context = get_forward_context().context
         if _LAUNCH_POLICY != "legacy":
-            table = self._tuned_launch_table(phase, mori_op, dtype, hidden_dim)
+            table = self._tuned_launch_table(phase, mori_op, dtype, hidden_dim, pull)
             if table is not None:
-                across_dp = (
-                    None if context is None else context.running_tokens_across_dp
-                )
-                group_tokens = max(across_dp) if across_dp else num_tokens
+                group_tokens = self._group_tokens(num_tokens)
                 ceilings, geometries = table
                 return geometries[bisect.bisect_left(ceilings, group_tokens)]
         # The legacy grid, as it actually launched: the warp count used to be
@@ -697,6 +700,28 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         if context is not None and context.is_prefill:
             return min(128, mp), _MAX_WARP_PER_BLOCK
         return min(64, mp), _MAX_WARP_PER_BLOCK
+
+    @staticmethod
+    def _group_tokens(num_tokens: int) -> int:
+        """The group's largest per-rank token count this pass, a host value
+        fixed per captured graph; this rank's own count where none was
+        reduced."""
+        context = get_forward_context().context
+        across_dp = None if context is None else context.running_tokens_across_dp
+        return max(across_dp) if across_dp else num_tokens
+
+    def _pull_combine(self, num_tokens: int) -> bool:
+        """Whether this step's sync combine pulls (zero-copy) or pushes.
+
+        Pull reads each token's expert rows from its peers, so a small step
+        pays a fabric round trip per read that push's posted writes do not;
+        push pays an extra copy that only matters once rows are many. So pull
+        only above ATOM_MORI_PULL_COMBINE_MIN_TOKENS per rank. Keyed on the
+        group's count, every rank takes the same side of the threshold.
+        """
+        if self._zero_copy_combine is None or self.supports_async():
+            return False
+        return self._group_tokens(num_tokens) > _PULL_COMBINE_MIN_TOKENS
 
     def mask_pad_topk_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
         """Route this rank's DP pad rows to expert -1.
@@ -773,7 +798,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # row). The buffer is only rewritten after this rank's next dispatch
         # has completed, and that completion waits for every peer to reach
         # the same dispatch -- i.e. to have finished pulling from it.
-        if self._zero_copy_combine != "direct" or self.supports_async():
+        if self._zero_copy_combine != "direct" or not self._pull_combine(num_rows):
             return None
         return self._registered_combine_input(dtype, hidden_dim)[:num_rows]
 
@@ -857,7 +882,8 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         num_token = topk_ids.shape[0]
 
         combine_kwargs = {}
-        if self._zero_copy_combine is not None:
+        pull = self._pull_combine(num_token)
+        if pull:
             num_rows, hidden_dim = fused_expert_output.shape
             combine_input = self._registered_combine_input(
                 fused_expert_output.dtype, hidden_dim
@@ -878,6 +904,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             num_token,
             fused_expert_output.dtype,
             fused_expert_output.shape[1],
+            pull=pull,
         )
 
         result = self._sync_mori_op.combine(

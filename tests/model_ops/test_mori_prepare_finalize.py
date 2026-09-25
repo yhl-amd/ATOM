@@ -439,9 +439,10 @@ def test_zero_copy_combine_uses_the_pull_tables(mi355x, monkeypatch):
             topk=TOPK,
         )
         got = pull._get_launch_config(
-            "combine", pull._sync_mori_op, tokens, torch.bfloat16, HIDDEN
+            "combine", pull._sync_mori_op, tokens, torch.bfloat16, HIDDEN, pull=True
         )
         assert got == (expected.block_num, expected.warp_per_block), tokens
+        assert pull._pull_combine(tokens)
         # Dispatch has one table, and the push op keeps the push rules.
         assert pull._get_launch_config(
             "dispatch", pull._sync_mori_op, tokens, torch.bfloat16, HIDDEN
@@ -506,3 +507,16 @@ def test_fused_moe_writes_into_the_pulled_buffer(monkeypatch):
     assert op.combine_input.shape == (rows, 16)
     assert (registered[:rows] == 5).all() and not registered[rows:].any()
     assert op.combine_indices is topk_ids
+
+
+def test_small_steps_push_when_below_the_pull_threshold(monkeypatch):
+    import atom.model_ops.fused_moe.mori_prepare_finalize as mpf_mod
+
+    pf = _zero_copy_pf("direct")
+    monkeypatch.setattr(mpf_mod, "_PULL_COMBINE_MIN_TOKENS", 64)
+    _context(monkeypatch, (56,) * 8)
+    assert not pf._pull_combine(56)
+    assert pf.expert_output_buffer(8 * 56, HIDDEN, torch.bfloat16) is None
+    _context(monkeypatch, (112,) * 8)
+    assert pf._pull_combine(112)
+    assert pf.expert_output_buffer(8 * 112, HIDDEN, torch.bfloat16) is not None

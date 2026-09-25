@@ -586,6 +586,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MORI_ZERO_COPY_COMBINE": lambda: os.getenv(
         "ATOM_MORI_ZERO_COPY_COMBINE", "0"
     ),
+    # With ATOM_MORI_ZERO_COPY_COMBINE, pull only when the group's largest
+    # per-rank token count exceeds this; smaller steps push (lower latency).
+    "ATOM_MORI_PULL_COMBINE_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_MORI_PULL_COMBINE_MIN_TOKENS", "0")
+    ),
     # Size the two TBO ubatch MoRI ops for half the per-rank token budget. A
     # token-midpoint prefill split never hands a ubatch more than
     # ceil(max_num_batched_tokens / 2) rows, so each op needs half the ~4 GB of
