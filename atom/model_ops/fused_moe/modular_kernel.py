@@ -98,6 +98,21 @@ def _sentinel_columns(
     return cols[0][:rows], cols[1][:rows]
 
 
+_ROW_INDEX: dict[torch.device, torch.Tensor] = {}
+
+
+def row_index(rows: int, device: torch.device) -> torch.Tensor:
+    """A cached [rows, 1] int32 arange, built outside graph capture like the
+    sentinel columns and only regrown by a larger eager step."""
+    idx = _ROW_INDEX.get(device)
+    if idx is None or idx.shape[0] < rows:
+        idx = torch.arange(
+            max(rows, _SENTINEL_MIN_ROWS), dtype=torch.int32, device=device
+        ).unsqueeze(1)
+        _ROW_INDEX[device] = idx
+    return idx[:rows]
+
+
 def append_aiter_ep_sentinel(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -149,14 +164,17 @@ class FusedMoEPrepareAndFinalize(ABC):
         dispatch_weights: torch.Tensor,
         num_experts: int,
         expert_map: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_valid_rows: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Adapt the dispatched routing for AITER fused_moe.
 
         Runs after the receive-buffer trim and only ahead of AITER fused_moe;
-        combine keeps the caller's own topk_ids. The default is a no-op for
-        transports that already hand back what fused_moe expects.
+        combine keeps the caller's own topk_ids. Returns the routing and the
+        device row count to pass as fused_moe's num_local_tokens. The default
+        is a no-op for transports that already hand back what fused_moe
+        expects.
         """
-        return dispatch_ids, dispatch_weights
+        return dispatch_ids, dispatch_weights, num_valid_rows
 
     def expert_output_buffer(
         self, num_rows: int, hidden_dim: int, dtype: torch.dtype
@@ -734,12 +752,13 @@ class FusedMoEModularKernel(torch.nn.Module):
         # After the trim, so this touches only the rows the group sent rather
         # than the whole receive arena. The Triton path above keeps the plain
         # routing: its gate count comes from the column count.
-        dispatch_ids, dispatch_weights = (
+        dispatch_ids, dispatch_weights, num_local_tokens = (
             self.prepare_finalize.adapt_routing_for_fused_moe(
                 dispatch_ids,
                 dispatch_weights,
                 global_num_experts,
                 expert_map,
+                expert_tokens_meta.expert_num_tokens,
             )
         )
         # aiter's own output shape: (M, w2.shape[1]) in the caller's dtype.
@@ -757,7 +776,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             expert_mask,
             activation,
             quant_type=quant_type,
-            num_local_tokens=expert_tokens_meta.expert_num_tokens,
+            num_local_tokens=num_local_tokens,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             a1_scale=dispatch_scale if dispatch_scale is not None else a1_scale,

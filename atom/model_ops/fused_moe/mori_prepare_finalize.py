@@ -586,7 +586,8 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         dispatch_weights: torch.Tensor,
         num_experts: int,
         expert_map: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_valid_rows: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         # MoRI delivers only the real top-k columns, and AITER drops the last
         # one from its tuned-kernel key under EP, so without the masked
         # sentinel column a top-6 model looks up top-5 rows and misses every
@@ -596,10 +597,22 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # TBO receivers feed the same forward, so they get it too.
         sentinel_expert_id = mk.aiter_ep_sentinel_expert_id(num_experts, expert_map)
         if sentinel_expert_id is None:
-            return dispatch_ids, dispatch_weights
-        return mk.append_aiter_ep_sentinel(
+            return dispatch_ids, dispatch_weights, num_valid_rows
+        dispatch_ids, dispatch_weights = mk.append_aiter_ep_sentinel(
             dispatch_ids, dispatch_weights, sentinel_expert_id
         )
+        if num_valid_rows is None:
+            return dispatch_ids, dispatch_weights, None
+        # Rows past the receive count are a stale arena tail. Route them to the
+        # masked sentinel instead of handing fused_moe the device count: when
+        # AITER's tuned stage 2 is the atomic epilog (M in (256, 512] or
+        # >= 16384 for DSV4 EP8), a num_local_tokens below M makes that GEMM
+        # ~2.8x slower, while a fully masked tail costs nothing. One select.
+        rows = mk.row_index(dispatch_ids.shape[0], dispatch_ids.device)
+        dispatch_ids = torch.where(
+            rows < num_valid_rows, dispatch_ids, sentinel_expert_id
+        )
+        return dispatch_ids, dispatch_weights, None
 
     def _tuned_launch_table(
         self,

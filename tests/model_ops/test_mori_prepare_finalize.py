@@ -104,9 +104,10 @@ def _context(monkeypatch, across_dp, *, is_prefill=False):
 def test_sentinel_is_appended_for_aiter():
     ids = torch.randint(0, NUM_EXPERTS, (5, TOPK), dtype=torch.int32)
     weights = torch.rand(5, TOPK)
-    out_ids, out_weights = _prepare_finalize().adapt_routing_for_fused_moe(
+    out_ids, out_weights, nlt = _prepare_finalize().adapt_routing_for_fused_moe(
         ids, weights, NUM_EXPERTS, _expert_map()
     )
+    assert nlt is None
     assert out_ids.shape == (5, TOPK + 1)
     assert out_weights.shape == (5, TOPK + 1)
     assert torch.equal(out_ids[:, :TOPK], ids)
@@ -124,10 +125,27 @@ def test_no_sentinel_without_the_extended_expert_map():
     weights = torch.ones(5, TOPK)
     pf = _prepare_finalize()
     for expert_map in (None, torch.arange(NUM_EXPERTS, dtype=torch.int32)):
-        out_ids, out_weights = pf.adapt_routing_for_fused_moe(
-            ids, weights, NUM_EXPERTS, expert_map
+        count = torch.tensor([3], dtype=torch.int32)
+        out_ids, out_weights, nlt = pf.adapt_routing_for_fused_moe(
+            ids, weights, NUM_EXPERTS, expert_map, count
         )
-        assert out_ids is ids and out_weights is weights
+        assert out_ids is ids and out_weights is weights and nlt is count
+
+
+def test_stale_tail_routes_to_the_sentinel_instead_of_a_row_count():
+    """AITER's atomic stage 2 is ~2.8x slower given num_local_tokens < M, so
+    the tail past the receive count is masked and no count is passed on."""
+    ids = torch.randint(0, NUM_EXPERTS, (6, TOPK), dtype=torch.int32)
+    weights = torch.rand(6, TOPK)
+    count = torch.tensor([4], dtype=torch.int32)
+    out_ids, out_weights, nlt = _prepare_finalize().adapt_routing_for_fused_moe(
+        ids, weights, NUM_EXPERTS, _expert_map(), count
+    )
+    assert nlt is None
+    assert torch.equal(out_ids[:4, :TOPK], ids[:4])
+    assert (out_ids[:4, -1] == NUM_EXPERTS).all()
+    assert (out_ids[4:] == NUM_EXPERTS).all()
+    assert out_weights.shape == (6, TOPK + 1)
 
 
 def test_sentinel_after_trim_and_combine_keeps_real_columns(monkeypatch):
