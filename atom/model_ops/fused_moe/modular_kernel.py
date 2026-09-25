@@ -76,14 +76,41 @@ def aiter_ep_sentinel_expert_id(
     return None
 
 
+# (device, ids dtype, weights dtype, sentinel id) -> prefilled [rows, 1] columns.
+# Built once and only regrown by a larger eager step: decode graphs are far
+# below the initial capacity, and the warmup forward creates it before capture.
+_SENTINEL_COLUMNS: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+_SENTINEL_MIN_ROWS = 1 << 16
+
+
+def _sentinel_columns(
+    rows: int, ids_like: torch.Tensor, weights_like: torch.Tensor, sentinel: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (ids_like.device, ids_like.dtype, weights_like.dtype, sentinel)
+    cols = _SENTINEL_COLUMNS.get(key)
+    if cols is None or cols[0].shape[0] < rows:
+        capacity = max(rows, _SENTINEL_MIN_ROWS)
+        cols = (
+            ids_like.new_full((capacity, 1), sentinel),
+            weights_like.new_zeros((capacity, 1)),
+        )
+        _SENTINEL_COLUMNS[key] = cols
+    return cols[0][:rows], cols[1][:rows]
+
+
 def append_aiter_ep_sentinel(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     sentinel_expert_id: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Append one zero-weight column routed to the masked sentinel expert."""
-    sentinel_ids = topk_ids.new_full((topk_ids.shape[0], 1), sentinel_expert_id)
-    sentinel_weights = topk_weights.new_zeros((topk_weights.shape[0], 1))
+    """Append one zero-weight column routed to the masked sentinel expert.
+
+    The column comes prefilled, so every MoE layer pays the two concatenations
+    and nothing else.
+    """
+    sentinel_ids, sentinel_weights = _sentinel_columns(
+        topk_ids.shape[0], topk_ids, topk_weights, sentinel_expert_id
+    )
     return (
         torch.cat((topk_ids, sentinel_ids), dim=1),
         torch.cat((topk_weights, sentinel_weights), dim=1),
