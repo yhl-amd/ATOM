@@ -323,7 +323,7 @@ class EngineArgs:
             nargs="?",
             const="high-throughput",
             default=None,
-            choices=["high-throughput", "low-latency", "rccl", "none"],
+            choices=["high-throughput", "low-latency", "rccl", "epx", "none"],
             help="Routed MoE transport. 'high-throughput' and 'low-latency' "
             "select MORI modes, 'rccl' selects ATOM's native RCCL MoE "
             "transport, and 'none' forces the DP "
@@ -723,6 +723,7 @@ class EngineArgs:
             "high-throughput": "mori",
             "low-latency": "mori",
             "rccl": "rccl",
+            "epx": "epx",
             "none": "none",
         }[all2all_backend]
 

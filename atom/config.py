@@ -1856,10 +1856,10 @@ class Config:
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )
-        if self.moe_all2all_backend not in ("auto", "mori", "rccl", "none"):
+        if self.moe_all2all_backend not in ("auto", "mori", "rccl", "epx", "none"):
             raise ValueError(
                 "moe_all2all_backend must be one of "
-                "{'auto', 'mori', 'rccl', 'none'}, "
+                "{'auto', 'mori', 'rccl', 'epx', 'none'}, "
                 f"got {self.moe_all2all_backend!r}"
             )
         if self.moe_all2all_backend == "rccl" and self.enable_tbo:
