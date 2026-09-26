@@ -206,6 +206,8 @@ class FusedMoEParallelConfig:
             return None
         if self.requested_all2all_backend == "rccl":
             return "rccl"
+        if self.requested_all2all_backend == "epx":
+            return "epx"
         if not envs.ATOM_DISABLE_MORI_EP and _has_module("mori"):
             return "mori"
         return None
@@ -634,6 +636,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                     moe.expert_layout.routed_physical_per_rank
                 ),
             )
+
+        if moe.moe_parallel_config.selected_all2all_backend == "epx":
+            from atom.model_ops.fused_moe.epx_prepare_finalize import (
+                make_epx_prepare_finalize,
+            )
+
+            return make_epx_prepare_finalize(moe, ep_group)
 
         all2all_manager = ep_group.device_communicator.all2all_manager
         assert all2all_manager is not None
