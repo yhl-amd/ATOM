@@ -272,6 +272,31 @@ def _log_pad_masking(active: bool) -> None:
         )
 
 
+def step_pad_rows(num_rows: int) -> torch.Tensor | None:
+    """The `[num_rows, 1]` "is a DP pad row" mask for this pass, or None.
+
+    None when nothing can be padded: the rows are not the step's
+    `running_tokens` (a TBO ubatch, a PCP shard, a sub-slice), an eager step
+    whose host count says every row is real, or the mask was never enabled /
+    is too short. While capturing it always returns the device mask, so the
+    recording follows whatever `publish_scheduled_tokens` wrote before each
+    replay. No host sync: only host fields and a device view are read.
+    Shared by every backend that masks pad rows (MoRI, epx, MegaMoE).
+    """
+    context = get_forward_context().context
+    if context is None or num_rows != context.running_tokens:
+        return None
+    if (
+        not torch.cuda.is_current_stream_capturing()
+        and context.scheduled_tokens >= num_rows
+    ):
+        return None
+    pad_rows = get_pad_rows_device()
+    if pad_rows is None or pad_rows.shape[0] < num_rows:
+        return None
+    return pad_rows[:num_rows]
+
+
 def _drops_negative_ids(mori_op: Any) -> bool:
     """Whether this op's dispatch skips a (token, k) whose expert id is < 0.
 
@@ -756,19 +781,10 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         """
         if not self._mask_pad_rows or self.supports_async():
             return topk_ids
-        context = get_forward_context().context
-        num_rows = topk_ids.shape[0]
-        if context is None or num_rows != context.running_tokens:
+        pad_rows = step_pad_rows(topk_ids.shape[0])
+        if pad_rows is None:
             return topk_ids
-        if (
-            not torch.cuda.is_current_stream_capturing()
-            and context.scheduled_tokens >= num_rows
-        ):
-            return topk_ids
-        pad_rows = get_pad_rows_device()
-        if pad_rows is None or pad_rows.shape[0] < num_rows:
-            return topk_ids
-        return torch.where(pad_rows[:num_rows], -1, topk_ids)
+        return torch.where(pad_rows, -1, topk_ids)
 
     # ---- Synchronous (non-TBO) path ----
 

@@ -36,6 +36,7 @@ not baked into the kernel).
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 
@@ -217,10 +218,16 @@ def run_mega_moe(
     mtpr: int,
     swiglu_limit: float,
     quant: str = "a8w4",
+    mask_pad_rows: bool = False,
 ) -> torch.Tensor:
     """Replace EP experts with MegaMoEV2. x: [tokens, model_dim] bf16 (this rank's
     local tokens, pre-dispatch). topk_ids: global (physical) expert ids. Returns
-    [tokens, model_dim] bf16."""
+    [tokens, model_dim] bf16.
+
+    mask_pad_rows: route this pass's DP pad rows (rows at or past
+    `scheduled_tokens`) to expert -1, like the MoRI/epx paths, and return
+    them as zeros. See _mask_pad_rows_for_mega for why the output select is
+    required and not just cosmetic."""
     from aiter.dist.parallel_state import get_ep_group
 
     # Do NOT "simplify" this to get_ep_group().rank_in_group / .world_size.
@@ -307,11 +314,67 @@ def run_mega_moe(
 
     wts = topk_weights.to(torch.float32).contiguous()
     ids = topk_ids.to(torch.int32).contiguous()
+    pad_rows = None
+    if mask_pad_rows:
+        from atom.model_ops.fused_moe.mori_prepare_finalize import step_pad_rows
+
+        # Same selection as MoriPrepareAndFinalize.mask_pad_topk_ids: None
+        # unless these rows are the step's padded `running_tokens`; while
+        # capturing, the device mask published before each replay.
+        pad_rows = step_pad_rows(run_tokens)
+        if pad_rows is not None:
+            # Whole rows only (every top-k slot, the fused shared expert slot
+            # included); see _mask_pad_rows_for_mega.
+            ids = torch.where(pad_rows, -1, ids)
     with torch.inference_mode(False), torch.no_grad():
         # swiglu_limit is NOT a forward arg -- it is baked into the instance at
         # construction (see the cache key above).
         out = mega.forward(x.contiguous(), wts, ids)
+    if pad_rows is not None:
+        # MegaMoEV2's fused combine (combine_no_stage1) sums all top-k slots
+        # of every token unconditionally. A slot whose id was -1 is never
+        # written by Stage2, so a masked row reads whatever an earlier call
+        # (any layer sharing this instance, any p2p wire format) left there:
+        # stale and, across fp8/bf16 formats, possibly non-finite. Select
+        # zeros so pad rows come back exactly as on the MoRI/epx paths.
+        out = torch.where(pad_rows, 0, out)
     return out
+
+
+def _mask_pad_rows_for_mega(mtpr: int) -> bool:
+    """Whether Mega routes DP pad rows to expert -1 (ATOM_MORI_MASK_PAD_ROWS).
+
+    Same switch and same device mask as the MoRI/epx paths, so an E2E A/B
+    compares like with like. Allocates the mask here, at layer init, i.e.
+    before any graph capture records its address.
+
+    Verified in aiter MegaMoEV2 (both the fixed-slot MTPR<=255 path and the
+    compact path): an id < 0 is never counted, sent or computed -- dispatch
+    (fixed-slot payload, compact group/plan/payload), Stage1 work counts and
+    Stage2 scatter all key off the valid-route histograms, and the rank
+    handshakes do not depend on route counts, so a row, or a whole rank, of
+    -1 cannot hang. The one gap is combine: its fused-Stage2 variant reads
+    every top-k slot without a validity check, so a -1 slot contributes a
+    stale value. Hence only whole rows are masked and run_mega_moe selects
+    zeros for them afterwards; a partially masked row would be wrong.
+
+    Plugin frontends own their step shapes and never publish the mask.
+    """
+    if not envs.ATOM_MORI_MASK_PAD_ROWS or is_plugin_mode():
+        return False
+    from atom.utils.forward_context import enable_pad_rows_device
+
+    enable_pad_rows_device(mtpr, torch.device("cuda", torch.cuda.current_device()))
+    _log_mega_pad_masking()
+    return True
+
+
+@functools.cache
+def _log_mega_pad_masking() -> None:
+    logger.info(
+        "[MEGA] DP pad rows are routed to expert -1 and returned as zeros "
+        "(ATOM_MORI_MASK_PAD_ROWS=1)"
+    )
 
 
 class MegaFusedExperts:
@@ -349,6 +412,7 @@ class MegaFusedExperts:
         self._inter_dim = inter_dim
         self._mtpr = mtpr
         self._quant = quant
+        self._mask_pad_rows = _mask_pad_rows_for_mega(mtpr)
 
     def __call__(
         self,
@@ -402,4 +466,5 @@ class MegaFusedExperts:
             mtpr=self._mtpr,
             swiglu_limit=getattr(self._layer, "swiglu_limit", 0.0),
             quant=self._quant,
+            mask_pad_rows=self._mask_pad_rows,
         )
