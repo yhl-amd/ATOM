@@ -31,6 +31,27 @@ def test_mxfp4_method_selection(monkeypatch, backend_name):
     assert selected is (mega_method if backend_name == "mega" else standard_method)
 
 
+def test_mega_hybrid_method_is_mega_specialization():
+    assert issubclass(moe_mod.MegaHybridMxfp4MoEMethod, moe_mod.MegaMxfp4MoEMethod)
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_mega_hybrid_method_selection(monkeypatch, hybrid):
+    mega_method = object()
+    hybrid_method = object()
+    config = SimpleNamespace(moe_backend="mega")
+    monkeypatch.setattr(moe_mod, "get_current_atom_config", lambda: config)
+    monkeypatch.setattr(moe_mod.envs, "ATOM_MEGA_HYBRID", hybrid)
+    monkeypatch.setattr(moe_mod, "MegaMxfp4MoEMethod", lambda *_args: mega_method)
+    monkeypatch.setattr(
+        moe_mod, "MegaHybridMxfp4MoEMethod", lambda *_args: hybrid_method
+    )
+
+    selected = moe_mod._make_mxfp4_moe_method(object(), object())
+
+    assert selected is (hybrid_method if hybrid else mega_method)
+
+
 @pytest.mark.parametrize(
     ("eplb_enabled", "expected_triton"),
     [(False, True), (True, False)],

@@ -2240,10 +2240,81 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         return views
 
 
+class MegaHybridMxfp4MoEMethod(MegaMxfp4MoEMethod):
+    """MegaMoE for small decode and big prefill, epx + AITER fused_moe between.
+
+    ATOM_MEGA_HYBRID=1 with ``--moe-backend mega --all2all-backend epx``. The
+    standard gfx950 GUGU shuffle (ATOM_MOE_GU_ITLV=1) and Mega's
+    ``shuffle_*_a16w4`` produce byte-identical tensors, so both pipelines read
+    one copy of the weights: the standard layout is built and Mega's names
+    alias it. See select_hybrid_route for the per-forward choice.
+    """
+
+    def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
+        super().__init__(quant_config, moe)
+        if not self.is_guinterleave or get_gfx() != "gfx950":
+            raise NotImplementedError(
+                "ATOM_MEGA_HYBRID shares one weight copy between MegaMoE and "
+                "AITER fused_moe, which needs ATOM_MOE_GU_ITLV=1 on gfx950 "
+                f"(got gu_itlv={self.is_guinterleave}, gfx={get_gfx()})"
+            )
+
+    def _process_weight_layout_after_loading(self, layer) -> None:
+        Mxfp4MoEMethod._process_weight_layout_after_loading(self, layer)
+        if self.hidden_pad or self.intermediate_pad:
+            raise NotImplementedError(
+                "ATOM_MEGA_HYBRID needs unpadded MoE weights; got "
+                f"hidden_pad={self.hidden_pad}, "
+                f"intermediate_pad={self.intermediate_pad}"
+            )
+        # Same bytes as build_mega_weights would produce from the raw layout:
+        # moe_shuffle_weight/moe_shuffle_scale(is_guinterleave=True) on gfx950
+        # are shuffle_weight_a16w4(., 16, .)/shuffle_scale_a16w4.
+        layer._mega_w1 = layer.w13_weight.data
+        layer._mega_w1_scale = layer.w13_weight_scale.data
+        layer._mega_w2 = layer.w2_weight.data
+        layer._mega_w2_scale = layer.w2_weight_scale.data
+        logger.info("Prepared shared MegaMoE/fused_moe weights for hybrid MoE layer")
+
+    def init_prepare_finalize(self, layer: torch.nn.Module):
+        from atom.model_ops.fused_moe.flydsl_mega_experts import (
+            MegaFusedExperts,
+            MegaHybridFusedExperts,
+        )
+
+        FusedMoEMethodBase.init_prepare_finalize(self, layer)
+        if self.moe.moe_parallel_config.selected_all2all_backend != "epx":
+            raise NotImplementedError(
+                "ATOM_MEGA_HYBRID routes mid-size forwards to the epx transport; "
+                "run with --all2all-backend epx"
+            )
+        modular = self.fused_experts
+        mega = MegaFusedExperts(
+            layer,
+            model_dim=self.hidden_size,
+            inter_dim=self.intermediate_size,
+            mtpr=self.moe.max_num_tokens,
+            quant="a8w4",
+        )
+        self.fused_experts = MegaHybridFusedExperts(
+            layer,
+            mega,
+            modular,
+            max_epx_tokens=hybrid_max_epx_tokens(self.moe.max_num_tokens),
+        )
+
+
+def hybrid_max_epx_tokens(max_num_tokens: int) -> int:
+    """Per-rank row limit of the epx leg under ATOM_MEGA_HYBRID."""
+    return min(max_num_tokens, envs.ATOM_MEGA_HYBRID_MAX_EPX_TOKENS)
+
+
 def _make_mxfp4_moe_method(
     quant_config: LayerQuantConfig, moe: FusedMoEConfig
 ) -> Mxfp4MoEMethod:
     if get_current_atom_config().moe_backend == "mega":
+        if envs.ATOM_MEGA_HYBRID:
+            return MegaHybridMxfp4MoEMethod(quant_config, moe)
         return MegaMxfp4MoEMethod(quant_config, moe)
     return Mxfp4MoEMethod(quant_config, moe)
 

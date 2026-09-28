@@ -95,6 +95,16 @@ class EpxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 def make_epx_prepare_finalize(moe, ep_group) -> EpxPrepareAndFinalize:
     """One epx op per process (every MoE layer shares it), like MoRI's cached handle."""
     global _EPX_OP
+    max_tokens = moe.max_num_tokens
+    if envs.ATOM_MEGA_HYBRID:
+        from atom.config import get_current_atom_config
+
+        if get_current_atom_config().moe_backend == "mega":
+            from atom.model_ops.moe import hybrid_max_epx_tokens
+
+            # Mega serves every forward above the hybrid limit, so size the
+            # receive arena for the epx leg only.
+            max_tokens = hybrid_max_epx_tokens(max_tokens)
     if _EPX_OP is None:
         from epx import EpxOp
 
@@ -102,7 +112,7 @@ def make_epx_prepare_finalize(moe, ep_group) -> EpxPrepareAndFinalize:
             rank=ep_group.rank_in_group,
             world_size=ep_group.world_size,
             hidden=moe.hidden_dim,
-            max_tokens_per_rank=moe.max_num_tokens,
+            max_tokens_per_rank=max_tokens,
             experts_per_rank=moe.num_local_experts,
             topk=moe.experts_per_token,
             x_bytes_per_elem=1,
@@ -112,7 +122,7 @@ def make_epx_prepare_finalize(moe, ep_group) -> EpxPrepareAndFinalize:
         )
     return EpxPrepareAndFinalize(
         _EPX_OP,
-        max_tokens_per_rank=moe.max_num_tokens,
+        max_tokens_per_rank=max_tokens,
         num_dispatchers=ep_group.world_size,
     )
 

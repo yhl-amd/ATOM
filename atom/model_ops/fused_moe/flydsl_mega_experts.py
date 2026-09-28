@@ -205,6 +205,110 @@ def get_or_build_mega_moe(
     return m
 
 
+def _mega_rank_world() -> tuple[int, int]:
+    from aiter.dist.parallel_state import get_ep_group
+
+    # Do NOT "simplify" this to get_ep_group().rank_in_group / .world_size.
+    # Reading device_communicator.all2all_manager is load-bearing: that property
+    # lazily constructs the all2all manager, and building MoriAll2AllManager is
+    # what initializes the mori symmetric shmem heap.
+    am = get_ep_group().device_communicator.all2all_manager
+    return int(am.rank), int(am.world_size)
+
+
+def _mega_build_args(
+    layer,
+    *,
+    rank: int,
+    world: int,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    quant: str,
+    swiglu_limit: float,
+) -> dict:
+    if not hasattr(layer, "_mega_w1"):
+        raise RuntimeError("MegaMoE weights were not prepared")
+    return {
+        "rank": rank,
+        "world_size": world,
+        "model_dim": model_dim,
+        "inter_dim": inter_dim,
+        "experts": experts,
+        "topk": topk,
+        "quant": quant,
+        "swiglu_limit": float(swiglu_limit),
+        "w1": layer._mega_w1,
+        "w1_scale": layer._mega_w1_scale,
+        "w2": layer._mega_w2,
+        "w2_scale": layer._mega_w2_scale,
+    }
+
+
+def _get_mega_instances(mtpr: int, build_args: dict):
+    """Return (configured-capacity instance, 128-token instance or None).
+
+    Allocate in a fixed order even when the first pass is prefill/profiling.
+    Mega construction has symmetric allocations and barriers; lazily building
+    only the locally selected capacity could leave peers in different calls.
+    """
+    mega = get_or_build_mega_moe(mtpr=mtpr, **build_args)
+    world = build_args["world_size"]
+    use_decode_capacity = (
+        envs.ATOM_MEGA_DECODE_FAST_PATH
+        # Plugin bridges do not all publish native ForwardMode's group-agreed
+        # token rows. Some still report request counts for prefill.
+        and not is_plugin_mode()
+        and mtpr > _MEGA_DECODE_MTPR
+        and world == 8
+        and build_args["experts"] == world * 48
+    )
+    if use_decode_capacity:
+        from atom.utils.tbo.ubatching import tbo_active
+
+        # Do not introduce symmetric workspace allocation from a TBO worker.
+        # The first ordinary forward's warmup will allocate the small instance.
+        use_decode_capacity = not tbo_active()
+    if not use_decode_capacity:
+        return mega, None
+    return mega, get_or_build_mega_moe(mtpr=_MEGA_DECODE_MTPR, **build_args)
+
+
+def prebuild_mega_moe(
+    layer,
+    *,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    mtpr: int,
+    swiglu_limit: float,
+    quant: str = "a8w4",
+) -> None:
+    """Allocate every Mega capacity run_mega_moe may select, without a forward.
+
+    For callers that route some forwards elsewhere: the instances must exist
+    before graph capture even if no Mega forward has run yet. Every rank must
+    call this at the same point (it allocates symmetric memory).
+    """
+    rank, world = _mega_rank_world()
+    _get_mega_instances(
+        mtpr,
+        _mega_build_args(
+            layer,
+            rank=rank,
+            world=world,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            quant=quant,
+            swiglu_limit=swiglu_limit,
+        ),
+    )
+
+
 def run_mega_moe(
     layer,
     x: torch.Tensor,
@@ -228,14 +332,7 @@ def run_mega_moe(
     `scheduled_tokens`) to expert -1, like the MoRI/epx paths, and return
     them as zeros. See _mask_pad_rows_for_mega for why the output select is
     required and not just cosmetic."""
-    from aiter.dist.parallel_state import get_ep_group
-
-    # Do NOT "simplify" this to get_ep_group().rank_in_group / .world_size.
-    # Reading device_communicator.all2all_manager is load-bearing: that property
-    # lazily constructs the all2all manager, and building MoriAll2AllManager is
-    # what initializes the mori symmetric shmem heap.
-    am = get_ep_group().device_communicator.all2all_manager
-    rank, world = int(am.rank), int(am.world_size)
+    rank, world = _mega_rank_world()
 
     run_tokens = int(x.shape[0])
     if run_tokens > mtpr:
@@ -244,44 +341,19 @@ def run_mega_moe(
             f"(max_num_tokens); widening mtpr here would diverge the p2p wire "
             f"format across ranks"
         )
-    if not hasattr(layer, "_mega_w1"):
-        raise RuntimeError("MegaMoE weights were not prepared")
-
-    build_args = {
-        "rank": rank,
-        "world_size": world,
-        "model_dim": model_dim,
-        "inter_dim": inter_dim,
-        "experts": experts,
-        "topk": topk,
-        "quant": quant,
-        "swiglu_limit": float(swiglu_limit),
-        "w1": layer._mega_w1,
-        "w1_scale": layer._mega_w1_scale,
-        "w2": layer._mega_w2,
-        "w2_scale": layer._mega_w2_scale,
-    }
-    # Allocate in a fixed order even when the first pass is prefill/profiling.
-    # Mega construction has symmetric allocations and barriers; lazily building
-    # only the locally selected capacity could leave peers in different calls.
-    mega = get_or_build_mega_moe(mtpr=mtpr, **build_args)
-    use_decode_capacity = (
-        envs.ATOM_MEGA_DECODE_FAST_PATH
-        # Plugin bridges do not all publish native ForwardMode's group-agreed
-        # token rows. Some still report request counts for prefill.
-        and not is_plugin_mode()
-        and mtpr > _MEGA_DECODE_MTPR
-        and world == 8
-        and experts == world * 48
+    build_args = _mega_build_args(
+        layer,
+        rank=rank,
+        world=world,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        quant=quant,
+        swiglu_limit=swiglu_limit,
     )
-    if use_decode_capacity:
-        from atom.utils.tbo.ubatching import tbo_active
-
-        # Do not introduce symmetric workspace allocation from a TBO worker.
-        # The first ordinary forward's warmup will allocate the small instance.
-        use_decode_capacity = not tbo_active()
-    if use_decode_capacity:
-        decode_mega = get_or_build_mega_moe(mtpr=_MEGA_DECODE_MTPR, **build_args)
+    mega, decode_mega = _get_mega_instances(mtpr, build_args)
+    if decode_mega is not None:
         from atom.utils.forward_context import get_forward_context
 
         context = get_forward_context().context
@@ -468,3 +540,106 @@ class MegaFusedExperts:
             quant=self._quant,
             mask_pad_rows=self._mask_pad_rows,
         )
+
+
+_HYBRID_ROUTE_LOGGED: set[tuple[bool, int, str]] = set()
+
+
+def select_hybrid_route(context, *, max_epx_tokens: int, tbo_active: bool) -> str:
+    """Pick "mega" or "epx" for one forward from group-agreed metadata only.
+
+    Mega's 128-token fixed-slot instance is the fastest decode path; above it
+    Mega falls to its large compact instance (FP8 combine), where epx + the
+    tuned AITER fused_moe is faster up to ~1k rows per rank. Big prefills go
+    back to Mega's compact path, which beats the unfused pipeline there.
+
+    Same rule as _select_decode_mtpr: only a DP-unified shape is known to every
+    rank, so anything else (and TBO) stays on Mega's configured capacity. The
+    two backends do not share a wire protocol, so a split choice would hang.
+    """
+    if context is None or not context.running_tokens_are_unified or tbo_active:
+        return "mega"
+    tokens = context.running_tokens
+    if _MEGA_DECODE_MTPR < tokens <= max_epx_tokens:
+        return "epx"
+    return "mega"
+
+
+class MegaHybridFusedExperts:
+    """Route each forward to MegaMoE or to the epx modular kernel.
+
+    Both callees read the same weight storage (see
+    MegaHybridMxfp4MoEMethod), so this only picks the pipeline. Like
+    MegaFusedExperts, deliberately not an ``nn.Module``.
+    """
+
+    def __init__(
+        self,
+        layer: torch.nn.Module,
+        mega: MegaFusedExperts,
+        modular,
+        *,
+        max_epx_tokens: int,
+    ) -> None:
+        self._layer = layer
+        self._mega = mega
+        self._modular = modular
+        self._max_epx_tokens = max_epx_tokens
+        self._mega_built = False
+
+    def _ensure_mega_built(self, global_num_experts: int, topk: int) -> None:
+        # Mega's instances must exist before any capture, including captures
+        # whose shapes route to epx first. Every rank routes identically, so
+        # every rank reaches this at the same point.
+        if self._mega_built or torch.cuda.is_current_stream_capturing():
+            return
+        mega = self._mega
+        prebuild_mega_moe(
+            self._layer,
+            model_dim=mega._model_dim,
+            inter_dim=mega._inter_dim,
+            experts=global_num_experts,
+            topk=topk,
+            mtpr=mega._mtpr,
+            swiglu_limit=getattr(self._layer, "swiglu_limit", 0.0),
+            quant=mega._quant,
+        )
+        self._mega_built = True
+
+    def __call__(self, **kwargs) -> torch.Tensor:
+        from atom.utils.forward_context import get_forward_context
+        from atom.utils.tbo.ubatching import tbo_active
+
+        context = get_forward_context().context
+        route = select_hybrid_route(
+            context, max_epx_tokens=self._max_epx_tokens, tbo_active=tbo_active()
+        )
+        if (
+            context is not None
+            and context.running_tokens_are_unified
+            and context.running_tokens > 0
+            and _mega_rank_world()[0] == 0
+        ):
+            key = (context.is_draft, context.running_tokens, route)
+            if key not in _HYBRID_ROUTE_LOGGED:
+                _HYBRID_ROUTE_LOGGED.add(key)
+                logger.info(
+                    "[MEGA-HYBRID] phase=%s tokens=%d route=%s",
+                    "draft" if context.is_draft else "target",
+                    context.running_tokens,
+                    route,
+                )
+        if route == "mega":
+            self._mega_built = True
+            return self._mega(**kwargs)
+        self._ensure_mega_built(
+            kwargs.get("global_num_experts", -1), int(kwargs["topk_ids"].shape[1])
+        )
+        rows = int(kwargs["hidden_states"].shape[0])
+        if rows > self._max_epx_tokens:
+            raise ValueError(
+                f"[mega-hybrid] {rows} rows exceed the epx capacity "
+                f"{self._max_epx_tokens}; context.running_tokens="
+                f"{context.running_tokens}"
+            )
+        return self._modular(**kwargs)

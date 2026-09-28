@@ -170,6 +170,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MEGA_DECODE_FAST_PATH": lambda: (
         os.getenv("ATOM_MEGA_DECODE_FAST_PATH", "1") == "1"
     ),
+    # With --moe-backend mega --all2all-backend epx: DP-unified forwards of
+    # 129..ATOM_MEGA_HYBRID_MAX_EPX_TOKENS rows per rank run epx + AITER
+    # fused_moe instead of Mega's compact path; smaller and larger stay on Mega.
+    "ATOM_MEGA_HYBRID": lambda: os.getenv("ATOM_MEGA_HYBRID", "0") == "1",
+    "ATOM_MEGA_HYBRID_MAX_EPX_TOKENS": lambda: int(
+        os.getenv("ATOM_MEGA_HYBRID_MAX_EPX_TOKENS", "1024")
+    ),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # Match SGLang's gfx950 pure-prefill fast path: cast Q/K/V to FP8 and use
     # AITER's head-dim-256 per-tensor FMHA kernel. Set to 0 for the BF16
