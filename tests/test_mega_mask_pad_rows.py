@@ -31,11 +31,14 @@ def run(monkeypatch):
     seen = {}
 
     class FakeMegaMoEV2:
+        supports_combine_mask = False
+
         def __init__(self, **kwargs):
             pass
 
-        def forward(self, x, weights, ids):
+        def forward(self, x, weights, ids, **kwargs):
             seen["ids"] = ids.clone()
+            seen["kwargs"] = kwargs
             return torch.full_like(x, float("nan"))
 
     def stub_module(name, **attrs):
@@ -104,6 +107,8 @@ def run(monkeypatch):
         )
         return ids.to(torch.int32), seen["ids"], out
 
+    _run.mega_cls = FakeMegaMoEV2
+    _run.seen = seen
     return _run
 
 
@@ -152,3 +157,19 @@ def test_switch_follows_the_mori_env(monkeypatch):
     )
     assert mega._mask_pad_rows_for_mega(128) is True
     assert fc.get_pad_rows_device().shape == (128, 1)
+
+
+def test_masking_combine_output_is_not_reselected(run, monkeypatch):
+    # An aiter whose combine skips -1 slots returns the pad rows itself; the
+    # output select would be a redundant elementwise pass per layer.
+    monkeypatch.setattr(run.mega_cls, "supports_combine_mask", True)
+    _, sent, out = run(scheduled=5 * 7, running=8 * 7)
+    assert (sent[5 * 7 :] == -1).all()
+    assert run.seen["kwargs"] == {"mask_invalid_slots": True}
+    assert out.isnan().all()
+
+
+def test_masking_combine_is_only_requested_for_padded_passes(run, monkeypatch):
+    monkeypatch.setattr(run.mega_cls, "supports_combine_mask", True)
+    run(scheduled=40, running=40)
+    assert run.seen["kwargs"] == {"mask_invalid_slots": False}

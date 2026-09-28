@@ -50,7 +50,11 @@ logger = logging.getLogger("atom")
 _MEGA_CACHE: dict = {}
 _MEGA_ROUTE_ROWS: dict[tuple[torch.device, int], torch.Tensor] = {}
 _MEGA_BUILD_DBG = False
-_MEGA_DECODE_MTPR = 128
+_MEGA_DECODE_MTPR = envs.ATOM_MEGA_DECODE_MTPR
+if _MEGA_DECODE_MTPR not in (128, 256):
+    raise ValueError(
+        f"ATOM_MEGA_DECODE_MTPR must be 128 or 256, got {_MEGA_DECODE_MTPR}"
+    )
 _MEGA_CAPACITY_LOGGED: set[tuple[bool, int, int]] = set()
 
 
@@ -398,17 +402,24 @@ def run_mega_moe(
             # Whole rows only (every top-k slot, the fused shared expert slot
             # included); see _mask_pad_rows_for_mega.
             ids = torch.where(pad_rows, -1, ids)
+    # An aiter whose combine can skip -1 top-k slots (MegaMoEV2.supports_combine_mask)
+    # returns exact zeros for masked rows itself; ask for it only when this pass
+    # masks rows, since the check costs ~10% of a prefill MoE layer.
+    combine_masks = getattr(mega, "supports_combine_mask", False)
+    forward_kwargs = (
+        {"mask_invalid_slots": pad_rows is not None} if combine_masks else {}
+    )
     with torch.inference_mode(False), torch.no_grad():
         # swiglu_limit is NOT a forward arg -- it is baked into the instance at
         # construction (see the cache key above).
-        out = mega.forward(x.contiguous(), wts, ids)
-    if pad_rows is not None:
-        # MegaMoEV2's fused combine (combine_no_stage1) sums all top-k slots
-        # of every token unconditionally. A slot whose id was -1 is never
-        # written by Stage2, so a masked row reads whatever an earlier call
-        # (any layer sharing this instance, any p2p wire format) left there:
-        # stale and, across fp8/bf16 formats, possibly non-finite. Select
-        # zeros so pad rows come back exactly as on the MoRI/epx paths.
+        out = mega.forward(x.contiguous(), wts, ids, **forward_kwargs)
+    if pad_rows is not None and not combine_masks:
+        # Older aiter: MegaMoEV2's fused combine (combine_no_stage1) sums all
+        # top-k slots of every token unconditionally. A slot whose id was -1 is
+        # never written by Stage2, so a masked row reads whatever an earlier
+        # call (any layer sharing this instance, any p2p wire format) left
+        # there: stale and, across fp8/bf16 formats, possibly non-finite.
+        # Select zeros so pad rows come back exactly as on the MoRI/epx paths.
         out = torch.where(pad_rows, 0, out)
     return out
 
