@@ -170,6 +170,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MEGA_DECODE_FAST_PATH": lambda: (
         os.getenv("ATOM_MEGA_DECODE_FAST_PATH", "1") == "1"
     ),
+    # Capacity of that small instance: 128 (aiter's fixed-slot limit) or 256, which
+    # needs an aiter with AITER_MEGA_FIXED_SLOT_MAX_MTPR=511 to stay fixed-slot.
+    "ATOM_MEGA_DECODE_MTPR": lambda: int(os.getenv("ATOM_MEGA_DECODE_MTPR", "128")),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # Match SGLang's gfx950 pure-prefill fast path: cast Q/K/V to FP8 and use
     # AITER's head-dim-256 per-tensor FMHA kernel. Set to 0 for the BF16
