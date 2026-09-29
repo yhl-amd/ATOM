@@ -92,6 +92,37 @@ class EpxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
 
 
+_EPX_FMOE_CSV = "dsv4_fp8fp4_ep8_epx_fmoe.csv"
+
+
+def _use_epx_tuned_fmoe() -> None:
+    """Put aiter's epx-tuned fused_moe rows ahead of its default configs.
+
+    The rows key on (padded M, local experts), which other EP transports also hit,
+    so aiter does not load them by default; this backend opts in. An explicit
+    AITER_CONFIG_FMOE is left alone.
+    """
+    import glob
+    import os
+
+    if os.environ.get("AITER_CONFIG_FMOE"):
+        return
+    try:
+        import aiter
+    except ImportError:
+        return
+    cfg = os.path.join(os.path.dirname(aiter.__file__), "configs")
+    rows = os.path.join(cfg, "model_configs", _EPX_FMOE_CSV)
+    if not os.path.isfile(rows):
+        return
+    defaults = [os.path.join(cfg, "tuned_fmoe.csv")] + sorted(
+        p
+        for p in glob.glob(os.path.join(cfg, "model_configs", "*tuned_fmoe*.csv"))
+        if "untuned" not in os.path.basename(p)
+    )
+    os.environ["AITER_CONFIG_FMOE"] = ":".join([rows] + defaults)
+
+
 def make_epx_prepare_finalize(moe, ep_group) -> EpxPrepareAndFinalize:
     """One epx op per process (every MoE layer shares it), like MoRI's cached handle."""
     global _EPX_OP
@@ -106,8 +137,12 @@ def make_epx_prepare_finalize(moe, ep_group) -> EpxPrepareAndFinalize:
             # receive arena for the epx leg only.
             max_tokens = hybrid_max_epx_tokens(max_tokens)
     if _EPX_OP is None:
-        from epx import EpxOp
+        try:
+            from aiter.dist.device_communicators.epx import EpxOp
+        except ImportError:  # aiter without epx: the standalone package
+            from epx import EpxOp
 
+        _use_epx_tuned_fmoe()
         _EPX_OP = EpxOp(
             rank=ep_group.rank_in_group,
             world_size=ep_group.world_size,
