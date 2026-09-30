@@ -8,6 +8,7 @@ import torch
 from aiter import ActivationType, QuantType
 from aiter.dist.parallel_state import get_dp_group
 from aiter.fused_moe import fused_moe
+from aiter.ops.flydsl.moe_common import GateMode
 
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.model_ops.fused_moe.utils import disable_inplace
@@ -60,6 +61,77 @@ PrepareResultType = tuple[
 ReceiverType = Callable[[], PrepareResultType]
 
 
+def aiter_ep_sentinel_expert_id(
+    num_experts: int, expert_map: torch.Tensor | None
+) -> int | None:
+    """The always-masked expert id AITER's EP convention expects, or None.
+
+    AITER's fused_moe treats the last top-k column as a fake expert whenever
+    an expert_mask is given, and subtracts it from the top-k of its tuned-kernel
+    key. FusedMoE advertises that fake expert by extending expert_map by exactly
+    one trailing -1 slot, which also leaves expert_mask[num_experts] == 0.
+    """
+    if expert_map is not None and expert_map.numel() == num_experts + 1:
+        return num_experts
+    return None
+
+
+# (device, ids dtype, weights dtype, sentinel id) -> prefilled [rows, 1] columns.
+# Built once and only regrown by a larger eager step: decode graphs are far
+# below the initial capacity, and the warmup forward creates it before capture.
+_SENTINEL_COLUMNS: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+_SENTINEL_MIN_ROWS = 1 << 16
+
+
+def _sentinel_columns(
+    rows: int, ids_like: torch.Tensor, weights_like: torch.Tensor, sentinel: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (ids_like.device, ids_like.dtype, weights_like.dtype, sentinel)
+    cols = _SENTINEL_COLUMNS.get(key)
+    if cols is None or cols[0].shape[0] < rows:
+        capacity = max(rows, _SENTINEL_MIN_ROWS)
+        cols = (
+            ids_like.new_full((capacity, 1), sentinel),
+            weights_like.new_zeros((capacity, 1)),
+        )
+        _SENTINEL_COLUMNS[key] = cols
+    return cols[0][:rows], cols[1][:rows]
+
+
+_ROW_INDEX: dict[torch.device, torch.Tensor] = {}
+
+
+def row_index(rows: int, device: torch.device) -> torch.Tensor:
+    """A cached [rows, 1] int32 arange, built outside graph capture like the
+    sentinel columns and only regrown by a larger eager step."""
+    idx = _ROW_INDEX.get(device)
+    if idx is None or idx.shape[0] < rows:
+        idx = torch.arange(
+            max(rows, _SENTINEL_MIN_ROWS), dtype=torch.int32, device=device
+        ).unsqueeze(1)
+        _ROW_INDEX[device] = idx
+    return idx[:rows]
+
+
+def append_aiter_ep_sentinel(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sentinel_expert_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Append one zero-weight column routed to the masked sentinel expert.
+
+    The column comes prefilled, so every MoE layer pays the two concatenations
+    and nothing else.
+    """
+    sentinel_ids, sentinel_weights = _sentinel_columns(
+        topk_ids.shape[0], topk_ids, topk_weights, sentinel_expert_id
+    )
+    return (
+        torch.cat((topk_ids, sentinel_ids), dim=1),
+        torch.cat((topk_weights, sentinel_weights), dim=1),
+    )
+
+
 class FusedMoEPrepareAndFinalize(ABC):
     """
     An abstract base class for the [Quantize-Prepare] and [Finalize] steps
@@ -85,6 +157,43 @@ class FusedMoEPrepareAndFinalize(ABC):
     def needs_dispatch_output_trim(self) -> bool:
         """Whether prepare may return a fixed-capacity buffer with a dead tail."""
         return True
+
+    def adapt_routing_for_fused_moe(
+        self,
+        dispatch_ids: torch.Tensor,
+        dispatch_weights: torch.Tensor,
+        num_experts: int,
+        expert_map: torch.Tensor | None,
+        num_valid_rows: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Adapt the dispatched routing for AITER fused_moe.
+
+        Runs after the receive-buffer trim and only ahead of AITER fused_moe;
+        combine keeps the caller's own topk_ids. Returns the routing and the
+        device row count to pass as fused_moe's num_local_tokens. The default
+        is a no-op for transports that already hand back what fused_moe
+        expects.
+        """
+        return dispatch_ids, dispatch_weights, num_valid_rows
+
+    def expert_output_buffer(
+        self, num_rows: int, hidden_dim: int, dtype: torch.dtype
+    ) -> torch.Tensor | None:
+        """A [num_rows, hidden_dim] buffer for AITER fused_moe to write into.
+
+        For a transport whose combine reads the expert output from memory it
+        owns, so fused_moe can write it there instead of into its own buffer.
+        None (the default) lets fused_moe allocate as usual.
+        """
+        return None
+
+    def mask_pad_topk_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        """Return `topk_ids` with rows that carry no request routed nowhere.
+
+        Identity unless the transport drops negative ids for free. Applied
+        before prepare, so dispatch and combine see the same routing.
+        """
+        return topk_ids
 
     def prepare_async(
         self,
@@ -386,6 +495,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         local_num_experts = w1.size(0)
         if global_num_experts == -1:
             global_num_experts = local_num_experts
+        topk_ids = self.prepare_finalize.mask_pad_topk_ids(topk_ids)
         (
             dispatch_a1,
             dispatch_scale,
@@ -439,6 +549,28 @@ class FusedMoEModularKernel(torch.nn.Module):
         # weights live on the layer, so the quant method forwards them through
         # `moe_extra_args` -- the modular kernel holds no layer reference.
         triton_experts = extra_kwargs.pop("triton_experts", None)
+
+        # An MXFP8 dispatch already ran the activation quant fused_moe would
+        # run; `dispatch_scale` below tells aiter to skip it. Checked here, not
+        # at construction, because only this call knows the activation and
+        # gate mode that decide whether aiter takes fp8 rows as-is.
+        if getattr(self.prepare_finalize, "use_mxfp8_dispatch", False):
+            from atom.model_ops.fused_moe.mori_prepare_finalize import (
+                check_mxfp8_dispatch_consumable,
+            )
+
+            if triton_experts is not None:
+                raise RuntimeError(
+                    "ATOM_MORI_FP8_DISPATCH=1 is not supported with the Triton "
+                    "EP experts (ATOM_USE_TRITON_MOE)"
+                )
+            check_mxfp8_dispatch_consumable(
+                quant_type,
+                w1.dtype,
+                activation,
+                extra_kwargs.get("gate_mode", GateMode.SEPARATED.value),
+                hidden_pad or 0,
+            )
 
         # Runs on prefill as well as decode. The gfx1250 gluon kernel used to
         # be prefill-broken (TDM async_gather over mxfp8 activations), so this
@@ -617,6 +749,24 @@ class FusedMoEModularKernel(torch.nn.Module):
                 topk_ids,
                 apply_router_weight_on_input,
             )
+        # After the trim, so this touches only the rows the group sent rather
+        # than the whole receive arena. The Triton path above keeps the plain
+        # routing: its gate count comes from the column count.
+        dispatch_ids, dispatch_weights, num_local_tokens = (
+            self.prepare_finalize.adapt_routing_for_fused_moe(
+                dispatch_ids,
+                dispatch_weights,
+                global_num_experts,
+                expert_map,
+                expert_tokens_meta.expert_num_tokens,
+            )
+        )
+        # aiter's own output shape: (M, w2.shape[1]) in the caller's dtype.
+        expert_output = self.prepare_finalize.expert_output_buffer(
+            dispatch_ids.shape[0], w2.shape[1], hidden_states.dtype
+        )
+        if expert_output is not None:
+            extra_kwargs["output"] = expert_output
         fused_out = fused_moe(
             dispatch_a1,
             w1,
@@ -626,7 +776,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             expert_mask,
             activation,
             quant_type=quant_type,
-            num_local_tokens=expert_tokens_meta.expert_num_tokens,
+            num_local_tokens=num_local_tokens,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             a1_scale=dispatch_scale if dispatch_scale is not None else a1_scale,

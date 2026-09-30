@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import bisect
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import cache, lru_cache
 from typing import Any
 
 import torch
@@ -11,8 +14,13 @@ from aiter.jit.utils.chip_info import get_cu_num
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
+from atom.plugin import is_plugin_mode
 from atom.utils import envs
-from atom.utils.forward_context import get_forward_context
+from atom.utils.forward_context import (
+    enable_pad_rows_device,
+    get_forward_context,
+    get_pad_rows_device,
+)
 
 try:
     import mori
@@ -21,6 +29,97 @@ try:
 except ImportError:
     mori = None  # type: ignore
     MORI_AVAILABLE = False
+
+logger = logging.getLogger("atom")
+
+
+_NUM_TBO_UBATCHES = 2
+
+
+def select_mori_kernel_params(
+    *, low_latency: bool, internode: bool
+) -> tuple[str, int, int, int]:
+    """Pick the MoRI kernel and its launch geometry.
+
+    Returns ``(kernel_name, warp_num_per_block, block_num, rdma_block_num)``.
+    The name is resolved against ``mori.ops.EpDispatchCombineKernelType`` by the
+    caller so this stays importable (and testable) without mori installed.
+
+    `internode` must come from a real topology probe. It used to be inferred
+    from ``world_size <= 8``, which is a GPUs-per-node assumption rather than a
+    measurement: 2 nodes x 4 GPUs reads as intra-node and selects kernels that
+    assume P2P mappings across a boundary that has none.
+    """
+    if low_latency:
+        return ("AsyncLL", 8, 64, 32)
+    if internode:
+        return ("InterNodeV1", 16, 32, 16)
+    return ("IntraNode", 16, 80, 0)
+
+
+@lru_cache(maxsize=8)
+def init_mori_op(
+    rank: int,
+    world_size: int,
+    hidden_dim: int,
+    scale_dim: int,
+    max_num_inp_token_per_rank: int,
+    num_local_experts: int,
+    num_experts_per_token: int,
+    gpu_per_node: int,
+    data_type_itemsize: int,
+    max_token_type_size: int,
+    low_latency: bool = False,
+    internode: bool = False,
+    instance_id: int = 0,
+    scale_type_size: int = torch.float32.itemsize,
+    quant_type: str = "none",
+) -> Any:
+    """
+    Create a mori op instance.
+      - low_latency=True  → AsyncLL (dispatch_send/recv, combine_send/recv)
+      - internode=True    → InterNodeV1 (RDMA across nodes)
+      - otherwise         → IntraNode
+    """
+    import mori
+
+    data_type = torch.float8_e4m3fnuz
+    for dt in [torch.float8_e4m3fnuz, torch.float8_e4m3fn, torch.bfloat16]:
+        if dt.itemsize == data_type_itemsize:
+            data_type = dt
+            break
+
+    kernel_name, warp_num_per_block, block_num, rdma_block_num = (
+        select_mori_kernel_params(low_latency=low_latency, internode=internode)
+    )
+    kernel_type = getattr(mori.ops.EpDispatchCombineKernelType, kernel_name)
+
+    mori_config = mori.ops.EpDispatchCombineConfig(
+        rank=rank,
+        world_size=world_size,
+        data_type=data_type,
+        hidden_dim=hidden_dim,
+        scale_dim=scale_dim,
+        scale_type_size=scale_type_size,
+        quant_type=quant_type,
+        max_token_type_size=max_token_type_size,
+        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+        num_experts_per_rank=num_local_experts,
+        num_experts_per_token=num_experts_per_token,
+        warp_num_per_block=warp_num_per_block,
+        block_num=block_num,
+        kernel_type=kernel_type,
+        gpu_per_node=gpu_per_node,
+        rdma_block_num=rdma_block_num,
+        **({"num_qp_per_pe": 2} if low_latency else {}),
+    )
+    mori_op = mori.ops.EpDispatchCombineOp(mori_config)
+    logger.info(
+        f"[MORI] Created {kernel_type} mori_op instance_id={instance_id}: "
+        f"{rank=} {world_size=} {hidden_dim=} {num_local_experts=} "
+        f"{num_experts_per_token=}"
+    )
+    return mori_op
 
 
 _FP8_DTYPES = (
@@ -34,6 +133,235 @@ _FP8_DTYPES = (
 # make_prepare_finalize runs per MoE layer (58x for DSR1). envs.__getattr__ does
 # not cache, so binding here also keeps it to a single getenv.
 _FP4_DISPATCH = envs.ATOM_MORI_FP4_DISPATCH
+# Same reasoning: the launch policy is consulted on every dispatch and combine.
+_LAUNCH_POLICY = envs.ATOM_MORI_LAUNCH_POLICY
+
+# IntraNode kernels launch warp_per_block * 64 threads per block; 16 warps is
+# the 1024-thread block limit and what the pre-tuning grid already ran.
+_MAX_WARP_PER_BLOCK = 16
+
+# Launch tables already logged; every MoE layer has its own prepare/finalize.
+_LOGGED_LAUNCH_TABLES: set[tuple] = set()
+
+
+@cache
+def mori_tuned_launch_table(
+    phase: str,
+    ep_size: int,
+    dtype: torch.dtype,
+    hidden_dim: int,
+    topk: int,
+    zero_copy: bool | None = None,
+    quant_type: str | None = None,
+) -> tuple[tuple[int, ...], tuple[tuple[int, int], ...]] | None:
+    """MoRI's shipped IntraNode tuning rules for one call shape, as a step table.
+
+    Returns ``(ceilings, geometries)``: the ``(block_num, warp_per_block)`` for
+    a per-rank token count ``n`` is ``geometries[bisect_left(ceilings, n)]``,
+    and the extra last entry covers counts past the largest rule. It is built
+    by asking mori's own ``TuningConfigManager.lookup`` at every rule boundary
+    (and one past the last), so it reproduces what mori's AUTO mode would pick
+    -- tightest ceiling, clamp above, exact-then-relaxed hidden/topk -- without
+    paying that walk on every launch. ``zero_copy``/``quant_type`` filter the
+    combine rules and are left None for dispatch, as mori does.
+
+    block_num is capped at the CU count: the IntraNode combine's cross-device
+    barrier spins until every block has arrived, so all blocks must be
+    co-resident. None when mori's tuning module or a matching rule is missing.
+    """
+    try:
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+        from mori.ops.tuning_config import (
+            TuningConfigManager,
+            detect_gpu_model,
+            quant_type_to_config_str,
+        )
+
+        manager = TuningConfigManager.get_instance(
+            get_gfx_runtime(), "IntraNode", ep_size, detect_gpu_model()
+        )
+        if quant_type is not None:
+            quant_type = quant_type_to_config_str(quant_type)
+    except Exception as exc:  # noqa: BLE001 -- the caller falls back to legacy
+        logger.warning(f"[MORI] tuned launch table unavailable ({exc!r})")
+        return None
+    rules = manager.dispatch_rules if phase == "dispatch" else manager.combine_rules
+    if not rules:
+        return None
+    ceilings = tuple(sorted({int(rule["num_tokens"]) for rule in rules}))
+    cu_num = get_cu_num()
+    geometries = []
+    for num_tokens in ceilings + (ceilings[-1] + 1,):
+        params = TuningConfigManager.lookup(
+            rules,
+            dtype,
+            num_tokens,
+            hidden_dim,
+            zero_copy=zero_copy,
+            quant_type=quant_type,
+            topk=topk,
+        )
+        if params is None:
+            return None
+        geometries.append(
+            (
+                min(params.block_num, cu_num),
+                min(params.warp_per_block, _MAX_WARP_PER_BLOCK),
+            )
+        )
+    return ceilings, tuple(geometries)
+
+
+_MXFP8_DISPATCH = envs.ATOM_MORI_FP8_DISPATCH
+_MASK_PAD_ROWS = envs.ATOM_MORI_MASK_PAD_ROWS
+_ZERO_COPY_COMBINE = envs.ATOM_MORI_ZERO_COPY_COMBINE
+_PULL_COMBINE_MIN_TOKENS = envs.ATOM_MORI_PULL_COMBINE_MIN_TOKENS
+
+# ATOM_MORI_ZERO_COPY_COMBINE value -> how the expert output reaches MoRI's
+# registered combine input buffer (None: push combine, as before).
+_ZERO_COPY_COMBINE_MODES = {"0": None, "1": "direct", "copy": "copy"}
+
+_TBO_HALF_BUFFERS = envs.ATOM_MORI_TBO_HALF_BUFFERS
+
+
+def tbo_max_tokens_per_rank(max_num_tokens: int, atom_config: Any) -> int:
+    """Per-rank input capacity of the two TBO ubatch ops.
+
+    Each op's symmetric buffers scale with this (~4 GB at 16384 bf16 rows on
+    EP8), and TBO adds two of them to the sync op. A token-midpoint prefill
+    split cuts a rank's tokens at floor(n / 2), so neither ubatch exceeds
+    ceil(max_num_tokens / 2); ATOM_MORI_TBO_HALF_BUFFERS sizes the ops to that.
+    Every other split can be uneven -- request boundaries (PCP, or
+    ATOM_TBO_PREFILL_TOKEN_SPLIT=0) put up to n - 1 rows in one ubatch -- so
+    those keep the full budget.
+    """
+    if not _TBO_HALF_BUFFERS:
+        return max_num_tokens
+    reason = None
+    if getattr(atom_config, "enable_tbo_decode", False):
+        reason = "decode TBO (--enable-tbo all) splits by request count"
+    elif getattr(atom_config, "prefill_context_parallel_size", 1) > 1:
+        reason = "PCP+TBO splits prefill on request boundaries"
+    elif not envs.ATOM_TBO_PREFILL_TOKEN_SPLIT:
+        reason = "ATOM_TBO_PREFILL_TOKEN_SPLIT=0 splits on request boundaries"
+    capacity = max_num_tokens if reason else (max_num_tokens + 1) // 2
+    _log_tbo_capacity(capacity, max_num_tokens, reason)
+    return capacity
+
+
+@cache
+def _log_tbo_capacity(capacity: int, max_num_tokens: int, reason: str | None) -> None:
+    if reason is None:
+        logger.info(
+            f"[MORI] TBO ubatch ops sized for {capacity} of {max_num_tokens} "
+            "tokens per rank (token-midpoint prefill split)"
+        )
+    else:
+        logger.warning(f"[MORI] ATOM_MORI_TBO_HALF_BUFFERS=1 ignored: {reason}")
+
+
+@cache
+def _log_pad_masking(active: bool) -> None:
+    """Say once, not per MoE layer, whether ATOM_MORI_MASK_PAD_ROWS took."""
+    if active:
+        logger.info("[MORI] DP pad rows are routed to expert -1 before dispatch")
+    else:
+        logger.warning(
+            "[MORI] ATOM_MORI_MASK_PAD_ROWS=1 ignored: needs the IntraNode "
+            "kernel and native ATOM serving"
+        )
+
+
+def step_pad_rows(num_rows: int) -> torch.Tensor | None:
+    """The `[num_rows, 1]` "is a DP pad row" mask for this pass, or None.
+
+    None when nothing can be padded: the rows are not the step's
+    `running_tokens` (a TBO ubatch, a PCP shard, a sub-slice), an eager step
+    whose host count says every row is real, or the mask was never enabled /
+    is too short. While capturing it always returns the device mask, so the
+    recording follows whatever `publish_scheduled_tokens` wrote before each
+    replay. No host sync: only host fields and a device view are read.
+    Shared by every backend that masks pad rows (MoRI, epx, MegaMoE).
+    """
+    context = get_forward_context().context
+    if context is None or num_rows != context.running_tokens:
+        return None
+    if (
+        not torch.cuda.is_current_stream_capturing()
+        and context.scheduled_tokens >= num_rows
+    ):
+        return None
+    pad_rows = get_pad_rows_device()
+    if pad_rows is None or pad_rows.shape[0] < num_rows:
+        return None
+    return pad_rows[:num_rows]
+
+
+def _drops_negative_ids(mori_op: Any) -> bool:
+    """Whether this op's dispatch skips a (token, k) whose expert id is < 0.
+
+    Read in intranode.hpp: IntraNode dispatch writes such a pair's destination
+    as `worldSize`, sends nothing for it, and its combine then treats that
+    destination as absent. Other kernels are unverified, so they keep the ids.
+    """
+    kernel_type = getattr(getattr(mori_op, "config", None), "kernel_type", None)
+    return kernel_type == mori.ops.EpDispatchCombineKernelType.IntraNode
+
+
+def resolve_zero_copy_combine(mode: str, mori_op: Any) -> str | None:
+    """How the sync combine gets its input: None (push), "direct" or "copy".
+
+    MoRI's IntraNode combine has two transports over the same symmetric
+    buffer. Push (use_external_inp_buf, what aiter's handle defaults to) has
+    every rank copy each received row into the sender's staging slot over
+    XGMI, then barrier, then sum local staging. Zero-copy (pull) skips that
+    copy: after the barrier each rank reads its tokens' rows straight out of
+    the peers' registered combine input buffers, so the expert output has to
+    already be there, in dispatch-receive row order. The buffer, its size and
+    the kernels are the same for both, and combine() takes the transport per
+    call, so aiter's cached handle serves either -- no second handle on the
+    shmem heap.
+
+    Only the IntraNode kernel's pull path was checked, and it has no combine
+    codec: MoRI raises for blockwise and would silently drop fp8_direct_cast,
+    so those keep the push combine. Decided once per layer from the env and
+    the handle, so every rank picks the same transport.
+    """
+    if mode not in _ZERO_COPY_COMBINE_MODES:
+        raise ValueError(
+            f"ATOM_MORI_ZERO_COPY_COMBINE={mode!r}: expected one of "
+            f"{sorted(_ZERO_COPY_COMBINE_MODES)}"
+        )
+    zero_copy = _ZERO_COPY_COMBINE_MODES[mode]
+    if zero_copy is None:
+        return None
+    config = mori_op.config
+    usable = (
+        config.kernel_type == mori.ops.EpDispatchCombineKernelType.IntraNode
+        and config.quant_type == "none"
+    )
+    _log_zero_copy_combine(zero_copy if usable else None)
+    return zero_copy if usable else None
+
+
+@cache
+def _log_zero_copy_combine(zero_copy: str | None) -> None:
+    """Say once, not per MoE layer, whether ATOM_MORI_ZERO_COPY_COMBINE took."""
+    if zero_copy is None:
+        logger.warning(
+            "[MORI] ATOM_MORI_ZERO_COPY_COMBINE ignored: needs the IntraNode "
+            "kernel and ATOM_MORI_COMBINE_QUANT=none"
+        )
+    else:
+        logger.info(
+            "[MORI] zero-copy combine: peers pull the expert output from the "
+            "registered combine input buffer "
+            + (
+                "(fused_moe writes it there)"
+                if zero_copy == "direct"
+                else "(copied in before combine)"
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -51,6 +379,10 @@ class MoriDispatchFormat:
     def is_fp8(self) -> bool:
         return self.dtype in _FP8_DTYPES
 
+    @property
+    def is_mxfp8(self) -> bool:
+        return self.is_fp8 and self.quant_type == QuantType.per_1x32
+
 
 def resolve_mori_dispatch(
     in_dtype: torch.dtype,
@@ -58,6 +390,35 @@ def resolve_mori_dispatch(
     quant_config: FusedMoEQuantConfig | None = None,
 ) -> MoriDispatchFormat:
     """Decide the MoRI wire format. Call once per layer construction."""
+    if _FP4_DISPATCH and _MXFP8_DISPATCH:
+        raise ValueError(
+            "ATOM_MORI_FP4_DISPATCH and ATOM_MORI_FP8_DISPATCH both pick the "
+            "dispatch wire format; set at most one"
+        )
+    if _MXFP8_DISPATCH:
+        # Only an MXFP4-weight layer runs aiter's a8w4 fused_moe, whose own
+        # activation quant this moves ahead of the dispatch; any other layer
+        # would take these fp8 rows as data. Refuse rather than fall back to
+        # bf16: a second wire format is a second MoRI handle, i.e. another set
+        # of 131072-row staging buffers on the shmem heap.
+        weight_dtype = None if quant_config is None else quant_config._w1.dtype
+        if weight_dtype != "mxfp4":
+            raise ValueError(
+                "ATOM_MORI_FP8_DISPATCH=1 needs MXFP4 routed experts (aiter "
+                f"a8w4 fused_moe); this MoE layer has weight dtype {weight_dtype!r}"
+            )
+        _log_dispatch_format_once(
+            f"mxfp8 (fp8 e4m3 + e8m0 per 1x32): scale_dim={hidden_dim // 32}, "
+            "scale_type_size=1"
+        )
+        # Per 1x32, e8m0 scales, unshuffled -- what aiter's fused_moe would
+        # compute from the received bf16 rows; it then only sorts the scales.
+        return MoriDispatchFormat(
+            dtype=dtypes.fp8,
+            quant_type=QuantType.per_1x32,
+            scale_dim=hidden_dim // 32,
+            scale_type_size=dtypes.fp8_e8m0.itemsize,
+        )
     if _FP4_DISPATCH:
         # fp4 blockwise is one scale per 32 elements, not per 128 as fp8 uses,
         # and get_hip_quant(per_1x32) emits e8m0 scales (1 byte), not fp32.
@@ -75,36 +436,133 @@ def resolve_mori_dispatch(
     )
 
 
+@lru_cache(maxsize=16)
+def _log_dispatch_format_once(desc: str) -> None:
+    logger.info(f"[MORI] dispatch wire format: {desc}")
+
+
+@lru_cache(maxsize=16)
+def check_mxfp8_dispatch_consumable(
+    quant_type: QuantType,
+    w1_dtype: torch.dtype,
+    activation: Any,
+    gate_mode: str,
+    hidden_pad: int,
+) -> None:
+    """Refuse an MXFP8 dispatch that aiter's fused_moe would not consume as-is.
+
+    fused_moe skips its own activation quant only on its a8w4/a8w8 branch
+    (fp8 input plus a1_scale: the scales are just sorted); on any other branch
+    the fp8 rows are read as data -- its bf16 path casts them and drops the
+    scales -- which is wrong numerics, not an error. The branch comes from
+    resolve_activation_dtype, per call from M unless AITER_BF16_FP8_MOE_BOUND=0
+    takes M out of it; asking with M=None returns fp8 only when every batch
+    size lands there. Cached, so the eager path pays a dict lookup per layer.
+    """
+    from aiter.fused_moe import resolve_activation_dtype
+
+    q_dtype_a = resolve_activation_dtype(
+        quant_type, w1_dtype, activation=activation, gate_mode=gate_mode, M=None
+    )
+    if (
+        QuantType(quant_type) != QuantType.per_1x32
+        or w1_dtype not in (dtypes.fp4x2, dtypes.fp8)
+        or q_dtype_a != dtypes.fp8
+        or hidden_pad
+    ):
+        raise RuntimeError(
+            "ATOM_MORI_FP8_DISPATCH=1 sends MXFP8 rows, but aiter fused_moe "
+            f"would not take them as-is here ({quant_type=}, {w1_dtype=}, "
+            f"{activation=}, {gate_mode=}, {hidden_pad=}, resolved activation "
+            f"dtype {q_dtype_a}). On gfx950 it needs ATOM_MOE_GU_ITLV=1 and "
+            "AITER_BF16_FP8_MOE_BOUND=0; otherwise unset ATOM_MORI_FP8_DISPATCH."
+        )
+
+
+def _mxfp8_quant(a1: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-1x32 fp8 with e8m0 scales, row-major and unshuffled.
+
+    The kernel aiter's fused_moe runs on the received rows for its split path
+    (more than 8*256/topk rows); below that it runs a fused quant+sort kernel
+    with the same e8m0 RoundUp scale. Given these scales, fused_moe only
+    sorts them into the GEMM layout (mxfp4_moe_sort_fwd).
+    """
+    if a1.shape[0] == 0:
+        # e8m0 scales are one byte each -- must match the scale_type_size
+        # handed to MoRI in moe.py.
+        return (
+            torch.empty(a1.shape, dtype=dtypes.fp8, device=a1.device),
+            torch.empty(
+                (0, a1.shape[-1] // 32), dtype=dtypes.fp8_e8m0, device=a1.device
+            ),
+        )
+    from aiter import get_hip_quant
+
+    return get_hip_quant(QuantType.per_1x32)(
+        a1, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+
+
 class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     """
     Prepare/Finalize using MoRI kernels.
     """
 
+    # "direct" / "copy" when the sync combine pulls (see
+    # resolve_zero_copy_combine); None pushes.
+    _zero_copy_combine: str | None = None
+
     def __init__(
         self,
-        mori_ops: list[Any],
+        mori_op: Any,
         max_tokens_per_rank: int,
         num_dispatchers: int,
         dispatch_format: MoriDispatchFormat,
-        *,
-        low_latency: bool,
-        internode: bool,
         quant_dtype: torch.dtype = None,
+        is_async: bool = False,
+        tbo_mori_ops: list | None = None,
+        low_latency: bool = False,
+        tbo_max_tokens_per_rank: int | None = None,
     ):
         if not MORI_AVAILABLE:
             raise ImportError(
                 "mori is required for MoriPrepareAndFinalize but not installed. "
                 "Please install mori to use this feature."
             )
-        if not mori_ops:
-            raise ValueError("mori_ops must contain at least one handle")
         super().__init__()
-        self._mori_ops = tuple(mori_ops)
+        self._sync_mori_op = mori_op
+        self._tbo_mori_ops = tbo_mori_ops  # per-ubatch ops for TBO (IntraNode)
+        # What the TBO ops were sized for; see tbo_max_tokens_per_rank.
+        self._tbo_max_tokens_per_rank = (
+            max_tokens_per_rank
+            if tbo_max_tokens_per_rank is None
+            else tbo_max_tokens_per_rank
+        )
         self.num_dispatchers_ = num_dispatchers
         self.max_tokens_per_rank = max_tokens_per_rank
         self.dispatch_format = dispatch_format
         self.quant_dtype = quant_dtype
-        self._use_split_send_recv = low_latency and not internode
+        self._is_async = is_async
+        self._low_latency = low_latency
+        # (phase, op, dtype, hidden_dim) -> step table or None; see
+        # _get_launch_config.
+        self._launch_tables: dict[tuple, Any] = {}
+        # See mask_pad_topk_ids. Plugin frontends own their own step shapes
+        # and never publish the pad-row mask, so they are left out.
+        self._mask_pad_rows = False
+        if _MASK_PAD_ROWS:
+            self._mask_pad_rows = not is_plugin_mode() and _drops_negative_ids(mori_op)
+            _log_pad_masking(self._mask_pad_rows)
+            if self._mask_pad_rows:
+                enable_pad_rows_device(
+                    max_tokens_per_rank,
+                    torch.device("cuda", torch.cuda.current_device()),
+                )
+        # Sync path only: the TBO ops are separate handles, left on push.
+        self._zero_copy_combine = resolve_zero_copy_combine(_ZERO_COPY_COMBINE, mori_op)
+        # (dtype, hidden_dim) -> view of the sync op's registered combine
+        # input buffer; see _registered_combine_input.
+        self._combine_inputs: dict[tuple, torch.Tensor] = {}
 
     # Derived from the resolved format so there is no second copy to keep in
     # sync with the staging config.
@@ -115,6 +573,10 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     @property
     def use_fp8_dispatch(self) -> bool:
         return self.dispatch_format.is_fp8
+
+    @property
+    def use_mxfp8_dispatch(self) -> bool:
+        return self.dispatch_format.is_mxfp8
 
     @property
     def quant_type(self):
@@ -137,40 +599,237 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         return torch.int32
 
     def supports_async(self) -> bool:
+        if not self._is_async:
+            return False
         from atom.utils.tbo.ubatching import tbo_active
 
-        return len(self._mori_ops) > 1 and tbo_active()
+        return tbo_active()
 
-    def _current_tbo_mori_op(self):
-        from atom.utils.tbo.ubatching import tbo_current_ubatch_id
+    def adapt_routing_for_fused_moe(
+        self,
+        dispatch_ids: torch.Tensor,
+        dispatch_weights: torch.Tensor,
+        num_experts: int,
+        expert_map: torch.Tensor | None,
+        num_valid_rows: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        # MoRI delivers only the real top-k columns, and AITER drops the last
+        # one from its tuned-kernel key under EP, so without the masked
+        # sentinel column a top-6 model looks up top-5 rows and misses every
+        # tuned kernel. Sits after the trim (see FusedMoEModularKernel.forward)
+        # so it costs the group's rows, not the receive arena's; the sentinel
+        # routes to expert_mask[num_experts] == 0, so moe_sorting drops it. The
+        # TBO receivers feed the same forward, so they get it too.
+        sentinel_expert_id = mk.aiter_ep_sentinel_expert_id(num_experts, expert_map)
+        if sentinel_expert_id is None:
+            return dispatch_ids, dispatch_weights, num_valid_rows
+        dispatch_ids, dispatch_weights = mk.append_aiter_ep_sentinel(
+            dispatch_ids, dispatch_weights, sentinel_expert_id
+        )
+        if num_valid_rows is None:
+            return dispatch_ids, dispatch_weights, None
+        # Rows past the receive count are a stale arena tail. Route them to the
+        # masked sentinel instead of handing fused_moe the device count: when
+        # AITER's tuned stage 2 is the atomic epilog (M in (256, 512] or
+        # >= 16384 for DSV4 EP8), a num_local_tokens below M makes that GEMM
+        # ~2.8x slower, while a fully masked tail costs nothing. One select.
+        rows = mk.row_index(dispatch_ids.shape[0], dispatch_ids.device)
+        dispatch_ids = torch.where(
+            rows < num_valid_rows, dispatch_ids, sentinel_expert_id
+        )
+        return dispatch_ids, dispatch_weights, None
 
-        return self._mori_ops[tbo_current_ubatch_id()]
+    def _tuned_launch_table(
+        self,
+        phase: str,
+        mori_op: Any,
+        dtype: torch.dtype,
+        hidden_dim: int,
+        pull: bool | None = None,
+    ):
+        key = (phase, id(mori_op), dtype, hidden_dim, pull)
+        if key in self._launch_tables:
+            return self._launch_tables[key]
+        config = mori_op.config
+        kernel_type = getattr(config.kernel_type, "name", str(config.kernel_type))
+        # MoRI tunes the pull combine separately; only the sync op pulls, and
+        # it decides per step (see _pull_combine).
+        zero_copy = not config.use_external_inp_buf or bool(pull)
+        table = None
+        # Only the IntraNode kernels' tables and co-residency limits are
+        # accounted for here; other kernel types keep the legacy grid.
+        if kernel_type == "IntraNode":
+            table = mori_tuned_launch_table(
+                phase,
+                config.world_size,
+                dtype,
+                hidden_dim,
+                config.num_experts_per_token,
+                **(
+                    {}
+                    if phase == "dispatch"
+                    else {
+                        "zero_copy": zero_copy,
+                        "quant_type": config.quant_type,
+                    }
+                ),
+            )
+        self._launch_tables[key] = table
+        log_key = (phase, kernel_type, dtype, hidden_dim, zero_copy)
+        if config.rank == 0 and log_key not in _LOGGED_LAUNCH_TABLES:
+            _LOGGED_LAUNCH_TABLES.add(log_key)
+            if table is None:
+                logger.info(
+                    f"[MORI] {phase} launch: no tuned table for {kernel_type} "
+                    f"{dtype} hidden={hidden_dim}; using the legacy grid"
+                )
+            else:
+                ceilings, geometries = table
+                steps = ", ".join(
+                    f"<={c}:{b}x{w}" for c, (b, w) in zip(ceilings, geometries)
+                )
+                transport = (
+                    "" if phase == "dispatch" else (" pull" if zero_copy else " push")
+                )
+                logger.info(
+                    f"[MORI] {phase}{transport} launch (tokens/rank:blocks x warps) "
+                    f"for {dtype} hidden={hidden_dim}: {steps}, "
+                    f">{ceilings[-1]}:{geometries[-1][0]}x{geometries[-1][1]}"
+                )
+        return table
 
-    def _get_dispatch_config(self, num_tokens: int | None = None) -> tuple[int, int]:
-        """Return (block_num, warp_per_block) based on runtime mode.
+    def _get_launch_config(
+        self,
+        phase: str,
+        mori_op: Any,
+        num_tokens: int,
+        dtype: torch.dtype,
+        hidden_dim: int,
+        pull: bool | None = None,
+    ) -> tuple[int, int]:
+        """Return (block_num, warp_per_block) for one dispatch or combine launch.
 
-        Default policy keys off the forward-context prefill/decode flag.
-        atom-vllm has no stable prefill/decode flag at this call site and
-        instead selects by a token-count threshold; it overrides this method
-        via a plugin patch, so keep this body frontend-agnostic.
+        Both kernels move what the whole group sends, not what this rank has:
+        a decoding rank's combine pushes back every row a prefilling peer
+        dispatched to it. So the tuned policy keys on the group's largest
+        per-rank count -- the shape mori's EP8 tables were measured at, every
+        rank sending the same count -- and falls back to this rank's own count
+        only where no DP reduction produced one. The count is a host value
+        fixed per captured graph, so the choice is graph safe. Dispatch and
+        combine are tuned separately; their best grids differ.
 
-        block_num is capped at the device CU count: mori's IntraNode
-        dispatch/combine use a hand-rolled grid-wide barrier
-        (CrossDeviceBarrierIntraNodeKernel) that spins until *all* gridDim.x
-        blocks have arrived, which requires every block to be co-resident. The
-        combine block (1024 threads + larger dynamic smem) gets ~1 block/CU
-        occupancy, so launching more blocks than CUs (e.g. 128 on the 80-CU
-        MI308X) leaves the surplus blocks unscheduled -> the barrier never
-        completes -> warmup deadlocks. Capping at multi_processor_count keeps
-        big-CU GPUs (MI300X/MI355X, >=128 CU) at 128 with no perf loss.
+        atom-vllm has no ATOM forward context at this call site and overrides
+        this method via a plugin patch, so keep the signature stable.
         """
-        mp = get_cu_num()
         context = get_forward_context().context
-        if context.is_prefill:
-            return min(128, mp), 16
-        return min(64, mp), 4
+        if _LAUNCH_POLICY != "legacy":
+            table = self._tuned_launch_table(phase, mori_op, dtype, hidden_dim, pull)
+            if table is not None:
+                group_tokens = self._group_tokens(num_tokens)
+                ceilings, geometries = table
+                return geometries[bisect.bisect_left(ceilings, group_tokens)]
+        # The legacy grid, as it actually launched: the warp count used to be
+        # passed positionally into rdma_block_num, so both kernels fell back to
+        # 16 warps (mori's IntraNode dispatch default and aiter's config).
+        # block_num is capped at the CU count for the same co-residency reason
+        # as the tuned table (e.g. 128 blocks on the 80-CU MI308X deadlocked
+        # warmup).
+        mp = get_cu_num()
+        if context is not None and context.is_prefill:
+            return min(128, mp), _MAX_WARP_PER_BLOCK
+        return min(64, mp), _MAX_WARP_PER_BLOCK
+
+    @staticmethod
+    def _group_tokens(num_tokens: int) -> int:
+        """The group's largest per-rank token count this pass, a host value
+        fixed per captured graph; this rank's own count where none was
+        reduced."""
+        context = get_forward_context().context
+        across_dp = None if context is None else context.running_tokens_across_dp
+        return max(across_dp) if across_dp else num_tokens
+
+    def _pull_combine(self, num_tokens: int) -> bool:
+        """Whether this step's sync combine pulls (zero-copy) or pushes.
+
+        Pull reads each token's expert rows from its peers, so a small step
+        pays a fabric round trip per read that push's posted writes do not;
+        push pays an extra copy that only matters once rows are many. So pull
+        only above ATOM_MORI_PULL_COMBINE_MIN_TOKENS per rank. Keyed on the
+        group's count, every rank takes the same side of the threshold.
+        """
+        if self._zero_copy_combine is None or self.supports_async():
+            return False
+        return self._group_tokens(num_tokens) > _PULL_COMBINE_MIN_TOKENS
+
+    def mask_pad_topk_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        """Route this rank's DP pad rows to expert -1.
+
+        A padded decode step runs `running_tokens` rows, of which only the
+        leading `scheduled_tokens` carry a request; the tail is there to match
+        the group's graph width. Its routing is real, so it pays dispatch, GEMM
+        and combine like any token, and being identical rows it piles onto the
+        same experts. IntraNode dispatch sends nothing for a negative id, and
+        combine sums nothing for a token sent nowhere, so a masked row costs
+        neither and comes back as zeros that are sliced off with the padding.
+
+        The pad-row mask is published on the device before every forward and
+        draft pass, so a capture records one select against it and each replay
+        follows its own step; an eager step checks the host count first and
+        skips the select when nothing is padded. Only rows that ARE the step's
+        `running_tokens` are touched: nothing else has a padded tail. TBO
+        ubatches are left alone, a ubatch's rows not being the step's prefix.
+        """
+        if not self._mask_pad_rows or self.supports_async():
+            return topk_ids
+        pad_rows = step_pad_rows(topk_ids.shape[0])
+        if pad_rows is None:
+            return topk_ids
+        return torch.where(pad_rows, -1, topk_ids)
 
     # ---- Synchronous (non-TBO) path ----
+
+    def _registered_combine_input(
+        self, dtype: torch.dtype, hidden_dim: int
+    ) -> torch.Tensor:
+        """The sync op's registered combine input buffer as [max_recv, hidden].
+
+        Row i is what the pull combine reads for dispatch-receive row i. A
+        cached view of a fixed symmetric allocation, so it is the same
+        pointer in every CUDA graph and costs no device work to fetch.
+        """
+        key = (dtype, hidden_dim)
+        buf = self._combine_inputs.get(key)
+        if buf is None:
+            config = self._sync_mori_op.config
+            if (
+                dtype.itemsize > config.max_token_type_size
+                or hidden_dim > config.hidden_dim
+            ):
+                raise RuntimeError(
+                    f"zero-copy combine: a {dtype} x {hidden_dim} expert output "
+                    "does not fit MoRI's combine input rows "
+                    f"({config.max_token_type_size} B x {config.hidden_dim}); "
+                    "unset ATOM_MORI_ZERO_COPY_COMBINE"
+                )
+            buf = self._sync_mori_op.get_registered_combine_input_buffer(
+                dtype, hidden_dim=hidden_dim
+            )
+            self._combine_inputs[key] = buf
+        return buf
+
+    def expert_output_buffer(
+        self, num_rows: int, hidden_dim: int, dtype: torch.dtype
+    ) -> torch.Tensor | None:
+        # "direct": fused_moe zeroes and accumulates the received rows' expert
+        # output in place in the buffer peers pull from, so the combine input
+        # costs neither a push nor a copy. Its rows are the dispatch-receive
+        # rows (the trim keeps a prefix; the sentinel adds a column, not a
+        # row). The buffer is only rewritten after this rank's next dispatch
+        # has completed, and that completion waits for every peer to reach
+        # the same dispatch -- i.e. to have finished pulling from it.
+        if self._zero_copy_combine != "direct" or not self._pull_combine(num_rows):
+            return None
+        return self._registered_combine_input(dtype, hidden_dim)[:num_rows]
 
     def prepare(
         self,
@@ -202,13 +861,17 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
             quant_func = get_hip_quant(self.quant_type or quant_type)
             a1, scale = quant_func(a1, quant_dtype=dtypes.fp4x2)
+        elif self.use_mxfp8_dispatch:
+            a1, scale = _mxfp8_quant(a1)
         elif self.use_fp8_dispatch:
             from aiter import get_hip_quant
 
             quant_func = get_hip_quant(quant_type)
             a1, scale = quant_func(a1, quant_dtype=dtypes.fp8)
 
-        block_num, warp_per_block = self._get_dispatch_config(a1.shape[0])
+        block_num, warp_per_block = self._get_launch_config(
+            "dispatch", self._sync_mori_op, a1.shape[0], a1.dtype, a1.shape[1]
+        )
 
         (
             dispatch_a1,
@@ -216,7 +879,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             dispatch_scale,
             dispatch_ids,
             dispatch_recv_token_num,
-        ) = self._mori_ops[0].dispatch(
+        ) = self._sync_mori_op.dispatch(
             a1,
             topk_weights,
             scale,
@@ -247,22 +910,47 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     ) -> torch.Tensor:
         num_token = topk_ids.shape[0]
 
-        block_num, warp_per_block = self._get_dispatch_config(num_token)
+        combine_kwargs = {}
+        pull = self._pull_combine(num_token)
+        if pull:
+            num_rows, hidden_dim = fused_expert_output.shape
+            combine_input = self._registered_combine_input(
+                fused_expert_output.dtype, hidden_dim
+            )
+            if fused_expert_output.data_ptr() != combine_input.data_ptr():
+                # Not written in place ("copy", or an expert path that took no
+                # output buffer): one local copy of the rows peers read. Plain
+                # stores into the symmetric buffer, as MoRI's own zero-copy
+                # tests stage it; the combine's entry barrier orders them
+                # before any peer reads.
+                combine_input[:num_rows].copy_(fused_expert_output)
+            fused_expert_output = combine_input[:num_rows]
+            combine_kwargs["use_external_inp_buf"] = 0
 
-        result = self._mori_ops[0].combine(
+        block_num, warp_per_block = self._get_launch_config(
+            "combine",
+            self._sync_mori_op,
+            num_token,
+            fused_expert_output.dtype,
+            fused_expert_output.shape[1],
+            pull=pull,
+        )
+
+        result = self._sync_mori_op.combine(
             fused_expert_output,
             None,
             topk_ids,
             block_num=block_num,
             warp_per_block=warp_per_block,
+            **combine_kwargs,
         )[0]
         return result[:num_token]
 
-    # 1. comm-stream (IntraNode / InterNodeV1 / InterNodeV1LL): dispatch() and
-    #    combine() on comm_stream. `_use_split_send_recv` is False for these;
-    #    mori only exposes the split send/recv API on AsyncLL.
-    # 2. AsyncLL (--low-latency, intra-node): dispatch_send/recv,
-    #    combine_send/recv (CU-free)
+    # 1. IntraNode (default TBO): dispatch()/combine() on comm_stream
+    # 2. AsyncLL (--low-latency): dispatch_send/recv, combine_send/recv (CU-free)
+    # Both keep the push combine whatever ATOM_MORI_ZERO_COPY_COMBINE says: the
+    # per-ubatch ops own their buffers, and expert_output_buffer never hands
+    # fused_moe the sync op's buffer while a ubatch is running.
     def prepare_async(
         self,
         a1: torch.Tensor,
@@ -275,6 +963,15 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         assert (
             not apply_router_weight_on_input
         ), "mori does not support apply_router_weight_on_input=True now."
+        # MoRI does not bound-check its input against the op's capacity, so an
+        # oversized ubatch would write past the symmetric buffers. Host shape,
+        # eager prefill: no sync.
+        if a1.shape[0] > self._tbo_max_tokens_per_rank:
+            raise RuntimeError(
+                f"TBO ubatch has {a1.shape[0]} tokens but its MoRI op holds "
+                f"{self._tbo_max_tokens_per_rank} per rank; unset "
+                "ATOM_MORI_TBO_HALF_BUFFERS"
+            )
 
         scale = None
         if self.use_fp4_dispatch:
@@ -294,6 +991,8 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                     dtype=torch.float8_e8m0fnu,
                     device=a1.device,
                 )
+        elif self.use_mxfp8_dispatch:
+            a1, scale = _mxfp8_quant(a1)
         elif self.use_fp8_dispatch:
             from aiter import get_hip_quant
 
@@ -310,7 +1009,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                     device=a1.device,
                 )
 
-        if self._use_split_send_recv:
+        if self._low_latency:
             return self._prepare_async_ll(a1, topk_weights, topk_ids, scale)
         return self._prepare_async_comm_stream(a1, topk_weights, topk_ids, scale)
 
@@ -322,7 +1021,10 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         scale: torch.Tensor | None,
     ) -> tuple[Callable, mk.ReceiverType]:
         """AsyncLL path: dispatch_send (CU-free) → yield → dispatch_recv."""
-        mori_op = self._current_tbo_mori_op()
+        from atom.utils.tbo.ubatching import tbo_current_ubatch_id
+
+        ubatch_id = tbo_current_ubatch_id()
+        mori_op = self._tbo_mori_ops[ubatch_id]
 
         (
             dispatch_a1,
@@ -358,12 +1060,17 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         scale: torch.Tensor | None,
     ) -> mk.ReceiverType:
         from atom.utils.tbo.ubatching import (
+            tbo_current_ubatch_id,
             tbo_switch_to_compute_sync,
             tbo_yield_and_switch_from_compute_to_comm,
         )
 
-        block_num, warp_per_block = self._get_dispatch_config(a1.shape[0])
-        mori_op = self._current_tbo_mori_op()
+        ubatch_id = tbo_current_ubatch_id()
+        mori_op = self._tbo_mori_ops[ubatch_id]
+
+        block_num, warp_per_block = self._get_launch_config(
+            "dispatch", mori_op, a1.shape[0], a1.dtype, a1.shape[1]
+        )
 
         tbo_yield_and_switch_from_compute_to_comm()
 
@@ -408,7 +1115,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         apply_router_weight_on_input: bool,
     ) -> Callable:
         num_token = topk_ids.shape[0]
-        if self._use_split_send_recv:
+        if self._low_latency:
             return self._finalize_async_ll(num_token, fused_expert_output, topk_ids)
         return self._finalize_async_comm_stream(
             num_token,
@@ -423,7 +1130,10 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         topk_ids: torch.Tensor,
     ) -> tuple[Callable, Callable]:
         """AsyncLL path: combine_send (CU-free) → yield → combine_recv."""
-        mori_op = self._current_tbo_mori_op()
+        from atom.utils.tbo.ubatching import tbo_current_ubatch_id
+
+        ubatch_id = tbo_current_ubatch_id()
+        mori_op = self._tbo_mori_ops[ubatch_id]
 
         combined_hidden_states = mori_op.combine_send(
             fused_expert_output, None, topk_ids
@@ -444,12 +1154,21 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         topk_ids: torch.Tensor,
     ) -> Callable:
         from atom.utils.tbo.ubatching import (
+            tbo_current_ubatch_id,
             tbo_switch_to_compute_sync,
             tbo_yield_and_switch_from_compute_to_comm,
         )
 
-        block_num, warp_per_block = self._get_dispatch_config(num_token)
-        mori_op = self._current_tbo_mori_op()
+        ubatch_id = tbo_current_ubatch_id()
+        mori_op = self._tbo_mori_ops[ubatch_id]
+
+        block_num, warp_per_block = self._get_launch_config(
+            "combine",
+            mori_op,
+            num_token,
+            fused_expert_output.dtype,
+            fused_expert_output.shape[1],
+        )
 
         # Yield to other thread FIRST, then switch to comm stream.
         tbo_yield_and_switch_from_compute_to_comm()
