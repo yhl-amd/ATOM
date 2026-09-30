@@ -265,6 +265,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MEGA_DECODE_FAST_PATH": lambda: (
         os.getenv("ATOM_MEGA_DECODE_FAST_PATH", "1") == "1"
     ),
+    # Capacity of that small instance: 128 (aiter's fixed-slot limit) or 256, which
+    # needs an aiter with AITER_MEGA_FIXED_SLOT_MAX_MTPR=511 to stay fixed-slot.
+    "ATOM_MEGA_DECODE_MTPR": lambda: int(os.getenv("ATOM_MEGA_DECODE_MTPR", "128")),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # Match SGLang's gfx950 pure-prefill fast path: cast Q/K/V to FP8 and use
     # AITER's head-dim-256 per-tensor FMHA kernel. Set to 0 for the BF16
@@ -539,6 +542,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_PROFILER_TIMEOUT": lambda: float(os.getenv("ATOM_PROFILER_TIMEOUT", "300")),
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
+    # Log a per-engine summary of forward wall time per step kind every N
+    # seconds (0 = off). Host-side timing of the synchronous forward call.
+    "ATOM_STEP_TIMING_LOG_S": lambda: float(os.getenv("ATOM_STEP_TIMING_LOG_S", "0")),
     # RTL (rocm-trace-lite) GPU kernel tracing — set to output directory to enable.
     # When set, the server launch is wrapped with `rtl trace` to collect per-kernel
     # GPU timestamps for both prefill and decode phases.
@@ -626,6 +632,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_V4_PREFILL_ASM_FOR_DECODE": lambda: (
         os.getenv("ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", "0") == "1"
     ),
+    # DeepSeek-V4 HCA (compress_ratio 128) fp8 decode through aiter's
+    # persistent V4-NM kernel (one launch, in-kernel split + merge) instead of
+    # the decode ASM + split plan. gfx950, 128 local heads only; quietly off
+    # when aiter lacks mla_decode_fwd_v4_nm_ps.
+    "ATOM_V4_HCA_PERSIST": lambda: os.getenv("ATOM_V4_HCA_PERSIST", "1") == "1",
+    # Calls with fewer q rows stay on the ASM path, which is faster there.
+    "ATOM_V4_HCA_PERSIST_MIN_ROWS": lambda: int(
+        os.getenv("ATOM_V4_HCA_PERSIST_MIN_ROWS", "15")
+    ),
     # Route the paged decode to aiter's FlyDSL kernel (#4332) instead of gluon.
     "ATOM_PA_FLYDSL": lambda: (os.getenv("ATOM_PA_FLYDSL", "0") == "1"),
     # FlyDSL GPU work planner, built once per forward in the metadata
@@ -696,9 +711,41 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",
     # --- MoE all2all (MoRI) wire format ---
     "ATOM_MORI_FP4_DISPATCH": lambda: (os.getenv("ATOM_MORI_FP4_DISPATCH", "0") == "1"),
+    # MXFP8 (fp8 e4m3 + e8m0 scale per 1x32) before dispatch: the same quant
+    # aiter's a8w4 fused_moe would run on the received rows, done on the sender.
+    "ATOM_MORI_FP8_DISPATCH": lambda: (os.getenv("ATOM_MORI_FP8_DISPATCH", "0") == "1"),
     # Combine-side codec. "none" (the MoRI default) sends bf16 back;
     # "fp8_blockwise" selects EpCombineIntraNodeKernel_*_fp8bwq_*.
     "ATOM_MORI_COMBINE_QUANT": lambda: os.getenv("ATOM_MORI_COMBINE_QUANT", "none"),
+    # IntraNode dispatch/combine launch geometry. "tuned" (default) looks each
+    # phase up in mori's shipped per-arch tuning tables, keyed by the group's
+    # largest per-rank token count; "legacy" restores the old grid (128 blocks
+    # on a prefilling rank, 64 otherwise, 16 warps per block for both phases).
+    "ATOM_MORI_LAUNCH_POLICY": lambda: os.getenv("ATOM_MORI_LAUNCH_POLICY", "tuned"),
+    # Route DP pad rows (past this rank's scheduled tokens) to expert -1, which
+    # the IntraNode dispatch drops, so padding costs no transport or GEMM.
+    "ATOM_MORI_MASK_PAD_ROWS": lambda: os.getenv("ATOM_MORI_MASK_PAD_ROWS", "0") == "1",
+    # IntraNode combine in zero-copy (pull) mode: peers read this rank's expert
+    # output straight from its registered combine input buffer instead of it
+    # being pushed into their staging. "0" (default) keeps the push combine;
+    # "1" has aiter fused_moe write its output into that buffer; "copy" keeps
+    # fused_moe's own output buffer and copies it in before the combine.
+    "ATOM_MORI_ZERO_COPY_COMBINE": lambda: os.getenv(
+        "ATOM_MORI_ZERO_COPY_COMBINE", "0"
+    ),
+    # With ATOM_MORI_ZERO_COPY_COMBINE, pull only when the group's largest
+    # per-rank token count exceeds this; smaller steps push (lower latency).
+    "ATOM_MORI_PULL_COMBINE_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_MORI_PULL_COMBINE_MIN_TOKENS", "0")
+    ),
+    # Size the two TBO ubatch MoRI ops for half the per-rank token budget. A
+    # token-midpoint prefill split never hands a ubatch more than
+    # ceil(max_num_batched_tokens / 2) rows, so each op needs half the ~4 GB of
+    # symmetric heap. Ignored (full size kept) for any split that can be uneven:
+    # decode TBO, PCP, or ATOM_TBO_PREFILL_TOKEN_SPLIT=0.
+    "ATOM_MORI_TBO_HALF_BUFFERS": lambda: (
+        os.getenv("ATOM_MORI_TBO_HALF_BUFFERS", "0") == "1"
+    ),
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"

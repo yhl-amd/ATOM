@@ -104,6 +104,7 @@ from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
 from atom.model_ops.triton_hash_topk import hash_topk_triton
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter, shuffle_weights
+from atom.model_ops.v4_kernels import hca_persist
 from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
@@ -2631,6 +2632,14 @@ class DeepseekV4Attention(nn.Module):
         # traces unchanged. The rope planes (swa_plane_rope / unified_kv_rope) are
         # bound onto the module by DeepseekV4AttentionMetadataBuilder.
         self.kv_fp8 = atom_config.kv_cache_dtype == "fp8"
+        # Persistent HCA decode workspace: allocate at model load (before KV
+        # sizing and graph capture) on every serving path, native or plugin.
+        if self.compress_ratio == hca_persist.HCA_RATIO:
+            hca_persist.prepare_if_usable(
+                kv_fp8=str(atom_config.kv_cache_dtype).startswith("fp8"),
+                heads=self.n_local_heads,
+                gfx=arch,
+            )
 
     def process_weights_after_loading(self) -> None:
         """Prepare wo_a (FP8 + e8m0 block scale) for the grouped output LoRA.
@@ -3313,12 +3322,15 @@ class DeepseekV4Attention(nn.Module):
             if ratio == 0:
                 kv_indices = attn_md.kv_indices_swa
                 kv_indptr = attn_md.kv_indptr_swa
+                split_plan = attn_md.split_plan_swa
             elif ratio == 4:
                 kv_indices = attn_md.kv_indices_csa
                 kv_indptr = attn_md.kv_indptr_csa
+                split_plan = attn_md.split_plan_csa
             else:  # ratio == 128
                 kv_indices = attn_md.kv_indices_hca
                 kv_indptr = attn_md.kv_indptr_hca
+                split_plan = attn_md.split_plan_hca
             # Dispatch on kv-cache layout inside the wrapper: fp8 2buff
             # (unified_kv_rope set) → aiter ASM with pre-packed fp8 Q + the
             # 2buff fp8/bf16 pools read with no requant. The optional H=128
@@ -3336,6 +3348,8 @@ class DeepseekV4Attention(nn.Module):
                 qo_indptr=attn_md.qo_indptr,
                 empty_kv_indptr=attn_md.empty_kv_indptr,
                 prefix=f"{self.layer_name}.sparse_attn_decode",
+                split_plan=split_plan,
+                compress_ratio=ratio,
             )  # [S, H, head_dim]
         else:
             # Two-source paged prefill: prefix from `unified_kv` (per-ratio
