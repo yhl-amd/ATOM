@@ -183,9 +183,11 @@ class _MPLookupClient:
 
         self._orphans.discard(lookup_id)
         answered = self._answered_at.pop(lookup_id, None)
+        max_age = envs.OFFLOAD_LOOKUP_MAX_AGE_S
         if (
             answered is not None
-            and time.monotonic() - answered > envs.OFFLOAD_LOOKUP_MAX_AGE_S
+            and max_age > 0
+            and time.monotonic() - answered > max_age
         ):
             # The server's read locks expire (l1 read TTL); a stale answer can
             # name chunks that were evicted since, and the retrieve then fails

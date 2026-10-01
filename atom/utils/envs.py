@@ -966,10 +966,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "OFFLOAD_ASYNC_LOOKUP_DEPTH": lambda: _nonnegative_int_env(
         "OFFLOAD_ASYNC_LOOKUP_DEPTH", 16
     ),
-    # An async lookup answer older than this is re-asked at admission: its
-    # server-side read locks may have expired and its chunks been evicted.
+    # An async lookup answer older than this is re-asked (synchronously) at
+    # admission: its server-side read locks may have expired and its chunks
+    # been evicted. 0 disables; prefer raising the server's
+    # --l1-read-ttl-seconds above the admission wait instead.
     "OFFLOAD_LOOKUP_MAX_AGE_S": lambda: _finite_float_env(
-        "OFFLOAD_LOOKUP_MAX_AGE_S", 60.0, allow_zero=True
+        "OFFLOAD_LOOKUP_MAX_AGE_S", 0.0, allow_zero=True
     ),
     # How long admission may pass over a request whose async lookup has not
     # answered before it waits for the answer instead.

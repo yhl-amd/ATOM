@@ -236,3 +236,19 @@ def test_fresh_answer_is_consumed_without_asking_again(monkeypatch):
     clock[0] += 30
     assert client.lookup(list(range(8)), "req") == 2 * CHUNK
     assert adapter.freed == []
+
+
+def test_stale_answer_is_consumed_when_max_age_is_disabled(monkeypatch):
+    monkeypatch.setattr(transfer.time, "sleep", lambda _s: None)
+    monkeypatch.delenv("OFFLOAD_LOOKUP_MAX_AGE_S", raising=False)
+    clock = [1000.0]
+    monkeypatch.setattr(mp_lookup.time, "monotonic", lambda: clock[0])
+    fake = _Client(chunks=2)
+    adapter = _Adapter(fake)
+    client = _client(adapter)
+    client.submit(list(range(8)), "req")
+    client.pump()
+
+    clock[0] += 3600
+    assert client.lookup(list(range(8)), "req") == 2 * CHUNK
+    assert adapter.freed == []
