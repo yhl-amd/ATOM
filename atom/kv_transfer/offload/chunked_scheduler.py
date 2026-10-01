@@ -331,6 +331,14 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return False
         if count:
             self._perf_bump("lookup_skipped_hbm_covered")
+            # The resumable HBM prefix was computed by an earlier request on
+            # this rank, which stored it then. Start this request's save where
+            # HBM ends, as a lookup hit would have: with no floor the save
+            # re-sends the whole prompt every turn.
+            sid = str(seq.id)
+            floor = self._chunk_floor(hbm)
+            if floor > int(self._hit_save_floors.get(sid, 0)):
+                self._hit_save_floors[sid] = floor
         return True
 
     def _fresh_tier_lookup(self, seq, sid: str) -> int | None:
