@@ -193,3 +193,46 @@ def test_poll_answers_without_blocking():
     assert client.poll("req")
     assert not client.is_pending("req")
     assert client.poll("never-submitted")
+
+
+def test_stale_answer_is_released_and_asked_again(monkeypatch):
+    monkeypatch.setattr(transfer.time, "sleep", lambda _s: None)
+    monkeypatch.setenv("OFFLOAD_LOOKUP_MAX_AGE_S", "60")
+    clock = [1000.0]
+    monkeypatch.setattr(mp_lookup.time, "monotonic", lambda: clock[0])
+    fake = _Client(chunks=2)
+    adapter = _Adapter(fake)
+    resubmitted = []
+
+    def resubmit(request_id, token_ids):
+        if request_id in adapter._pending_lookups:
+            return
+        resubmitted.append(request_id)
+        adapter._pending_lookups.add(request_id)
+        adapter._lookup_results[request_id] = CHUNK
+
+    adapter.maybe_submit_lookup_request = resubmit
+    client = _client(adapter)
+    client.submit(list(range(8)), "req")
+    client.pump()
+
+    clock[0] += 61
+    assert client.lookup(list(range(8)), "req") == CHUNK
+    assert [(c["start"], c["end"]) for c in adapter.freed] == [(0, 2 * CHUNK)]
+    assert resubmitted == [_rid(client, "req")]
+
+
+def test_fresh_answer_is_consumed_without_asking_again(monkeypatch):
+    monkeypatch.setattr(transfer.time, "sleep", lambda _s: None)
+    monkeypatch.setenv("OFFLOAD_LOOKUP_MAX_AGE_S", "60")
+    clock = [1000.0]
+    monkeypatch.setattr(mp_lookup.time, "monotonic", lambda: clock[0])
+    fake = _Client(chunks=2)
+    adapter = _Adapter(fake)
+    client = _client(adapter)
+    client.submit(list(range(8)), "req")
+    client.pump()
+
+    clock[0] += 30
+    assert client.lookup(list(range(8)), "req") == 2 * CHUNK
+    assert adapter.freed == []
