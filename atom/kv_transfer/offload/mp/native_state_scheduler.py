@@ -181,6 +181,15 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             else 0
         )
         floor = self._save_floor(exhausted)
+        ascending = envs.OFFLOAD_SAVE_ALL_CHECKPOINTS
+        if ascending:
+            # Store every READY checkpoint, lowest first, instead of only the
+            # highest: a later request that shares a shorter prefix (a sibling
+            # subagent's system prompt) can restore only where a state image
+            # exists, and the rungs the frontier jumps over are those images.
+            entry = self._save_tracker.get(str(seq.id))
+            if entry is not None and entry[0] is seq:
+                floor = max(floor, int(entry[1]))
         # Every tracked request asks every step. The answer changes only when
         # its frontier moves or one of ITS boundary checkpoints is published or
         # dropped, so rescan only then -- not whenever any request's
@@ -205,7 +214,12 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         boundaries = getattr(seq, "_mp_boundary_by_hash", None)
         if boundaries is None:
             boundaries = seq._mp_boundary_by_hash = {}
-        for boundary in range(frontier, floor, -self.chunk_size):
+        if ascending:
+            start = (floor // self.chunk_size + 1) * self.chunk_size
+            scan = range(start, frontier + 1, self.chunk_size)
+        else:
+            scan = range(frontier, floor, -self.chunk_size)
+        for boundary in scan:
             prefix_hash = self._boundary_hash(seq, boundary)
             boundaries[prefix_hash] = boundary
             if self._checkpoints.contains(prefix_hash):

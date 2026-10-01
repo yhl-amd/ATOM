@@ -966,6 +966,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Send external-tier lookups for the head of the waiting queue ahead of
     # admission, so the scheduler reads an answer instead of waiting for one.
     "OFFLOAD_ASYNC_LOOKUP": lambda: _flag_env("OFFLOAD_ASYNC_LOOKUP"),
+    # Native MP: store every READY state checkpoint between the saved floor and
+    # the frontier, lowest first, rather than only the highest one.
+    "OFFLOAD_SAVE_ALL_CHECKPOINTS": lambda: _flag_env("OFFLOAD_SAVE_ALL_CHECKPOINTS"),
     "OFFLOAD_ASYNC_LOOKUP_DEPTH": lambda: _nonnegative_int_env(
         "OFFLOAD_ASYNC_LOOKUP_DEPTH", 16
     ),

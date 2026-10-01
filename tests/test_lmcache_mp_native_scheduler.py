@@ -232,6 +232,18 @@ def test_save_frontier_selects_existing_checkpoint_below_computed_tokens(monkeyp
     assert scheduler._save_tracker["1"][1] == 8
 
 
+def test_save_all_checkpoints_stores_lowest_ready_rung_first(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_SAVE_ALL_CHECKPOINTS", "1")
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence(computed=24)
+    checkpoint(scheduler, checkpoints, seq, 8)
+    checkpoint(scheduler, checkpoints, seq, 16)
+    scheduler.update_state_after_alloc(seq)
+    [request] = scheduler.build_connector_meta().requests
+    assert request.native_state.boundary_tokens == 8
+    assert scheduler._save_tracker["1"][1] == 8
+
+
 def test_save_frontier_skips_checkpoints_shorter_than_min_save_tokens(monkeypatch):
     scheduler, checkpoints, _ = make_scheduler(monkeypatch, min_save_tokens=16)
     seq = sequence(computed=24)
