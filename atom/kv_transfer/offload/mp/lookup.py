@@ -86,6 +86,21 @@ class _MPLookupClient:
         self._async_tokens[lookup_id] = token_ids
         return True
 
+    def is_pending(self, lookup_id: str) -> bool:
+        """Submitted and not answered yet."""
+        return lookup_id in self._async
+
+    def poll(self, lookup_id: str) -> bool:
+        """Advance one async lookup without blocking. True once it answered."""
+        if lookup_id not in self._async:
+            return True
+        try:
+            return self._advance(lookup_id)
+        except Exception:
+            # Let the synchronous path ask again and surface the error there.
+            self._async.pop(lookup_id, None)
+            return True
+
     def pending_ids(self):
         """Lookups already submitted and not yet consumed (do not mutate)."""
         return self._async_tokens.keys()

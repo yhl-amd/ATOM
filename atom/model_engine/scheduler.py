@@ -1690,6 +1690,14 @@ class Scheduler:
                 continue
 
             offload_resume = self._is_offload_prefill_resume(seq)
+            if (
+                not remote_ready_for_decode
+                and not offload_resume
+                and self.kv_connector is not None
+                and self._offload_lookup_pending(seq)
+            ):
+                prefix_waiters.append(seq)
+                continue
             needs_remote_load = self._query_connector_prefill_match(
                 seq,
                 skip=remote_ready_for_decode or offload_resume,
@@ -2415,6 +2423,11 @@ class Scheduler:
             )
             and len(seq.block_table) > 0
         )
+
+    def _offload_lookup_pending(self, seq: Sequence) -> bool:
+        """Whether the connector's lookup for `seq` is still in flight."""
+        pending = getattr(self.kv_connector, "lookup_pending", None)
+        return bool(pending(seq)) if pending is not None else False
 
     def _query_connector_prefill_match(self, seq: Sequence, *, skip: bool) -> bool:
         """Ask the connector whether this prefill should park for remote KV."""

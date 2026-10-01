@@ -158,6 +158,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._lookup_results: dict[str, tuple[object, int]] = {}
         self._handoff_loads: set[str] = set()
         self._block_manager = None
+        self._lookup_defer_since: dict[str, float] = {}
         # Unaligned handoff is always on: when the HBM prefix-cache hit is not
         # chunk-aligned, recompute the misaligned head up to the next chunk
         # boundary, then load the aligned remainder from CPU. (Previously gated
@@ -280,6 +281,30 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if submit(self._lookup_token_ids(seq), sid):
                 self._perf_bump("lookup_prefetched")
         self._perf_bump("prefetch_us", int((time.perf_counter() - t0) * 1e6))
+
+    def lookup_pending(self, seq) -> bool:
+        """True while admission should pass over `seq`: its lookup is in flight.
+
+        Waiting a step or two for an answer that may carry tens of thousands of
+        prompt tokens is cheaper than either blocking the scheduler thread on
+        it (every DP rank waits in lockstep) or admitting the request without
+        it (a recompute). Bounded by `OFFLOAD_LOOKUP_DEFER_S`, after which the
+        ordinary synchronous lookup waits for the answer.
+        """
+        client = self._lookup_client
+        if not envs.OFFLOAD_ASYNC_LOOKUP or getattr(client, "is_pending", None) is None:
+            return False
+        sid = str(seq.id)
+        if not client.is_pending(sid) or client.poll(sid):
+            self._lookup_defer_since.pop(sid, None)
+            return False
+        now = time.monotonic()
+        first = self._lookup_defer_since.setdefault(sid, now)
+        if now - first > envs.OFFLOAD_LOOKUP_DEFER_S:
+            self._perf_bump("lookup_defer_expired")
+            return False
+        self._perf_bump("lookup_deferred")
+        return True
 
     def _lookup_covered_by_hbm(self, seq, lookup_len: int, count: bool = True) -> bool:
         """Whether HBM already holds all but less than one minimum load.
@@ -1310,6 +1335,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._load_lifecycles.pop(sid, None)
         self._release_failed_load_attempt(sid, seq)
         self._forget_tier_hit(sid)
+        self._lookup_defer_since.pop(sid, None)
         discard = getattr(self._lookup_client, "discard", None)
         if discard is not None:
             try:

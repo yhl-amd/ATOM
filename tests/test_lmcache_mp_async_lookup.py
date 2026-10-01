@@ -179,3 +179,17 @@ def test_short_prompt_is_not_submitted():
     client = _client(_Adapter(fake))
     assert not client.submit(list(range(CHUNK - 1)), "req")
     assert fake.lookups == []
+
+
+def test_poll_answers_without_blocking():
+    fake = _Client(chunks=2, lookup_done=False)
+    adapter = _Adapter(fake)
+    client = _client(adapter)
+    client.submit(list(range(8)), "req")
+
+    assert client.is_pending("req")
+    assert not client.poll("req")
+    fake.lookup_future.done = True
+    assert client.poll("req")
+    assert not client.is_pending("req")
+    assert client.poll("never-submitted")

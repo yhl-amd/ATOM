@@ -355,6 +355,14 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if callable(bind):
                 bind(block_manager)
 
+    def lookup_pending(self, seq: Any) -> bool:
+        """True while any sub's external-tier lookup for `seq` is in flight."""
+        for connector in self._connectors:
+            pending = getattr(connector, "lookup_pending", None)
+            if callable(pending) and pending(seq):
+                return True
+        return False
+
     def prefetch_lookups(self, seqs: Any) -> None:
         """Let each sub send its external-tier lookups ahead of admission."""
         seqs = list(seqs)
