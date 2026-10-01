@@ -232,6 +232,20 @@ def test_save_frontier_selects_existing_checkpoint_below_computed_tokens(monkeyp
     assert scheduler._save_tracker["1"][1] == 8
 
 
+def test_lookup_skipped_for_hbm_hit_starts_the_save_where_hbm_ends(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_SKIP_COVERED_LOOKUP", "1")
+    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "8")
+    scheduler, _, adapter = make_scheduler(monkeypatch)
+    seq = sequence(count=24, computed=0)
+    monkeypatch.setattr(
+        scheduler._block_manager, "probe_hbm_hit_tokens", lambda _seq: 16, raising=False
+    )
+    assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
+    assert adapter.queries == []
+    scheduler.update_state_after_alloc(seq)
+    assert scheduler._save_tracker["1"][1] == 16
+
+
 def test_save_frontier_skips_checkpoints_shorter_than_min_save_tokens(monkeypatch):
     scheduler, checkpoints, _ = make_scheduler(monkeypatch, min_save_tokens=16)
     seq = sequence(computed=24)

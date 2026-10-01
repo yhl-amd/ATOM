@@ -343,6 +343,24 @@ class TestPrefixCaching:
         block_manager_prefix.allocate(s2, n)
         assert s2.num_cached_tokens == 4
 
+    def test_probe_hbm_hit_matches_can_allocate(
+        self, block_manager_prefix, seq_factory
+    ):
+        bm = block_manager_prefix
+        s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+        bm.allocate(s1)
+        bm.hash_blocks(s1, s1.num_tokens - s1.num_cached_tokens)
+        bm.deallocate(s1)
+
+        for tokens in (
+            [1, 2, 3, 4, 5, 6, 7, 8, 30, 31, 32, 33, 34],
+            [1, 2, 3, 4, 9, 10, 11, 12],
+            [9, 10, 11, 12, 13, 14, 15, 16],
+        ):
+            s2 = seq_factory(tokens)
+            hit_blocks = bm.can_allocate(s2, record=False)
+            assert bm.probe_hbm_hit_tokens(s2) == hit_blocks * bm.hash_block_size
+
     def test_prefix_cache_miss_different_tokens(
         self, block_manager_prefix, seq_factory
     ):
