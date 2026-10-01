@@ -1003,13 +1003,15 @@ class BlockManager:
         return num_cached_blocks
 
     def probe_hbm_hit_tokens(self, seq: Sequence) -> int:
-        """Resumable HBM prefix hit in tokens, with no side effects.
+        """Resumable HBM prefix hit in tokens, cheaply and with no side effects.
 
-        The read-only half of `can_allocate`: the same chained match and
-        `_gated_hit`, reusing the admission probe's cached hashes, but no
-        checkpoint demand, no joint boundary and no fit check. An offload
-        connector uses it to skip an external-tier lookup whose answer could not
-        produce a load.
+        For a caller that only needs an estimate -- an offload connector
+        deciding whether an external-tier lookup could produce a load. It
+        reuses the admission probe's cached hash chain, finds the contiguous
+        hit by bisection (a prefix cache evicts leaves first, so presence is
+        prefix-closed in practice) and trusts the hash without comparing
+        tokens, then applies the same state gates as `can_allocate`. No
+        checkpoint demand, no joint boundary, no fit check.
         """
         if not self.enable_prefix_caching:
             return 0
@@ -1019,20 +1021,25 @@ class BlockManager:
             cached_hashes = []
         self._prefill_probe_hashes[seq] = (h, cached_hashes)
         immutable_blocks = seq.num_prompt_tokens // self.hash_block_size
-        block_hashes: list[int] = []
-        for i in range(self._n_hash_blocks(seq) - 1):
-            token_ids = self._hash_block_tokens(seq, i)
-            if i < len(cached_hashes):
-                h = cached_hashes[i]
+        n = min(self._n_hash_blocks(seq) - 1, immutable_blocks)
+        if n <= 0:
+            return 0
+        if len(cached_hashes) < n:
+            h = cached_hashes[-1] if cached_hashes else seq.cache_seed
+            for i in range(len(cached_hashes), n):
+                h = self.compute_hash(self._hash_block_tokens(seq, i), h)
+                cached_hashes.append(h)
+        lookup = self.kv.lookup
+        lo, hi = 0, n
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if lookup(cached_hashes[mid - 1]) != -1:
+                lo = mid
             else:
-                h = self.compute_hash(token_ids, h)
-                if i < immutable_blocks:
-                    cached_hashes.append(h)
-            block_id = self.kv.lookup(h)
-            if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
-                break
-            block_hashes.append(h)
-        return self._gated_hit(seq, len(block_hashes), block_hashes) * self.hash_block_size
+                hi = mid - 1
+        if lo == 0:
+            return 0
+        return self._gated_hit(seq, lo, cached_hashes[:lo]) * self.hash_block_size
 
     def record_allocation(
         self, seq: Sequence, num_cached_blocks: int, block_hashes: list[int]

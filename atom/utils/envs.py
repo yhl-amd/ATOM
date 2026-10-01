@@ -963,6 +963,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Skip the external-tier lookup when the resumable HBM prefix already leaves
     # less than OFFLOAD_MIN_LOAD_TOKENS for the tier to supply.
     "OFFLOAD_SKIP_COVERED_LOOKUP": lambda: _flag_env("OFFLOAD_SKIP_COVERED_LOOKUP"),
+    # Scheduler steps an HBM probe answer is reused for before it is redone.
+    "OFFLOAD_PROBE_REFRESH_STEPS": lambda: _nonnegative_int_env(
+        "OFFLOAD_PROBE_REFRESH_STEPS", 16
+    ),
     # Send external-tier lookups for the head of the waiting queue ahead of
     # admission, so the scheduler reads an answer instead of waiting for one.
     "OFFLOAD_ASYNC_LOOKUP": lambda: _flag_env("OFFLOAD_ASYNC_LOOKUP"),

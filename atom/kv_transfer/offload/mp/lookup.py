@@ -83,8 +83,12 @@ class _MPLookupClient:
         )
         future = adapter._client.lookup(key, adapter._parallel.tp_size)
         self._async[lookup_id] = [request_id, len(token_ids), "lookup", future]
-        self._async_tokens[lookup_id] = list(token_ids)
+        self._async_tokens[lookup_id] = token_ids
         return True
+
+    def pending_ids(self):
+        """Lookups already submitted and not yet consumed (do not mutate)."""
+        return self._async_tokens.keys()
 
     def _advance(self, lookup_id: str) -> bool:
         """One non-blocking step of an async lookup. True once answered."""
