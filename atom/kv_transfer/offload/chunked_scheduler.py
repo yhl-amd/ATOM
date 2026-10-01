@@ -230,7 +230,43 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return 0, False
         return self._answer_from_tier_hit(seq, sid, hit)
 
-    def _lookup_covered_by_hbm(self, seq, lookup_len: int) -> bool:
+    def prefetch_lookups(self, seqs) -> None:
+        """Send lookups for waiting requests before they reach admission.
+
+        Called once per scheduling pass with the head of the waiting queue.
+        The answer is consumed by the ordinary `_fresh_tier_lookup` when the
+        request is admitted, so only the round trip moves off the admission
+        path; the hit, its pin and the memo are exactly what a synchronous
+        lookup would have produced.
+        """
+        client = self._lookup_client
+        submit = getattr(client, "submit", None)
+        if submit is None or not envs.OFFLOAD_ASYNC_LOOKUP or not self._do_load:
+            return
+        client.pump()
+        budget = envs.OFFLOAD_ASYNC_LOOKUP_DEPTH
+        memo = self._tier_hit_memo or {}
+        for seq in seqs:
+            if budget <= 0:
+                break
+            sid = str(seq.id)
+            if sid in self._lookup_results or sid in self._load_specs:
+                continue
+            entry = memo.get(sid)
+            if entry is not None and entry[0]() is seq:
+                continue
+            if self._load_failed_seqs.get(sid) is seq:
+                continue
+            tokens = self._lookup_token_ids(seq)
+            if not tokens:
+                continue
+            if self._lookup_covered_by_hbm(seq, len(tokens), count=False):
+                continue
+            budget -= 1
+            if submit(tokens, sid):
+                self._perf_bump("lookup_prefetched")
+
+    def _lookup_covered_by_hbm(self, seq, lookup_len: int, count: bool = True) -> bool:
         """Whether HBM already holds all but less than one minimum load.
 
         The tier cannot answer past `lookup_len`, and a load must add at least
@@ -244,7 +280,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         hbm = int(self._block_manager.probe_hbm_hit_tokens(seq))
         if lookup_len - hbm >= max(1, min_load):
             return False
-        self._perf_bump("lookup_skipped_hbm_covered")
+        if count:
+            self._perf_bump("lookup_skipped_hbm_covered")
         return True
 
     def _fresh_tier_lookup(self, seq, sid: str) -> int | None:
@@ -1248,6 +1285,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._load_lifecycles.pop(sid, None)
         self._release_failed_load_attempt(sid, seq)
         self._forget_tier_hit(sid)
+        discard = getattr(self._lookup_client, "discard", None)
+        if discard is not None:
+            try:
+                discard(sid)
+            except Exception:
+                logger.debug("LMCache offload: async lookup discard failed for %s", sid)
         entry = self._save_tracker.get(sid)
         if entry is not None and entry[0] is seq:
             if self._early_release:

@@ -992,16 +992,24 @@ class OffloadSchedulerMixin(ABC):
         """One INFO line per minute with the diagnostic counters and statistics."""
 
         now = time.monotonic()
-        if now - self.__dict__.get("_perf_last_log", 0.0) < 60.0:
+        last = self.__dict__.get("_perf_last_log")
+        if last is None:
+            self._perf_last_log = now
+            return
+        if now - last < 60.0:
             return
         self._perf_last_log = now
         counters = self.__dict__.get("_perf_counters")
         if not counters:
             return
+        try:
+            statistics = self.get_statistics()
+        except Exception:  # noqa: BLE001  # diagnostics must never fail a step
+            statistics = {}
         logger.info(
             "[OFFLOAD-PERF] %s | %s",
             json.dumps(dict(sorted(counters.items()))),
-            json.dumps(self.get_statistics()),
+            json.dumps(statistics),
         )
 
     def _mark_load_skip(

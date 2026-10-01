@@ -43,6 +43,111 @@ class _MPLookupClient:
         self._timeout = timeout
         self._poll_interval = poll_interval
         self._lookups: dict[str, _LookupState] = {}
+        # lookup_id -> [request_id, prompt length, phase, future]
+        self._async: dict[str, list] = {}
+        # Prompts of submitted lookups not yet consumed, to free their locks.
+        self._async_tokens: dict[str, list[int]] = {}
+        self._orphans: set[str] = set()
+
+    # -- asynchronous submission ------------------------------------------
+    #
+    # A lookup costs a blocking round trip on the scheduler thread (the server
+    # hashes the whole prompt before it answers). `submit` sends it while the
+    # request still waits; `pump` advances it without blocking. Either way the
+    # answer lands in the adapter's own result cache, so the synchronous
+    # `lookup` that later consumes it returns at once and every lock
+    # lifecycle after that is unchanged.
+
+    def submit(self, token_ids: list[int], lookup_id: str) -> bool:
+        """Send this request's lookup without waiting. False if not sent."""
+
+        if lookup_id in self._async or lookup_id in self._lookups:
+            return False
+        adapter = self._adapter
+        request_id = _mp_session_id(self._config, lookup_id)
+        if (
+            request_id in adapter._pending_lookups
+            or request_id in adapter._lookup_results
+        ):
+            return False
+        chunk = int(adapter.lmcache_tokens_per_chunk)
+        aligned_end = (len(token_ids) // chunk) * chunk
+        if aligned_end == 0:
+            return False
+        key = adapter._create_key(
+            token_ids,
+            start=0,
+            end=aligned_end,
+            request_id=request_id,
+            worker_id=None,
+        )
+        future = adapter._client.lookup(key, adapter._parallel.tp_size)
+        self._async[lookup_id] = [request_id, len(token_ids), "lookup", future]
+        self._async_tokens[lookup_id] = list(token_ids)
+        return True
+
+    def _advance(self, lookup_id: str) -> bool:
+        """One non-blocking step of an async lookup. True once answered."""
+
+        entry = self._async[lookup_id]
+        request_id, _, phase, future = entry
+        adapter = self._adapter
+        if phase == "lookup":
+            if not future.query():
+                return False
+            future.result(timeout=0)
+            adapter._pending_lookups.add(request_id)
+            entry[2] = phase = "status"
+            entry[3] = future = adapter._client.query_prefetch_status(request_id)
+        if not future.query():
+            return False
+        result = future.result(timeout=0)
+        if result is None:
+            entry[3] = adapter._client.query_prefetch_status(request_id)
+            return False
+        adapter._lookup_results[request_id] = int(result) * int(
+            adapter.lmcache_tokens_per_chunk
+        )
+        del self._async[lookup_id]
+        return True
+
+    def pump(self) -> None:
+        """Advance every async lookup; release the ones nobody will consume."""
+
+        for lookup_id in list(self._async):
+            try:
+                answered = self._advance(lookup_id)
+            except Exception:
+                logger.warning(
+                    "LMCache MP async lookup failed for request %s",
+                    lookup_id,
+                    exc_info=True,
+                )
+                self._async.pop(lookup_id, None)
+                continue
+            if answered and lookup_id in self._orphans:
+                self._orphans.discard(lookup_id)
+                self._release_unconsumed(lookup_id)
+
+    def _release_unconsumed(self, lookup_id: str) -> None:
+        request_id = _mp_session_id(self._config, lookup_id)
+        hit = self._adapter._lookup_results.get(request_id)
+        token_ids = self._async_tokens.pop(lookup_id, None)
+        if hit and token_ids is not None:
+            self._adapter.free_lookup_locks(
+                token_ids=token_ids, start=0, end=hit, request_id=request_id
+            )
+        self._adapter.cleanup_lookup_result(request_id)
+
+    def discard(self, lookup_id: str) -> None:
+        """Forget an async lookup its request will never consume."""
+
+        if lookup_id in self._async:
+            # Still in flight: its locks exist only once it answers.
+            self._orphans.add(lookup_id)
+            return
+        if lookup_id in self._async_tokens:
+            self._release_unconsumed(lookup_id)
 
     def lookup(self, token_ids: list[int], lookup_id: str) -> int | None:
         """Hit length for this prompt, or None if the tier never answered.
@@ -52,6 +157,27 @@ class _MPLookupClient:
         well hold.
         """
 
+        self._orphans.discard(lookup_id)
+        if lookup_id in self._async:
+            deadline = time.monotonic() + self._timeout
+            while lookup_id in self._async:
+                try:
+                    if self._advance(lookup_id):
+                        break
+                except Exception:
+                    self._async.pop(lookup_id, None)
+                    raise
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "LMCache MP async lookup timed out after %.1fs for "
+                        "request %s",
+                        self._timeout,
+                        lookup_id,
+                    )
+                    self._orphans.add(lookup_id)
+                    return None
+                time.sleep(self._poll_interval)
+        self._async_tokens.pop(lookup_id, None)
         state = _LookupState(token_ids=list(token_ids))
         self._lookups[lookup_id] = state
         request_id = _mp_session_id(self._config, lookup_id)

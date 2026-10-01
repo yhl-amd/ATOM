@@ -355,6 +355,14 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if callable(bind):
                 bind(block_manager)
 
+    def prefetch_lookups(self, seqs: Any) -> None:
+        """Let each sub send its external-tier lookups ahead of admission."""
+        seqs = list(seqs)
+        for connector in self._connectors:
+            prefetch = getattr(connector, "prefetch_lookups", None)
+            if callable(prefetch):
+                prefetch(seqs)
+
     def __init__(self, config: Any) -> None:
         self._connectors = _build_subconnectors(config, role="scheduler")
         self.is_producer = any(

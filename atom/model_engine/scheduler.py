@@ -19,6 +19,7 @@ Every scheduler here owns an :class:`~atom.model_engine.engine_stats.EngineStats
 
 from __future__ import annotations
 
+import itertools
 import logging
 import struct
 import threading
@@ -1543,6 +1544,12 @@ class Scheduler:
         # Reclaim aborted heads even when decode protection vetoes Phase 2.
         while self.waiting and self.waiting[0].status == SequenceStatus.ABORTED:
             self._reject_aborted_waiting(self.waiting.popleft())
+        if self.kv_connector is not None and self.waiting:
+            prefetch = getattr(self.kv_connector, "prefetch_lookups", None)
+            if prefetch is not None:
+                prefetch(
+                    itertools.islice(self.waiting, 0, envs.OFFLOAD_ASYNC_LOOKUP_DEPTH)
+                )
 
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.

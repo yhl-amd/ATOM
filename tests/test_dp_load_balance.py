@@ -188,6 +188,27 @@ def test_affinity_existing_session_always_uses_cache_owner():
     assert mgr._dp_route_counters["affinity_spill_total"] == 0
 
 
+def test_offload_spill_moves_session_off_an_overloaded_owner():
+    mgr = _make_mgr(2, session_affinity=True)
+    mgr._dp_offload_spill_tokens = 100_000
+    mgr._dp_session_owners["s"] = 0
+    mgr._rank_tokens = [500_000, 0]
+    rank = _route(mgr, [_FakeSeq("turn", 1000, dp_session_id="s")])[0]
+    assert rank == 1
+    assert mgr._dp_session_owners["s"] == 1
+    assert mgr._dp_route_counters["affinity_spill_total"] == 1
+
+
+def test_offload_spill_keeps_owner_below_threshold():
+    mgr = _make_mgr(2, session_affinity=True)
+    mgr._dp_offload_spill_tokens = 100_000
+    mgr._dp_session_owners["s"] = 0
+    mgr._rank_tokens = [50_000, 0]
+    rank = _route(mgr, [_FakeSeq("turn", 1000, dp_session_id="s")])[0]
+    assert rank == 0
+    assert mgr._dp_route_counters["affinity_spill_total"] == 0
+
+
 def test_affinity_later_turn_charges_only_prompt_growth():
     mgr = _make_mgr(2, session_affinity=True, req_equiv=512)
     first = _FakeSeq("first", 100_000, dp_session_id="s")

@@ -1186,7 +1186,8 @@ class CoreManager:
         than the lightest rank by the threshold, so a balanced engine keeps
         strict locality and only a hot rank sheds sessions.
         """
-        if self._dp_offload_spill_tokens <= 0:
+        threshold = getattr(self, "_dp_offload_spill_tokens", 0)
+        if threshold <= 0:
             return None
         equiv = self._dp_lb_req_equiv
         owner_load = self._rank_tokens[owner] + equiv * self._rank_reqs[owner]
@@ -1194,7 +1195,7 @@ class CoreManager:
         if best == owner:
             return None
         best_load = self._rank_tokens[best] + equiv * self._rank_reqs[best]
-        if owner_load - best_load < self._dp_offload_spill_tokens:
+        if owner_load - best_load < threshold:
             return None
         logger.debug(
             "%s: DPA offload spill session=%s rank%d(load=%d) -> rank%d(load=%d)",

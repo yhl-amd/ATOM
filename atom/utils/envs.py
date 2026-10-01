@@ -963,6 +963,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Skip the external-tier lookup when the resumable HBM prefix already leaves
     # less than OFFLOAD_MIN_LOAD_TOKENS for the tier to supply.
     "OFFLOAD_SKIP_COVERED_LOOKUP": lambda: _flag_env("OFFLOAD_SKIP_COVERED_LOOKUP"),
+    # Send external-tier lookups for the head of the waiting queue ahead of
+    # admission, so the scheduler reads an answer instead of waiting for one.
+    "OFFLOAD_ASYNC_LOOKUP": lambda: _flag_env("OFFLOAD_ASYNC_LOOKUP"),
+    "OFFLOAD_ASYNC_LOOKUP_DEPTH": lambda: _nonnegative_int_env(
+        "OFFLOAD_ASYNC_LOOKUP_DEPTH", 16
+    ),
     # Experimental: run the staging pack and copy legs on one stream.
     "OFFLOAD_SINGLE_STREAM": lambda: _flag_env("OFFLOAD_SINGLE_STREAM"),
     # GPU staging buffer size in LMCache chunks, and an upper bound in bytes.
