@@ -163,6 +163,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_DP_SESSION_AFFINITY", "0"
     ).lower()
     in {"1", "true", "yes", "on"},
+    # With ATOM_DP_SESSION_AFFINITY and a shared external KV tier (lmcache_mp),
+    # move an existing session off its owner when the owner's load exceeds the
+    # lightest rank's by at least this many token-equivalents; the new rank
+    # restores the prefix from the tier. 0 keeps strict affinity.
+    "ATOM_DP_OFFLOAD_SPILL_TOKENS": lambda: int(
+        os.getenv("ATOM_DP_OFFLOAD_SPILL_TOKENS", "0")
+    ),
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # SGLang's GLM-5.2 and DeepSeek V4 prefill CP paths still force
@@ -953,6 +960,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Per-transfer offload profiling logs.
     "OFFLOAD_PROFILE": lambda: _flag_env("OFFLOAD_PROFILE"),
+    # Skip the external-tier lookup when the resumable HBM prefix already leaves
+    # less than OFFLOAD_MIN_LOAD_TOKENS for the tier to supply.
+    "OFFLOAD_SKIP_COVERED_LOOKUP": lambda: _flag_env("OFFLOAD_SKIP_COVERED_LOOKUP"),
     # Experimental: run the staging pack and copy legs on one stream.
     "OFFLOAD_SINGLE_STREAM": lambda: _flag_env("OFFLOAD_SINGLE_STREAM"),
     # GPU staging buffer size in LMCache chunks, and an upper bound in bytes.

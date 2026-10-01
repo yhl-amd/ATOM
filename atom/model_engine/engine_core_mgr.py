@@ -219,6 +219,7 @@ class CoreManager:
         # Read once here: this is a construction-time config value (CoreManager
         # is built after env/args are finalized), not a runtime-tunable knob.
         self._dp_lb_req_equiv = envs.ATOM_DP_LB_REQ_EQUIV
+        self._dp_offload_spill_tokens = max(0, envs.ATOM_DP_OFFLOAD_SPILL_TOKENS)
         self._dp_session_affinity_enabled = envs.ATOM_DP_SESSION_AFFINITY
         # Session id -> rank whose local prefix cache owns the session. Owners
         # are immutable for the lifetime of the process: moving one turn to a
@@ -1170,7 +1171,41 @@ class CoreManager:
             )
             return self._record_dp_route_locked("affinity_new_total", owner)
 
+        spill = self._offload_spill_rank_locked(session_id, owner)
+        if spill is not None:
+            self._dp_session_owners[session_id] = spill
+            return self._record_dp_route_locked("affinity_spill_total", spill)
         return self._record_dp_route_locked("affinity_owner_hit_total", owner)
+
+    def _offload_spill_rank_locked(self, session_id: str, owner: int) -> int | None:
+        """A lighter rank to move an existing session to, or None to stay.
+
+        Only with `ATOM_DP_OFFLOAD_SPILL_TOKENS`: the session's prefix must be
+        restorable from a tier every rank shares (lmcache_mp), or the move turns
+        a cache hit into a full prefill. Moving needs the owner to be heavier
+        than the lightest rank by the threshold, so a balanced engine keeps
+        strict locality and only a hot rank sheds sessions.
+        """
+        if self._dp_offload_spill_tokens <= 0:
+            return None
+        equiv = self._dp_lb_req_equiv
+        owner_load = self._rank_tokens[owner] + equiv * self._rank_reqs[owner]
+        best = self._select_new_session_rank_locked(session_id)
+        if best == owner:
+            return None
+        best_load = self._rank_tokens[best] + equiv * self._rank_reqs[best]
+        if owner_load - best_load < self._dp_offload_spill_tokens:
+            return None
+        logger.debug(
+            "%s: DPA offload spill session=%s rank%d(load=%d) -> rank%d(load=%d)",
+            self.label,
+            session_id,
+            owner,
+            owner_load,
+            best,
+            best_load,
+        )
+        return best
 
     def get_dp_router_statistics(self) -> dict:
         """Return a consistent, non-mutating snapshot of DP routing state."""

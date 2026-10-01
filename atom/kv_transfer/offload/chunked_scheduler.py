@@ -210,9 +210,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         sid = str(seq.id)
         if self._repeat_load_suppressed(seq, sid):
             return 0, False
-        if not self._lookup_token_ids(seq):
+        lookup_tokens = self._lookup_token_ids(seq)
+        if not lookup_tokens:
             return 0, False
         pending = self._lookup_results.get(sid)
+        if pending is None and self._lookup_covered_by_hbm(seq, len(lookup_tokens)):
+            return 0, False
         if pending is not None and pending[0] is not seq:
             # An older lifecycle still owns this worker-side pin. Its cleanup
             # must be dispatched before the ID can acquire a new lease.
@@ -227,6 +230,23 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return 0, False
         return self._answer_from_tier_hit(seq, sid, hit)
 
+    def _lookup_covered_by_hbm(self, seq, lookup_len: int) -> bool:
+        """Whether HBM already holds all but less than one minimum load.
+
+        The tier cannot answer past `lookup_len`, and a load must add at least
+        `_min_load_tokens` over the HBM hit, so below that margin the lookup's
+        answer is a refusal (`too_small` or `hbm_satisfies_after_alloc`) that
+        cost a blocking round trip on the scheduler thread.
+        """
+        if not envs.OFFLOAD_SKIP_COVERED_LOOKUP or self._block_manager is None:
+            return False
+        min_load = int(getattr(self, "_min_load_tokens", 8192))
+        hbm = int(self._block_manager.probe_hbm_hit_tokens(seq))
+        if lookup_len - hbm >= max(1, min_load):
+            return False
+        self._perf_bump("lookup_skipped_hbm_covered")
+        return True
+
     def _fresh_tier_lookup(self, seq, sid: str) -> int | None:
         """Ask the tier, take its pin, and remember the hit. None if it did not answer."""
 
@@ -235,8 +255,20 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if sid not in self._lookup_in_step:
             self._lookup_in_step.append(sid)
         self._lookup_results[sid] = (seq, 0)
+        _t0 = time.perf_counter()
         try:
             hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
+            _us = int((time.perf_counter() - _t0) * 1e6)
+            self._perf_bump("lookup_n")
+            self._perf_bump("lookup_us", _us)
+            if _us > self.__dict__.get("_perf_lookup_max_us", 0):
+                self._perf_lookup_max_us = _us
+                self._perf_counters["lookup_max_us"] = _us
+            self._perf_bump("lookup_prompt_tokens", num_prompt)
+            self._perf_bump("lookup_hbm_tokens", int(seq.num_cached_tokens))
+            self._perf_bump("lookup_hit_tokens", int(hit or 0))
+            if hit is None:
+                self._perf_bump("lookup_none")
         except Exception:
             # The ID stays in `_lookup_in_step` so the dispatch unpins whatever
             # a half-run lookup may have taken.
@@ -487,6 +519,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         return target, block_ids, keep
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
+        _perf_t0 = time.perf_counter()
         meta = LMCacheOffloadMetadata()
 
         # Loads
@@ -575,6 +608,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if not self._do_save:
                 continue
             if not self._may_emit_save():
+                self._perf_bump("save_cap_block_steps")
                 break
             seq, saved = entry
             if sid in self._reqs_need_recv or sid in loading_sids:
@@ -614,8 +648,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             ):
                 late_source = self._late_save_source(seq, saved, aligned)
                 if late_source is None:
+                    self._perf_bump("late_save_dropped")
+                    self._perf_bump("late_save_dropped_tokens", aligned - saved)
                     self._save_tracker.pop(sid, None)
                     continue
+                self._perf_bump("late_save_emit")
                 aligned, block_ids, late_acquired = late_source
             else:
                 block_ids = list(
@@ -663,6 +700,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             sid for sid in self._lookup_in_step if sid not in dispatched
         ]
         self._reqs_need_recv.clear()
+        self._perf_bump("build_meta_us", int((time.perf_counter() - _perf_t0) * 1e6))
+        self._perf_bump("build_meta_n")
+        self._perf_maybe_log()
         return meta
 
     def should_defer_free(self, seq) -> bool:

@@ -1002,6 +1002,38 @@ class BlockManager:
         self._extend_hash_chain(seq, block_hashes)
         return num_cached_blocks
 
+    def probe_hbm_hit_tokens(self, seq: Sequence) -> int:
+        """Resumable HBM prefix hit in tokens, with no side effects.
+
+        The read-only half of `can_allocate`: the same chained match and
+        `_gated_hit`, reusing the admission probe's cached hashes, but no
+        checkpoint demand, no joint boundary and no fit check. An offload
+        connector uses it to skip an external-tier lookup whose answer could not
+        produce a load.
+        """
+        if not self.enable_prefix_caching:
+            return 0
+        h = seq.cache_seed
+        seed, cached_hashes = self._prefill_probe_hashes.get(seq, (h, []))
+        if seed != h:
+            cached_hashes = []
+        self._prefill_probe_hashes[seq] = (h, cached_hashes)
+        immutable_blocks = seq.num_prompt_tokens // self.hash_block_size
+        block_hashes: list[int] = []
+        for i in range(self._n_hash_blocks(seq) - 1):
+            token_ids = self._hash_block_tokens(seq, i)
+            if i < len(cached_hashes):
+                h = cached_hashes[i]
+            else:
+                h = self.compute_hash(token_ids, h)
+                if i < immutable_blocks:
+                    cached_hashes.append(h)
+            block_id = self.kv.lookup(h)
+            if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
+                break
+            block_hashes.append(h)
+        return self._gated_hit(seq, len(block_hashes), block_hashes) * self.hash_block_size
+
     def record_allocation(
         self, seq: Sequence, num_cached_blocks: int, block_hashes: list[int]
     ) -> None:
