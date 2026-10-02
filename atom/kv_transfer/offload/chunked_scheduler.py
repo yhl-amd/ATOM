@@ -1349,7 +1349,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             try:
                 discard(sid)
             except Exception:
-                logger.debug("LMCache offload: async lookup discard failed for %s", sid)
+                # Its read locks are then released only by the server's
+                # session cleanup or read TTL.
+                logger.warning(
+                    "LMCache offload: async lookup discard failed for %s",
+                    sid,
+                    exc_info=True,
+                )
         entry = self._save_tracker.get(sid)
         if entry is not None and entry[0] is seq:
             if self._early_release:

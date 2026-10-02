@@ -101,6 +101,11 @@ class _MPLookupClient:
             return self._advance(lookup_id)
         except Exception:
             # Let the synchronous path ask again and surface the error there.
+            logger.warning(
+                "LMCache MP async lookup failed for request %s; asking again",
+                lookup_id,
+                exc_info=True,
+            )
             self._async.pop(lookup_id, None)
             return True
 
