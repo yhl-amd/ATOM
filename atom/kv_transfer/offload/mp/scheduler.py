@@ -40,9 +40,6 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     """Scheduler-side LMCache MP connector for generic PAGE offload."""
 
     _supports_early_block_release = True
-    # Every lookup is a blocking round trip to the LMCache server; skip the
-    # ones HBM already makes pointless.
-    _skip_covered_lookup = True
 
     def __init__(self, config: Any, *, checkpoint_spec: Any = None) -> None:
         _validate_mp_config(config)

@@ -47,11 +47,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     is_offload = True
     # Only transports that publish source-safe completion groups may opt in.
     _supports_early_block_release = False
-    # Skip a tier lookup whose answer could not produce a load because the
-    # resumable HBM prefix already leaves less than a minimum load (see
-    # `_lookup_covered_by_hbm`). Opt-in per transport: it was validated where
-    # the lookup is a blocking round trip to a separate server.
-    _skip_covered_lookup = False
 
     def __init__(
         self,
@@ -228,12 +223,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         sid = str(seq.id)
         if self._repeat_load_suppressed(seq, sid):
             return 0, False
-        lookup_len = self._lookup_len(seq)
-        if lookup_len <= 0:
+        if self._lookup_len(seq) <= 0:
             return 0, False
         pending = self._lookup_results.get(sid)
-        if pending is None and self._lookup_covered_by_hbm(seq, lookup_len):
-            return 0, False
         if pending is not None and pending[0] is not seq:
             # An older lifecycle still owns this worker-side pin. Its cleanup
             # must be dispatched before the ID can acquire a new lease.
@@ -277,10 +269,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 continue
             if self._load_failed_seqs.get(sid) is seq:
                 continue
-            lookup_len = self._lookup_len(seq)
-            if lookup_len <= 0:
-                continue
-            if self._lookup_covered_by_hbm(seq, lookup_len, count=False):
+            if self._lookup_len(seq) <= 0:
                 continue
             budget -= 1
             if submit(self._lookup_token_ids(seq), sid):
@@ -309,44 +298,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._perf_bump("lookup_defer_expired")
             return False
         self._perf_bump("lookup_deferred")
-        return True
-
-    def _lookup_covered_by_hbm(self, seq, lookup_len: int, count: bool = True) -> bool:
-        """Whether HBM already holds all but less than one minimum load.
-
-        The tier cannot answer past `lookup_len`, and a load must add at least
-        `_min_load_tokens` over the HBM hit, so below that margin the lookup's
-        answer is a refusal (`too_small` or `hbm_satisfies_after_alloc`) that
-        cost a blocking round trip on the scheduler thread.
-        """
-        if not self._skip_covered_lookup or self._block_manager is None:
-            return False
-        probe = getattr(self._block_manager, "probe_hbm_hit_tokens", None)
-        if probe is None:
-            return False
-        min_load = int(getattr(self, "_min_load_tokens", 8192))
-        step = self.__dict__.get("_meta_steps", 0)
-        cached = getattr(seq, "_offload_hbm_probe", None)
-        if cached is not None and step - cached[0] < envs.OFFLOAD_PROBE_REFRESH_STEPS:
-            hbm = cached[1]
-        else:
-            t0 = time.perf_counter()
-            hbm = int(probe(seq))
-            self._perf_bump("probe_us", int((time.perf_counter() - t0) * 1e6))
-            self._perf_bump("probe_n")
-            seq._offload_hbm_probe = (step, hbm)
-        if lookup_len - hbm >= max(1, min_load):
-            return False
-        if count:
-            self._perf_bump("lookup_skipped_hbm_covered")
-            # The resumable HBM prefix was computed by an earlier request on
-            # this rank, which stored it then. Start this request's save where
-            # HBM ends, as a lookup hit would have: with no floor the save
-            # re-sends the whole prompt every turn.
-            sid = str(seq.id)
-            floor = self._chunk_floor(hbm)
-            if floor > int(self._hit_save_floors.get(sid, 0)):
-                self._hit_save_floors[sid] = floor
         return True
 
     def _fresh_tier_lookup(self, seq, sid: str) -> int | None:
@@ -622,7 +573,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         _perf_t0 = time.perf_counter()
-        self._meta_steps = self.__dict__.get("_meta_steps", 0) + 1
         meta = LMCacheOffloadMetadata()
 
         # Loads

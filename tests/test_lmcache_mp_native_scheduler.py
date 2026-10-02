@@ -232,19 +232,6 @@ def test_save_frontier_selects_existing_checkpoint_below_computed_tokens(monkeyp
     assert scheduler._save_tracker["1"][1] == 8
 
 
-def test_lookup_skipped_for_hbm_hit_starts_the_save_where_hbm_ends(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "8")
-    scheduler, _, adapter = make_scheduler(monkeypatch)
-    seq = sequence(count=24, computed=0)
-    monkeypatch.setattr(
-        scheduler._block_manager, "probe_hbm_hit_tokens", lambda _seq: 16, raising=False
-    )
-    assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
-    assert adapter.queries == []
-    scheduler.update_state_after_alloc(seq)
-    assert scheduler._save_tracker["1"][1] == 16
-
-
 def test_save_frontier_skips_checkpoints_shorter_than_min_save_tokens(monkeypatch):
     scheduler, checkpoints, _ = make_scheduler(monkeypatch, min_save_tokens=16)
     seq = sequence(computed=24)
@@ -870,11 +857,3 @@ def test_engine_releases_retired_request_when_unpinned_candidate_is_evicted(
     assert connector._retired_requests == {}
     assert connector._save_tracker == {}
     assert not connector.has_pending_work()
-
-
-def test_only_lmcache_mp_skips_lookups_that_hbm_already_covers():
-    from atom.kv_transfer.offload.dense.connector import DenseOffloadScheduler
-
-    assert mp_scheduler.LMCacheMPConnectorScheduler._skip_covered_lookup is True
-    assert NativeStateLMCacheMPConnectorScheduler._skip_covered_lookup is True
-    assert DenseOffloadScheduler._skip_covered_lookup is False

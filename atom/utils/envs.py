@@ -953,12 +953,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Per-transfer offload profiling logs.
     "OFFLOAD_PROFILE": lambda: _flag_env("OFFLOAD_PROFILE"),
-    # lmcache_mp skips a tier lookup when the resumable HBM prefix leaves less
-    # than OFFLOAD_MIN_LOAD_TOKENS for the tier to supply; this is how many
-    # scheduler steps that HBM probe answer is reused before it is redone.
-    "OFFLOAD_PROBE_REFRESH_STEPS": lambda: _nonnegative_int_env(
-        "OFFLOAD_PROBE_REFRESH_STEPS", 16
-    ),
     # lmcache_mp sends tier lookups for the head of the waiting queue ahead of
     # admission; this is how many waiting requests per scheduling pass.
     "OFFLOAD_ASYNC_LOOKUP_DEPTH": lambda: _nonnegative_int_env(
