@@ -14,6 +14,14 @@ from atom.kv_transfer.offload.mp.deployment import _mp_session_id
 
 logger = logging.getLogger("atom")
 
+_ASYNC_ADAPTER_ATTRS = (
+    "_client",
+    "_parallel",
+    "_create_key",
+    "_pending_lookups",
+    "_lookup_results",
+)
+
 
 @dataclass
 class _LookupState:
@@ -48,6 +56,17 @@ class _MPLookupClient:
         # Prompts of submitted lookups not yet consumed, to free their locks.
         self._async_tokens: dict[str, list[int]] = {}
         self._orphans: set[str] = set()
+        # The non-blocking path drives LMCache's ATOM adapter through its
+        # internals (message-queue client and result caches). An adapter
+        # without them falls back to the synchronous lookup.
+        missing = [name for name in _ASYNC_ADAPTER_ATTRS if not hasattr(adapter, name)]
+        self._async_supported = not missing
+        if missing:
+            logger.warning(
+                "LMCache MP adapter %s lacks %s; tier lookups stay synchronous",
+                type(adapter).__name__,
+                ", ".join(missing),
+            )
 
     # -- asynchronous submission ------------------------------------------
     #
@@ -61,7 +80,11 @@ class _MPLookupClient:
     def submit(self, token_ids: list[int], lookup_id: str) -> bool:
         """Send this request's lookup without waiting. False if not sent."""
 
-        if lookup_id in self._async or lookup_id in self._lookups:
+        if (
+            not self._async_supported
+            or lookup_id in self._async
+            or lookup_id in self._lookups
+        ):
             return False
         adapter = self._adapter
         request_id = _mp_session_id(self._config, lookup_id)

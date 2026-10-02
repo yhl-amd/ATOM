@@ -193,3 +193,30 @@ def test_poll_answers_without_blocking():
     assert client.poll("req")
     assert not client.is_pending("req")
     assert client.poll("never-submitted")
+
+
+def test_adapter_without_async_internals_stays_synchronous(monkeypatch):
+    monkeypatch.setattr(transfer.time, "sleep", lambda _s: None)
+
+    class _SyncOnly:
+        lmcache_tokens_per_chunk = CHUNK
+
+        def __init__(self):
+            self.submitted = []
+
+        def maybe_submit_lookup_request(self, request_id, token_ids):
+            self.submitted.append(request_id)
+
+        def check_lookup_result(self, request_id):
+            return CHUNK
+
+        def cleanup_lookup_result(self, request_id):
+            pass
+
+    adapter = _SyncOnly()
+    client = _client(adapter)
+    assert not client.submit(list(range(8)), "req")
+    assert not client.is_pending("req")
+    client.pump()
+    assert client.lookup(list(range(8)), "req") == CHUNK
+    assert adapter.submitted == [_rid(client, "req")]
