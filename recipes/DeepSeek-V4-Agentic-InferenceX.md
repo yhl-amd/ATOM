@@ -101,8 +101,6 @@ export ATOM_KV_OFFLOAD=lmcache_mp
 export ATOM_KV_OFFLOAD_EXTRA_CONFIG='{"lmcache.mp.host": "tcp://127.0.0.1", "lmcache.mp.port": 5555}'
 export LMCACHE_CHUNK_SIZE=256
 export OFFLOAD_MAX_PENDING_SAVES=8
-export OFFLOAD_SKIP_COVERED_LOOKUP=1
-export OFFLOAD_ASYNC_LOOKUP=1
 ```
 
 - Size `--l1-size-gb` to the host: the pool is pinned memory, and

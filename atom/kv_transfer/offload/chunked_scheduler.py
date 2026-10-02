@@ -47,6 +47,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     is_offload = True
     # Only transports that publish source-safe completion groups may opt in.
     _supports_early_block_release = False
+    # Skip a tier lookup whose answer could not produce a load because the
+    # resumable HBM prefix already leaves less than a minimum load (see
+    # `_lookup_covered_by_hbm`). Opt-in per transport: it was validated where
+    # the lookup is a blocking round trip to a separate server.
+    _skip_covered_lookup = False
 
     def __init__(
         self,
@@ -254,7 +259,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """
         client = self._lookup_client
         submit = getattr(client, "submit", None)
-        if submit is None or not envs.OFFLOAD_ASYNC_LOOKUP or not self._do_load:
+        if submit is None or not self._do_load:
             return
         t0 = time.perf_counter()
         client.pump()
@@ -292,7 +297,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         ordinary synchronous lookup waits for the answer.
         """
         client = self._lookup_client
-        if not envs.OFFLOAD_ASYNC_LOOKUP or getattr(client, "is_pending", None) is None:
+        if getattr(client, "is_pending", None) is None:
             return False
         sid = str(seq.id)
         if not client.is_pending(sid) or client.poll(sid):
@@ -314,7 +319,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         answer is a refusal (`too_small` or `hbm_satisfies_after_alloc`) that
         cost a blocking round trip on the scheduler thread.
         """
-        if not envs.OFFLOAD_SKIP_COVERED_LOOKUP or self._block_manager is None:
+        if not self._skip_covered_lookup or self._block_manager is None:
+            return False
+        probe = getattr(self._block_manager, "probe_hbm_hit_tokens", None)
+        if probe is None:
             return False
         min_load = int(getattr(self, "_min_load_tokens", 8192))
         step = self.__dict__.get("_meta_steps", 0)
@@ -323,7 +331,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             hbm = cached[1]
         else:
             t0 = time.perf_counter()
-            hbm = int(self._block_manager.probe_hbm_hit_tokens(seq))
+            hbm = int(probe(seq))
             self._perf_bump("probe_us", int((time.perf_counter() - t0) * 1e6))
             self._perf_bump("probe_n")
             seq._offload_hbm_probe = (step, hbm)
