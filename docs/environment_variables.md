@@ -321,7 +321,6 @@ derive a bound.
 | **OFFLOAD_ASYNC_LOOKUP** | bool | 0 | Send tier lookups for the head of the waiting queue before admission, as non-blocking requests; admission consumes the answer. A request whose answer has not arrived is passed over (in arrival order) instead of blocking the scheduler. `lmcache_mp` only. |
 | **OFFLOAD_ASYNC_LOOKUP_DEPTH** | int | 16 | How many waiting requests per scheduling pass `OFFLOAD_ASYNC_LOOKUP` prefetches. |
 | **OFFLOAD_LOOKUP_DEFER_S** | float | 2.0 | How long admission may pass over a request whose async lookup is still in flight before it waits for the answer (finite, ≥ 0). |
-| **OFFLOAD_LOOKUP_MAX_AGE_S** | float | 0 (off) | Re-ask, synchronously at admission, a prefetched answer older than this. Guards against answers that outlived the server's L1 read TTL (their chunks may be evicted, failing the load into a recompute). Prefer raising the server's `--l1-read-ttl-seconds` above the admission wait; this brings back a blocking lookup for every request that waited longer. |
 | **OFFLOAD_PROFILE** | bool | 0 | Emit `[OFFLOAD-SAVE-PROF]` / `[OFFLOAD-LOAD-PROF]` per-transfer records, and once a minute an `[OFFLOAD-PERF]` line per scheduler with lookup/save/load-skip counters and per-step timings. An empty value reads as off. |
 | **OFFLOAD_SINGLE_STREAM** | bool | 0 | Experimental: run the staging pack and copy legs on one stream. |
 | **OFFLOAD_GPU_STAGING_CHUNKS** | int | derived from KV geometry | GPU staging buffer size in LMCache chunks (≥ 1). |

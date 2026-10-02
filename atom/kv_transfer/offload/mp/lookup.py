@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from atom.kv_transfer.offload.mp.deployment import _mp_session_id
-from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -49,8 +48,6 @@ class _MPLookupClient:
         # Prompts of submitted lookups not yet consumed, to free their locks.
         self._async_tokens: dict[str, list[int]] = {}
         self._orphans: set[str] = set()
-        # lookup_id -> when its async answer arrived.
-        self._answered_at: dict[str, float] = {}
 
     # -- asynchronous submission ------------------------------------------
     #
@@ -136,7 +133,6 @@ class _MPLookupClient:
             adapter.lmcache_tokens_per_chunk
         )
         del self._async[lookup_id]
-        self._answered_at[lookup_id] = time.monotonic()
         return True
 
     def pump(self) -> None:
@@ -158,7 +154,6 @@ class _MPLookupClient:
                 self._release_unconsumed(lookup_id)
 
     def _release_unconsumed(self, lookup_id: str) -> None:
-        self._answered_at.pop(lookup_id, None)
         request_id = _mp_session_id(self._config, lookup_id)
         hit = self._adapter._lookup_results.get(request_id)
         token_ids = self._async_tokens.pop(lookup_id, None)
@@ -187,17 +182,6 @@ class _MPLookupClient:
         """
 
         self._orphans.discard(lookup_id)
-        answered = self._answered_at.pop(lookup_id, None)
-        max_age = envs.OFFLOAD_LOOKUP_MAX_AGE_S
-        if (
-            answered is not None
-            and max_age > 0
-            and time.monotonic() - answered > max_age
-        ):
-            # The server's read locks expire (l1 read TTL); a stale answer can
-            # name chunks that were evicted since, and the retrieve then fails
-            # into a full recompute. Release it and ask again.
-            self._release_unconsumed(lookup_id)
         if lookup_id in self._async:
             deadline = time.monotonic() + self._timeout
             while lookup_id in self._async:
