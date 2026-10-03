@@ -119,6 +119,7 @@ from atom.model_ops.v4_kernels import (
     FP4_MQA_PARALLEL_UNIT_NUM,
     build_v4_paged_decode_indptr,
     fp4_indexer_enabled,
+    hca_persist,
     plan_context_lens,
     v4_decode_split_plan,
     write_v4_paged_decode_indices,
@@ -724,6 +725,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             model_runner.config.hf_config.num_attention_heads
             // get_tensor_model_parallel_world_size()
         )
+        self._prepare_hca_persist()
 
         # Sparse-attn + per-fwd metadata buffers (CG-A: pre-allocate for fixed
         # GPU pointers, prerequisite for CUDAGraph capture). All H2D copies in
@@ -3693,6 +3695,21 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             running_tokens=running_tokens,
             buf_prefix_ubatch=buf_prefix_ubatch,
         )
+
+    def _prepare_hca_persist(self) -> None:
+        """Allocate the persistent HCA decode workspace here, at init: before
+        warmup, before KV sizing (so it is accounted for) and before any
+        CUDA-graph capture, which may be the first forward to reach it."""
+        if not envs.ATOM_V4_HCA_PERSIST:
+            return
+        why = "no HCA (ratio 128) layers" if not self.hca_layers else None
+        why = why or hca_persist.unusable_reason(
+            kv_fp8=self._kv_fp8, heads=self._local_heads, gfx=get_gfx()
+        )
+        if why is not None:
+            logger.info("V4 HCA persistent decode not used: %s", why)
+            return
+        hca_persist.prepare(self.device)
 
     def _decode_split_plan(
         self, rows: int, kv_len: int, split_indptr: torch.Tensor
