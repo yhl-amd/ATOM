@@ -59,6 +59,7 @@ from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils.device_info import get_num_sms
 
 from atom.model_ops.sparse_attn_v4 import _sparse_attn_ragged_torch
+from atom.model_ops.v4_kernels import hca_persist
 from atom.model_ops.v4_kernels.paged_decode_gluon import (
     _paged_decode_fused_gluon_kernel,
 )
@@ -985,24 +986,44 @@ def _sparse_attn_v4_paged_decode_prefill_asm(
     )
 
 
+# aiter never picks more than 16 KV splits for the v4 nm decode kernel.
+V4_DECODE_MAX_SPLITS = 16
+
+
+def v4_uniform_split_table(rows: int, device) -> torch.Tensor:
+    """``[V4_DECODE_MAX_SPLITS, rows + 1]`` int32; row ``s - 1`` is the uniform
+    ``split_indptr`` ``[0, s, 2s, ...]`` of ``s`` splits per row.
+
+    Built once, outside CUDA-graph capture, and never written again: every
+    split plan is a slice of it, so graphs of any size read constant memory and
+    no forward rewrites a plan before it runs.
+    """
+    splits = torch.arange(1, V4_DECODE_MAX_SPLITS + 1, dtype=torch.int32, device=device)
+    return splits[:, None] * torch.arange(rows + 1, dtype=torch.int32, device=device)
+
+
 def v4_decode_split_plan(
-    rows: int, heads: int, kv_len: int, split_indptr: torch.Tensor
+    rows: int, heads: int, kv_len: int, split_table: torch.Tensor
 ) -> tuple[int, torch.Tensor] | None:
     """aiter's KV split plan for the fp8 decode ASM kernel, or None.
 
     For a decode call of `rows` query rows (its `qo_indptr` has `rows + 1`
-    entries), `heads` local heads and at most `kv_len` KV per row. The plan's
-    `split_indptr` is written in place into the caller's persistent buffer, so
-    whoever owns a decode CSR builds its plan next to it and passes it on as
+    entries), `heads` local heads and at most `kv_len` KV per row. Host only:
+    aiter picks the split count ``s`` and the plan's ``split_indptr`` is row
+    ``s - 1`` of `split_table` (:func:`v4_uniform_split_table`), whose prefix
+    the decode call trims to its rows. Pass it on as
     ``sparse_attn_v4_paged_decode(..., split_plan=plan)``. None on aiter builds
-    before ROCm/aiter#5890, which leaves the split pick to aiter.
+    before ROCm/aiter#6126, which leaves the split pick to aiter.
     """
     import aiter.mla
 
-    plan_fn = getattr(aiter.mla, "get_mla_v4_nm_split_plan", None)
-    if plan_fn is None:
+    num_kv_splits = getattr(aiter.mla, "get_mla_v4_nm_num_kv_splits", None)
+    if num_kv_splits is None:
         return None
-    return plan_fn(rows, heads, kv_len, split_indptr=split_indptr)
+    s = num_kv_splits(rows, heads, kv_len)
+    if s > split_table.shape[0] or rows >= split_table.shape[1]:
+        return None  # outside the table: let aiter pick
+    return s, split_table[s - 1]
 
 
 def _sparse_attn_v4_paged_decode_asm(
@@ -1168,6 +1189,7 @@ def sparse_attn_v4_paged_decode(
     empty_kv_indptr: torch.Tensor | None = None,
     prefix: str = "",
     split_plan: tuple[int, torch.Tensor] | None = None,
+    compress_ratio: int | None = None,
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
@@ -1177,9 +1199,14 @@ def sparse_attn_v4_paged_decode(
     sparse-prefill ASM kernel with an empty extend stream. Both paths consume
     pre-packed fp8 Q and the fp8 NoPE + bf16 RoPE pools with no requant.
 
-    ``split_plan`` is aiter's ``MlaV4NmSplitPlan`` (``num_kv_splits``,
-    ``split_indptr``) for the decode ASM kernel, built by whoever built this
+    ``split_plan`` is ``(num_kv_splits, split_indptr)`` (:func:`v4_decode_split_plan`)
+    for the decode ASM kernel, built by whoever built this
     call's ``qo_indptr``; None leaves the split pick to aiter.
+
+    ``compress_ratio`` is the calling layer's ratio (0 SWA, 4 CSA, 128 HCA).
+    With ``ATOM_V4_HCA_PERSIST`` (default on), fp8 HCA calls with 128 heads on
+    gfx950 and ``ATOM_V4_HCA_PERSIST_MIN_ROWS <= rows <= 32768`` run aiter's
+    persistent kernel (``hca_persist``) instead; ``split_plan`` is then unused.
 
     Otherwise (bf16): the existing Triton / reference path. When ``kv_scales``
     is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and is dequantized
@@ -1201,6 +1228,26 @@ def sparse_attn_v4_paged_decode(
                 empty_kv_indptr,
                 attn_sink,
                 softmax_scale,
+                unified_kv_rope,
+                q_packed_in,
+                q_rope_in,
+            )
+        if (
+            q_packed_in is not None
+            and hca_persist.wanted(
+                compress_ratio=compress_ratio,
+                heads=q_packed_in.shape[1],
+                rows=q_packed_in.shape[0],
+                gfx=get_gfx(),
+            )
+            and hca_persist.layout_ok(unified_kv, unified_kv_rope)
+            and hca_persist.workspace_ready(q_packed_in.device)
+        ):
+            return hca_persist.hca_persist_decode(
+                unified_kv,
+                kv_indices,
+                kv_indptr,
+                attn_sink,
                 unified_kv_rope,
                 q_packed_in,
                 q_rope_in,

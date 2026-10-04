@@ -112,6 +112,7 @@ from atom.model_ops.v4_kernels import (
     csa_translate_pack,
     fp4_indexer_enabled,
     fused_compress_attn,
+    hca_persist,
     inverse_rope_inplace,
     qk_norm_rope_maybe_quant,
     scale_indexer_weights,
@@ -837,9 +838,9 @@ def _wo_a_block_scale_to_e8m0(
     """
     s = scale.detach()
     if s.element_size() == 1:
-        # ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE allocates weight_scale as
-        # dtypes.fp8_e8m0, which aiter resolves to torch.uint8 when the torch
-        # build has no float8_e8m0fnu. Those bytes are already biased
+        # E8M0 block scales (QuantizationConfig.blockscale_e8m0_scale) allocate
+        # weight_scale as dtypes.fp8_e8m0, which aiter resolves to torch.uint8
+        # when the torch build has no float8_e8m0fnu. Those bytes are already biased
         # exponents, so the float path would read 127 as a magnitude and
         # return 134; a native float8_e8m0fnu byte is the same exponent.
         e = s.view(torch.uint8)
@@ -2631,6 +2632,14 @@ class DeepseekV4Attention(nn.Module):
         # traces unchanged. The rope planes (swa_plane_rope / unified_kv_rope) are
         # bound onto the module by DeepseekV4AttentionMetadataBuilder.
         self.kv_fp8 = atom_config.kv_cache_dtype == "fp8"
+        # Persistent HCA decode workspace: allocate at model load (before KV
+        # sizing and graph capture) on every serving path, native or plugin.
+        if self.compress_ratio == hca_persist.HCA_RATIO:
+            hca_persist.prepare_if_usable(
+                kv_fp8=self.kv_fp8,
+                heads=self.n_local_heads,
+                gfx=arch,
+            )
 
     def process_weights_after_loading(self) -> None:
         """Prepare wo_a (FP8 + e8m0 block scale) for the grouped output LoRA.
@@ -3340,6 +3349,7 @@ class DeepseekV4Attention(nn.Module):
                 empty_kv_indptr=attn_md.empty_kv_indptr,
                 prefix=f"{self.layer_name}.sparse_attn_decode",
                 split_plan=split_plan,
+                compress_ratio=ratio,
             )  # [S, H, head_dim]
         else:
             # Two-source paged prefill: prefix from `unified_kv` (per-ratio
