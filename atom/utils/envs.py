@@ -138,6 +138,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
         os.getenv("ATOM_PREFIX_CACHE_PROTECTED_RATIO", "0.5")
     ),
+    # Log one `[PREFIX-GAP]` line per admitted prefill: prompt length, the
+    # compressed-KV hit, the hit a checkpoint at every boundary would reach, and
+    # the admitted hit. Their gap is reuse the state gate declined.
+    "ATOM_LOG_PREFIX_GAP": lambda: os.getenv("ATOM_LOG_PREFIX_GAP", "0").lower()
+    in {"1", "true", "yes", "on"},
     # LMCache KV offload without --kv-transfer-config: "lmcache" (in-process) or
     # "lmcache_mp" (standalone `lmcache server`). Unset = off.
     "ATOM_KV_OFFLOAD": lambda: os.getenv("ATOM_KV_OFFLOAD", ""),

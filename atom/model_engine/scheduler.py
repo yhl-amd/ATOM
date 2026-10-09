@@ -2633,6 +2633,16 @@ class Scheduler:
                 num_reusable_tokens,
                 num_offload_tokens=offload_tokens,
             )
+        if envs.ATOM_LOG_PREFIX_GAP:
+            hbs = self.block_manager.hash_block_size
+            logger.info(
+                "[PREFIX-GAP] seq=%d prompt=%d compressed=%d wanted=%d cached=%d",
+                seq.id,
+                seq.num_prompt_tokens,
+                seq.num_compressed_hit_blocks * hbs,
+                seq.num_wanted_hit_blocks * hbs,
+                seq.num_cached_tokens,
+            )
 
     def _schedule_prefill_seq(
         self,
