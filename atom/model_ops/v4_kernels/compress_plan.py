@@ -115,6 +115,7 @@ def make_compress_plans(
     max_q_len: int | None = None,
     decode_capacity_per_ratio: dict[int, int] | None = None,
     extra_write: int,
+    compress_floor_cpu: np.ndarray | None = None,
 ) -> dict[int, CompressPlan]:
     """Build a CompressPlan per (ratio, overlap) variant.
 
@@ -188,6 +189,13 @@ def make_compress_plans(
                     is invisible wherever `K_pool >= 1 + max_spec_steps` (V4: 8
                     and 128), which is exactly why nobody should get it by
                     default.
+      compress_floor_cpu: optional np[bs] int — per seq, the first position
+                    whose compression boundary this fwd may write. Boundaries
+                    below it are dropped from the compress plan: they belong to
+                    a replayed prefix whose compressed entries are already in
+                    shared cached blocks (see `Sequence.replay_end`), and the
+                    replay's state at those positions is not exact anyway. The
+                    write plan is untouched. None (or all zeros) drops nothing.
 
     Returns:
       dict[ratio] -> CompressPlan. On empty fwd (`extend_lens_cpu.sum() == 0`)
@@ -305,6 +313,10 @@ def make_compress_plans(
     plan_rows[:, 0] = ragged_ids
     plan_rows[:, 1] = batch_ids
     plan_rows[:, 2] = positions
+    above_floor = None
+    if compress_floor_cpu is not None and np.any(compress_floor_cpu):
+        floor = np.ascontiguousarray(compress_floor_cpu[:bs], dtype=np.int32)
+        above_floor = positions >= floor[batch_ids]
 
     for ratio, is_overlap in unique_ratios_overlap:
         K = ratio * (2 if is_overlap else 1)
@@ -318,6 +330,8 @@ def make_compress_plans(
 
         # compress: token at a compression boundary
         compress_mask = (positions + 1) % ratio == 0
+        if above_floor is not None:
+            compress_mask &= above_floor
         compress_plan = plan_rows[compress_mask]
         # cu_compress: per-seq prefix-sum of boundary counts (for caller slicing).
         # bincount preserves seq order because compress_plan rows are already

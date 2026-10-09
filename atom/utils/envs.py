@@ -143,6 +143,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the admitted hit. Their gap is reuse the state gate declined.
     "ATOM_LOG_PREFIX_GAP": lambda: os.getenv("ATOM_LOG_PREFIX_GAP", "0").lower()
     in {"1", "true", "yes", "on"},
+    # DeepSeek-V4 bounded replay: when the compressed history hits further than
+    # the nearest state checkpoint by more than the window's receptive field,
+    # keep the whole hit and recompute only that field (W + (L-1)(W-1) tokens)
+    # to rebuild every layer's window and compressor state exactly.
+    "ATOM_DSV4_STATE_REPLAY": lambda: os.getenv("ATOM_DSV4_STATE_REPLAY", "0").lower()
+    in {"1", "true", "yes", "on"},
+    # Experiments only: replay this many tokens instead of the receptive field.
+    # Anything shorter is no longer exact. 0 = the receptive field.
+    "ATOM_DSV4_STATE_REPLAY_TOKENS": lambda: int(
+        os.getenv("ATOM_DSV4_STATE_REPLAY_TOKENS", "0")
+    ),
     # LMCache KV offload without --kv-transfer-config: "lmcache" (in-process) or
     # "lmcache_mp" (standalone `lmcache server`). Unset = off.
     "ATOM_KV_OFFLOAD": lambda: os.getenv("ATOM_KV_OFFLOAD", ""),

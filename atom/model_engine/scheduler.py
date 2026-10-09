@@ -267,6 +267,18 @@ class ScheduledBatch:
         )
 
         self.is_final_chunk = is_final_chunk
+        # Per seq, the bounded-replay window (`Sequence.replay_start` /
+        # `replay_end`), 0 where the seq does not replay. Read by the V4
+        # prefill builder; a batch with no replay leaves `state_replay_end` None.
+        self.state_replay_start = None
+        self.state_replay_end = None
+        if any(seq.replay_end for seq in seqs.values()):
+            self.state_replay_start = np.asarray(
+                [seq.replay_start for seq in seqs.values()], dtype=np.int32
+            )
+            self.state_replay_end = np.asarray(
+                [seq.replay_end for seq in seqs.values()], dtype=np.int32
+            )
         # Per seq, the token following this forward where the scheduler knows it
         # (a middle prefill chunk's successor prompt token), -1 where sampling
         # supplies it. A drafter runs one position ahead of the target, so this
@@ -815,7 +827,7 @@ class Scheduler:
                     # fill or mistake an individually fitting request for idle.
                     prefillable = True
                     break
-                cached = cached_blocks * self.block_manager.hash_block_size
+                cached = self.block_manager.prefill_start_tokens(seq, cached_blocks)
             remaining = (
                 seq.num_tokens - cached
                 if offload_resume
@@ -1801,7 +1813,7 @@ class Scheduler:
             # the token_ids, so num_tokens > num_prompt_tokens and those tokens
             # still need KV recomputed.
             num_new_tokens = self._new_prefill_tokens(
-                seq, num_cached_blocks * self.block_manager.hash_block_size
+                seq, self.block_manager.prefill_start_tokens(seq, num_cached_blocks)
             )
             if (
                 self._local_prefill_coalescing
@@ -2636,12 +2648,14 @@ class Scheduler:
         if envs.ATOM_LOG_PREFIX_GAP:
             hbs = self.block_manager.hash_block_size
             logger.info(
-                "[PREFIX-GAP] seq=%d prompt=%d compressed=%d wanted=%d cached=%d",
+                "[PREFIX-GAP] seq=%d prompt=%d compressed=%d wanted=%d cached=%d "
+                "replay_end=%d",
                 seq.id,
                 seq.num_prompt_tokens,
                 seq.num_compressed_hit_blocks * hbs,
                 seq.num_wanted_hit_blocks * hbs,
                 seq.num_cached_tokens,
+                seq.replay_end,
             )
 
     def _schedule_prefill_seq(
