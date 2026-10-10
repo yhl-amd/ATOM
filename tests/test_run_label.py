@@ -290,15 +290,25 @@ class TestPrefillAttentionSpan:
             num_scheduled_tokens=np.asarray([3000, 2000], dtype=np.int32),
         )
         lbl = build_run_label(
-            is_prefill=True, use_cudagraph=False, is_dummy=False, tbo_on=False,
-            scheduled_bs=2, batch=batch, running_bs=2,
+            is_prefill=True,
+            use_cudagraph=False,
+            is_dummy=False,
+            tbo_on=False,
+            scheduled_bs=2,
+            batch=batch,
+            running_bs=2,
         )
         # 3000 * (4000 - 1500) + 2000 * (2000 - 1000) = 9.5M
         assert "nctx=9.5M" in lbl
 
     def test_no_nctx_without_scheduled_tokens(self):
         lbl = build_run_label(
-            is_prefill=True, use_cudagraph=False, is_dummy=False, tbo_on=False,
-            scheduled_bs=1, batch=prefill_batch(100, [100]), running_bs=1,
+            is_prefill=True,
+            use_cudagraph=False,
+            is_dummy=False,
+            tbo_on=False,
+            scheduled_bs=1,
+            batch=prefill_batch(100, [100]),
+            running_bs=1,
         )
         assert "nctx=" not in lbl
