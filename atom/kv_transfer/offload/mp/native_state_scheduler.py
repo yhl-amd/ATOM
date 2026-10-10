@@ -130,6 +130,11 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         self._kv_reach: dict[str, tuple[Any, int | None]] = {}
         # Requests whose KV-only lookup session must be ended with them.
         self._kv_sessions: set[str] = set()
+        # Requests parked for a load the next dispatch has yet to send, and
+        # those whose load it dropped instead: nothing will ever report on
+        # those, so `process_completions` wakes them as failed loads.
+        self._parked_loads: dict[str, Any] = {}
+        self._dropped_parked_loads: set[Any] = set()
 
     def can_partially_deallocate_state(self, seq: Any) -> bool:
         """The checkpoint coordinator owns state sources past request free.
@@ -307,12 +312,27 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
 
     def should_park_for_load_after_alloc(self, seq: Any) -> bool:
         parks = super().should_park_for_load_after_alloc(seq)
-        if not parks and getattr(seq, "replay_kv_load", False):
+        if parks:
+            self._parked_loads[str(seq.id)] = seq
+        elif getattr(seq, "replay_kv_load", False):
             # The load was refused (and `_clear_pending_load` gave its locks
             # back): the slot is fresh and the KV past the HBM hit is missing,
             # so replay below the HBM hit.
             self._block_manager.fall_back_to_hbm_replay(seq)
         return parks
+
+    def _ensure_lookup_pin(self, seq: Any, sid: str, spec) -> bool:
+        operation = self._native_load_operations.get(sid)
+        lease = self._native_loads.get(operation)
+        if lease is None or lease.seq is not seq or not lease.transfer.kv_only:
+            return super()._ensure_lookup_pin(seq, sid, spec)
+        # A KV-only load reads under the KV-only lookup, whose locks nothing
+        # has released since it answered (no dispatch unpins it). The ordinary
+        # lookup asks for an image at the end as well, so asking it again --
+        # what the base does for a load admitted on a remembered hit -- falls
+        # short of any reach past the last image and drops every such load.
+        hit = self._lookup_client.hit_tokens(kv_only_lookup_id(sid))
+        return hit is not None and int(hit) >= int(spec.lmcache_cached_tokens)
 
     def _save_frontier(self, seq: Any) -> int:
         if not getattr(seq, "has_per_req_cache", False):
@@ -533,6 +553,23 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
 
     def build_connector_meta(self):
         metadata = super().build_connector_meta()
+        # Every load parked since the last dispatch was sent or dropped just
+        # now. A dropped one leaves its request parked with no transfer to
+        # report on it.
+        sent = {
+            request.req_id
+            for request in metadata.requests
+            if request.load_operation is not None
+        }
+        for seq in self._parked_loads.values():
+            if seq.id not in sent and not self._has_active_load(seq):
+                logger.warning(
+                    "LMCache MP load for parked request %s was dropped at "
+                    "dispatch; waking it to prefill",
+                    seq.id,
+                )
+                self._dropped_parked_loads.add(seq.id)
+        self._parked_loads.clear()
         for request in metadata.requests:
             if request.load_operation is not None:
                 transfer = self._native_loads[request.load_operation].transfer
@@ -697,6 +734,10 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             if not self.should_defer_free(seq):
                 output.finished_saving.add(seq.id)
                 self._finish_retired_request(sid)
+        # The scheduler wakes a failed load to prefill (a KV-only one to
+        # replay below its HBM hit), exactly as it would a transfer that ran.
+        output.failed_loading.update(self._dropped_parked_loads)
+        self._dropped_parked_loads.clear()
         return output
 
     def _live_transfers(self) -> set[Any]:

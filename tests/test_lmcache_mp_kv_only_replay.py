@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
-from atom.kv_transfer.disaggregation.types import LoadOperationId
+from atom.kv_transfer.disaggregation.types import KVConnectorOutput, LoadOperationId
 from atom.kv_transfer.offload.mp import deployment
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp.lookup import (
@@ -306,3 +306,52 @@ def test_a_kv_only_reach_below_the_state_reach_is_not_trusted(monkeypatch):
     scheduler.prefetch_lookups(iter([seq]))  # the scheduler passes an iterator
     scheduler.get_num_new_matched_tokens(seq)
     assert seq.offload_joint.kv_only_tokens == 0
+
+
+def _admit_on_a_remembered_hit(scheduler, seq):
+    """Asked in one step, admitted in a later one on the remembered answer."""
+    scheduler.prefetch_lookups(iter([seq]))  # the scheduler passes an iterator
+    assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
+    # Not admitted this step (no room, say): its dispatch unpins the ordinary
+    # lookup, which no load took.
+    assert scheduler.build_connector_meta().requests == []
+    return _admit_kv_only(scheduler, seq, hbm=8)
+
+
+def test_a_kv_only_load_admitted_on_a_remembered_hit_still_loads(monkeypatch):
+    # No image anywhere (the ordinary lookup answers 0), PAGE KV to 32.
+    scheduler, _, adapter, fallbacks = _scheduler(monkeypatch, chunks=0, kv_chunks=4)
+    seq = _seq()
+    assert _admit_on_a_remembered_hit(scheduler, seq) == 32
+    scheduler.update_state_after_alloc(seq)
+    assert scheduler.should_park_for_load_after_alloc(seq)
+    # The dispatch confirms the KV-only lookup it reads under, not the
+    # ordinary one, which can never promise KV past the last image.
+    [request] = scheduler.build_connector_meta().requests
+    assert request.native_state.kv_only
+    assert request.load_spec.lmcache_cached_tokens == 32
+    kv_session = deployment._mp_session_id(scheduler._config, kv_only_lookup_id("1"))
+    assert any(
+        f["request_id"] == kv_session and (f["start"], f["end"]) == (0, 8)
+        for f in adapter.freed
+    )
+    assert fallbacks == []
+    output = scheduler.process_completions(KVConnectorOutput())
+    assert output.failed_loading == set()
+
+
+def test_a_parked_load_dropped_at_dispatch_wakes_its_request(monkeypatch):
+    scheduler, _, _, _ = _scheduler(monkeypatch, chunks=0, kv_chunks=4)
+    seq = _seq()
+    _admit_on_a_remembered_hit(scheduler, seq)
+    scheduler.update_state_after_alloc(seq)
+    assert scheduler.should_park_for_load_after_alloc(seq)
+    # The KV-only lookup no longer holds the reach the load was aimed at.
+    monkeypatch.setattr(scheduler._lookup_client, "hit_tokens", lambda _id: 16)
+    assert scheduler.build_connector_meta().requests == []
+    assert scheduler._native_loads == {}
+    # Parked, with no transfer left to report: woken as a failed load, which
+    # the scheduler turns into a replay below the HBM hit.
+    output = scheduler.process_completions(KVConnectorOutput())
+    assert output.failed_loading == {seq.id}
+    assert scheduler.process_completions(KVConnectorOutput()).failed_loading == set()
