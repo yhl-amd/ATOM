@@ -181,6 +181,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_DP_SESSION_AFFINITY", "0"
     ).lower()
     in {"1", "true", "yes", "on"},
+    # --- DP prefill cost balancing ---
+    # Under DP attention every rank prefills in the same lockstep step and the
+    # step lasts as long as the slowest rank. With the same token budget, a rank
+    # whose chunk attends long contexts is that straggler. When on, the ranks
+    # agree each prefill step on the largest estimated chunk cost (cost of a
+    # chunk = new tokens x (TOKEN_WEIGHT + prior context + new / 2)), and a
+    # rank below it takes more tokens, up to --max-num-batched-tokens, until it
+    # reaches that cost. Ranks start from BASE_TOKENS (0 = the whole
+    # --max-num-batched-tokens, which leaves no room to grow).
+    "ATOM_DP_PREFILL_COST_BALANCE": lambda: _flag_env("ATOM_DP_PREFILL_COST_BALANCE"),
+    "ATOM_DP_PREFILL_BALANCE_BASE_TOKENS": lambda: _int_env(
+        "ATOM_DP_PREFILL_BALANCE_BASE_TOKENS", 0
+    ),
+    "ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT": lambda: _int_env(
+        "ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT", 65536
+    ),
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # SGLang's GLM-5.2 and DeepSeek V4 prefill CP paths still force

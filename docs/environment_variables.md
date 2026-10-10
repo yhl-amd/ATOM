@@ -19,6 +19,9 @@ This document describes the environment variables used in the ATOM project.
 | **ATOM_DP_MASTER_PORT** | int | 29500 | Master port for DP ranks coordination. |
 | **ATOM_DP_LB_REQ_EQUIV** | int | 512 | Token-equivalent decode pressure assigned to each in-flight request by `least_tokens` routing. |
 | **ATOM_DP_SESSION_AFFINITY** | bool | false | Load-place each new session, then keep later turns on the same prefix-cache owner. Reads `X-Dynamo-Session-ID`, falling back to `X-Correlation-ID`. |
+| **ATOM_DP_PREFILL_COST_BALANCE** | bool | false | Balance each lockstep DP prefill step by estimated cost: ranks agree on the costliest chunk and a cheaper rank takes more tokens, up to `--max-num-batched-tokens`, until it reaches that cost. |
+| **ATOM_DP_PREFILL_BALANCE_BASE_TOKENS** | int | 0 | Base prefill chunk per rank under cost balancing (0 = the whole `--max-num-batched-tokens`, which leaves no room to grow). |
+| **ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT** | int | 65536 | Per-token term of the chunk cost estimate, in attended-context tokens: cost = new tokens x (weight + prior context + new / 2). |
 
 ## Prefill delayer (TP/DCP and DP attention)
 

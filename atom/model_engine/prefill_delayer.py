@@ -117,6 +117,7 @@ class PrefillDelayer:
         "_stat_hold",
         "_stat_hold_decode_interval",
         "_stat_log_every",
+        "any_rank_prefillable",
         "cpu_group",
         "dp_size",
         "kv_high_watermark",
@@ -216,6 +217,7 @@ class PrefillDelayer:
         self._first = True
         self._decode_interval_remaining = 0
         self._prefill_executed_since_last_decision = False
+        self.any_rank_prefillable = False
 
         # Per-exit fire counters + hold counter for periodic logging. Each exit
         # is counted separately so the log shows WHICH reason released prefill —
@@ -348,6 +350,7 @@ class PrefillDelayer:
                     "prefill and deferring to the DP-state shutdown barrier."
                 )
                 self._reset()
+                self.any_rank_prefillable = False
                 return True
 
         # One host<-device readback for all 8 slots (a single .tolist() beats
@@ -365,6 +368,10 @@ class PrefillDelayer:
         # This local execution report has now participated in the global
         # decision. A later successful prefill forward sets it again.
         self._prefill_executed_since_last_decision = False
+        # Identical on every rank (it comes from the reduced buffer): whether
+        # any rank has prefill work this tick. A FIRE with this set is where
+        # the ranks may run one more lockstep collective (max_across_ranks).
+        self.any_rank_prefillable = n_prefillable > 0
         any_kv_high = kv_high_n > 0
         any_kv_low = kv_low_n > 0
         any_partial = partial_n > 0
@@ -452,6 +459,21 @@ class PrefillDelayer:
         self._reset()
         self._maybe_log()
         return True
+
+    def max_across_ranks(self, value: float) -> float:
+        """Largest ``value`` over the DP ranks (this rank's own value locally).
+
+        A lockstep collective like ``should_allow_prefill``: every rank must call
+        it on the same tick, which holds when the call is conditioned on that
+        tick's (rank-identical) decision.
+        """
+        if self.cpu_group is None:
+            return value
+        buf = torch.tensor([float(value)], dtype=torch.float64)
+        torch.distributed.all_reduce(
+            buf, op=torch.distributed.ReduceOp.MAX, group=self.cpu_group
+        )
+        return float(buf.item())
 
     def notify_prefill_executed(self) -> None:
         """Report a completed local prefill forward.

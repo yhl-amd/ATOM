@@ -207,7 +207,9 @@ class EngineCore:
             PrefillDelayer(
                 dp_size=config.parallel_config.data_parallel_size,
                 cpu_group=cpu_group,
-                max_num_batched_tokens=config.max_num_batched_tokens,
+                # The base chunk under DP prefill cost balancing; the whole
+                # batch budget otherwise.
+                max_num_batched_tokens=self.scheduler.prefill_base_tokens,
                 target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
                 ttft_max_ticks=envs.ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS,
                 partial_max_ticks=envs.ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS,
