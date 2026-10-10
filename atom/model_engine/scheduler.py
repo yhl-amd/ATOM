@@ -1859,8 +1859,12 @@ class Scheduler:
 
             self._notify_connector_after_prefill_alloc(seq)
 
+            # A replay that loads its KV first parks for that load whatever the
+            # lookup answered: the answer was the state-carrying hit, which a
+            # KV-only reach can exceed. Running the forward instead would start
+            # under the replay's floors before the KV below them arrived.
             needs_remote_load = self._confirm_remote_load_after_alloc(
-                seq, needs_remote_load
+                seq, needs_remote_load or getattr(seq, "replay_kv_load", False)
             )
 
             if needs_remote_load:
