@@ -2649,13 +2649,17 @@ class Scheduler:
             hbs = self.block_manager.hash_block_size
             logger.info(
                 "[PREFIX-GAP] seq=%d prompt=%d compressed=%d wanted=%d cached=%d "
-                "replay_end=%d",
+                "replay_end=%d lmcache=%d joint=%d",
                 seq.id,
                 seq.num_prompt_tokens,
                 seq.num_compressed_hit_blocks * hbs,
                 seq.num_wanted_hit_blocks * hbs,
                 seq.num_cached_tokens,
                 seq.replay_end,
+                # The KV tier's reach and the boundary both legs settled on;
+                # 0 without an offload connector.
+                int(seq.offload_joint.kv_prefix_tokens or 0),
+                int(seq.offload_joint.boundary_tokens or 0),
             )
 
     def _schedule_prefill_seq(
