@@ -193,6 +193,9 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
     # own session and locks, and `BlockManager._replay_hit` weighs its answer.
 
     def prefetch_lookups(self, seqs) -> None:
+        # The scheduler hands over an iterator (a slice of `waiting`), which
+        # the base would exhaust before the loop below sees a single request.
+        seqs = list(seqs)
         super().prefetch_lookups(seqs)
         if not self._replay_tokens:
             return

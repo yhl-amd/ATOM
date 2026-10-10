@@ -166,7 +166,7 @@ def _seq(count=40):
 
 def _admit_kv_only(scheduler, seq, *, hbm):
     """What `BlockManager._replay_hit` and `allocate` leave for a KV-only load."""
-    scheduler.prefetch_lookups([seq])
+    scheduler.prefetch_lookups(iter([seq]))  # the scheduler passes an iterator
     assert not scheduler.lookup_pending(seq)
     scheduler.get_num_new_matched_tokens(seq)
     reach = seq.offload_joint.kv_only_tokens
@@ -199,7 +199,7 @@ def test_kv_only_lookup_restricts_the_key_to_page():
 def test_both_lookups_run_and_the_reach_is_recorded(monkeypatch):
     scheduler, _, adapter, _ = _scheduler(monkeypatch, chunks=1, kv_chunks=4)
     seq = _seq()
-    scheduler.prefetch_lookups([seq])
+    scheduler.prefetch_lookups(iter([seq]))  # the scheduler passes an iterator
     assert set(adapter._client.keys) == {
         deployment._mp_session_id(scheduler._config, "1"),
         deployment._mp_session_id(scheduler._config, kv_only_lookup_id("1")),
@@ -213,7 +213,7 @@ def test_both_lookups_run_and_the_reach_is_recorded(monkeypatch):
 def test_no_kv_only_lookup_with_replay_off(monkeypatch):
     scheduler, _, adapter, _ = _scheduler(monkeypatch, chunks=1, kv_chunks=4, replay=0)
     seq = _seq()
-    scheduler.prefetch_lookups([seq])
+    scheduler.prefetch_lookups(iter([seq]))  # the scheduler passes an iterator
     assert len(adapter._client.keys) == 1
     scheduler.get_num_new_matched_tokens(seq)
     assert seq.offload_joint.kv_only_tokens == 0
@@ -277,7 +277,7 @@ def test_a_refused_kv_only_load_falls_back_and_returns_its_locks(monkeypatch):
 def test_an_unused_kv_only_lookup_returns_its_locks_at_admission(monkeypatch):
     scheduler, _, adapter, _ = _scheduler(monkeypatch, chunks=1, kv_chunks=4)
     seq = _seq()
-    scheduler.prefetch_lookups([seq])
+    scheduler.prefetch_lookups(iter([seq]))  # the scheduler passes an iterator
     scheduler.get_num_new_matched_tokens(seq)
     seq.num_cached_tokens = 0  # an ordinary admission: no replay chosen
     scheduler.update_state_after_alloc(seq)
@@ -291,7 +291,7 @@ def test_an_unused_kv_only_lookup_returns_its_locks_at_admission(monkeypatch):
 def test_a_replay_from_hbm_never_loads(monkeypatch):
     scheduler, _, _, _ = _scheduler(monkeypatch, chunks=1, kv_chunks=4)
     seq = _seq()
-    scheduler.prefetch_lookups([seq])
+    scheduler.prefetch_lookups(iter([seq]))  # the scheduler passes an iterator
     scheduler.get_num_new_matched_tokens(seq)
     seq.num_cached_tokens = 3  # replay_start, below claimed blocks
     seq.replay_end, seq.replay_start = 16, 3
@@ -303,6 +303,6 @@ def test_a_replay_from_hbm_never_loads(monkeypatch):
 def test_a_kv_only_reach_below_the_state_reach_is_not_trusted(monkeypatch):
     scheduler, _, _, _ = _scheduler(monkeypatch, chunks=3, kv_chunks=1)
     seq = _seq()
-    scheduler.prefetch_lookups([seq])
+    scheduler.prefetch_lookups(iter([seq]))  # the scheduler passes an iterator
     scheduler.get_num_new_matched_tokens(seq)
     assert seq.offload_joint.kv_only_tokens == 0
