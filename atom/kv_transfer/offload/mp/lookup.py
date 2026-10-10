@@ -167,6 +167,8 @@ class _MPLookupClient:
         back to a synchronous lookup of its own (which would not carry the
         submitted lookup's options).
         """
+        if lookup_id in self._async_hits:
+            return True
         request_id = _mp_session_id(self._config, lookup_id)
         return request_id in self._adapter._lookup_results
 

@@ -608,9 +608,12 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
                 self._active_load_operations.pop(sid, None)
             if getattr(lease.seq, "_load_operation", None) == operation:
                 delattr(lease.seq, "_load_operation")
-        if self._replay_tokens:
+        if self._replay_tokens and sid not in self._kv_reach:
             # A KV-only load dropped before its retrieve: its lookup's locks
             # come back too. A no-op once the retrieve owns them, or with none.
+            # While `_kv_reach` holds the lookup it is not weighed yet -- an
+            # ordinary hit HBM already covers lands here first -- and
+            # `_drop_kv_reach` gives it back if nothing uses it.
             self._lookup_client.clear_lookup_status(kv_only_lookup_id(sid))
         super()._clear_pending_load(sid)
 

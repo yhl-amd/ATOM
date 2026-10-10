@@ -355,3 +355,17 @@ def test_a_parked_load_dropped_at_dispatch_wakes_its_request(monkeypatch):
     output = scheduler.process_completions(KVConnectorOutput())
     assert output.failed_loading == {seq.id}
     assert scheduler.process_completions(KVConnectorOutput()).failed_loading == set()
+
+
+def test_an_ordinary_hit_inside_hbm_keeps_the_kv_only_reach(monkeypatch):
+    # HBM already holds the ordinary (image-carrying) hit, so no ordinary load
+    # is armed; the PAGE KV past it is exactly what a replay can still use.
+    scheduler, _, adapter, _ = _scheduler(monkeypatch, chunks=1, kv_chunks=4)
+    seq = _seq()
+    seq.num_cached_tokens = CHUNK
+    scheduler.prefetch_lookups(iter([seq]))  # the scheduler passes an iterator
+    assert not scheduler.lookup_pending(seq)
+    assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
+    assert seq.offload_joint.kv_only_tokens == 4 * CHUNK
+    kv_session = deployment._mp_session_id(scheduler._config, kv_only_lookup_id("1"))
+    assert not any(f["request_id"] == kv_session for f in adapter.freed)
