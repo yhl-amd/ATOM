@@ -79,6 +79,20 @@ def _make_all_cleared() -> AllBlocksCleared:
     return AllBlocksCleared()
 
 
+def _connector_replays(kv_transfer_config: dict | None) -> bool:
+    """Whether a bounded replay can coexist with this KV connector.
+
+    None at all, or LMCache MP offload alone: its native-state scheduler is the
+    one connector whose loads know about a replay (`Sequence.replay_kv_load`).
+    """
+    if not kv_transfer_config:
+        return True
+    return (
+        kv_transfer_config.get("kv_connector") == "lmcache_mp"
+        and kv_transfer_config.get("kv_role") == "offload"
+    )
+
+
 @dataclass(frozen=True)
 class JointBoundaryDecision:
     """The outcome of the joint-boundary computation, as a value.
@@ -522,7 +536,7 @@ class BlockManager:
         and never fail.
         """
         # The recompute fills the private blocks itself, so nothing is replayed.
-        seq.replay_start = seq.replay_end = 0
+        seq.clear_replay()
         if not self.enable_prefix_caching:
             return True
         table = seq.block_table
@@ -685,12 +699,13 @@ class BlockManager:
             reason = f"speculative method {method!r}"
         elif config.prefill_context_parallel_size > 1 or self.dcp_world_size > 1:
             reason = "context parallelism"
-        elif getattr(config, "kv_transfer_config", None):
+        elif not _connector_replays(getattr(config, "kv_transfer_config", None)):
             # Every connector load starts at `num_cached_tokens` and raises it
             # when the load lands, and a replay moves exactly that field below
-            # blocks it has claimed: an LMCache MP load would write those
-            # shared blocks and resume past the replay. Not wired up yet.
-            reason = "a KV connector (connector loads do not replay yet)"
+            # blocks it has claimed: a load that does not know about the
+            # replay would write those shared blocks and resume past it. Only
+            # LMCache MP's native-state scheduler is taught to (`replay_kv_load`).
+            reason = "a KV connector other than lmcache_mp offload"
         if reason is not None:
             logger.warning("[State Cache] bounded replay off: %s.", reason)
             return 0
@@ -719,18 +734,37 @@ class BlockManager:
     def _replay_hit(self, seq: Sequence, compressed_hit: int, hit: int) -> int:
         """`hit` widened to `compressed_hit` when replaying is cheaper.
 
-        Resuming from the checkpoint at `hit` recomputes `compressed_hit - hit`
-        blocks; replaying recomputes `state_replay_tokens`. Records the replay
-        window on `seq` when it wins, clears it otherwise.
+        Without a replay the forward resumes at the checkpoint `hit`, or at the
+        LMCache MP hit (`kv_prefix_tokens`) if it is further, which brings its
+        state image along. A replay resumes `state_replay_tokens` below the
+        furthest full-attention KV: the HBM `compressed_hit`, or LMCache's
+        KV-only reach (`kv_only_tokens`) when that is further, in which case
+        the KV past the HBM hit is loaded first (`replay_kv_load`). Records the
+        replay window on `seq` when it wins, clears it otherwise.
         """
-        seq.replay_start = seq.replay_end = 0
+        seq.clear_replay()
         if not self.state_replay_tokens or not seq.has_per_req_cache:
             return hit
-        end = compressed_hit * self.hash_block_size
-        if end - hit * self.hash_block_size <= self.state_replay_tokens:
+        hbs = self.hash_block_size
+        # The connector skips a load under OFFLOAD_MIN_LOAD_TOKENS, so neither
+        # LMCache figure counts unless it clears that above where it starts.
+        min_load = envs.OFFLOAD_MIN_LOAD_TOKENS
+        resume = hit * hbs
+        tier_hit = int(seq.offload_joint.kv_prefix_tokens or 0)
+        if tier_hit - resume >= min_load:
+            resume = tier_hit
+        in_hbm = compressed_hit * hbs
+        end = in_hbm
+        tier_kv = int(seq.offload_joint.kv_only_tokens or 0)
+        if tier_kv - in_hbm >= min_load:
+            end = tier_kv
+        if end - resume <= self.state_replay_tokens:
             return hit
         seq.replay_end = end
         seq.replay_start = end - self.state_replay_tokens
+        if end > in_hbm:
+            seq.replay_kv_load = True
+            seq.replay_load_start = in_hbm
         return compressed_hit
 
     def prefill_start_tokens(self, seq: Sequence, num_cached_blocks: int) -> int:
@@ -741,6 +775,33 @@ class BlockManager:
         if seq.replay_end:
             return seq.replay_start
         return num_cached_blocks * self.hash_block_size
+
+    def begin_loaded_replay(self, seq: Sequence) -> None:
+        """A replay's KV-only load landed: the forward starts at the replay.
+
+        `[replay_load_start, replay_end)` is now published KV like the claimed
+        prefix below it, and as read-only to this forward.
+        """
+        seq.replay_kv_load = False
+        seq.replay_load_start = 0
+        seq.num_cached_tokens = seq.replay_start
+        seq.num_hashed_tokens = max(seq.num_hashed_tokens, seq.replay_end)
+
+    def fall_back_to_hbm_replay(self, seq: Sequence) -> None:
+        """A replay's KV-only load failed: replay below the HBM hit instead.
+
+        The state slot is fresh, so the HBM hit is no place to resume; the
+        blocks past it were never published and the forward rewrites them.
+        """
+        end = seq.replay_load_start
+        seq.clear_replay()
+        if end <= 0:
+            seq.num_cached_tokens = 0
+            return
+        seq.replay_end = end
+        seq.replay_start = max(0, end - self.state_replay_tokens)
+        seq.num_cached_tokens = seq.replay_start
+        seq.num_hashed_tokens = max(seq.num_hashed_tokens, end)
 
     def _gated_hit(
         self,
@@ -1199,8 +1260,14 @@ class BlockManager:
             # A replay starts from a fresh state slot, never a checkpoint. If
             # the claim above stopped short of the hit, replay to where it
             # stopped instead: the floors below it still hold, and the blocks
-            # that were claimed must not be rewritten either way.
-            seq.replay_end = min(seq.replay_end, num_cached_blocks * hbs)
+            # that were claimed must not be rewritten either way. A KV load
+            # past the hit is dropped then too -- it would start above a gap.
+            claimed = num_cached_blocks * hbs
+            if seq.replay_kv_load and claimed < seq.replay_load_start:
+                seq.replay_kv_load = False
+                seq.replay_load_start = 0
+            if not seq.replay_kv_load:
+                seq.replay_end = min(seq.replay_end, claimed)
             seq.replay_start = max(0, seq.replay_end - self.state_replay_tokens)
             hit_hash = -1
         # Pin the restore before fresh blocks can evict its checkpoint.
@@ -1225,7 +1292,12 @@ class BlockManager:
         for _ in range(len(seq.block_table), self.num_pool_blocks(len(seq))):
             seq.block_table.append(self._fresh_block())
         seq.num_cached_tokens = num_cached_blocks * hbs
-        if seq.replay_end:
+        if seq.replay_kv_load:
+            # The load runs first, from the HBM hit; the connector moves
+            # `num_cached_tokens` to the replay once the KV lands
+            # (`Scheduler._mark_offload_load_ready`).
+            pass
+        elif seq.replay_end:
             # The claimed blocks are already published; the forward starts at
             # the replay and `hash_blocks` publishes from the hit onward.
             seq.num_cached_tokens = seq.replay_start
@@ -2762,7 +2834,7 @@ class BlockManager:
         seq.checkpoint_demand_declined = False
         # A replay floors this admission's forwards; a re-prefill from 0 must
         # rewrite every block it computes.
-        seq.replay_start = seq.replay_end = 0
+        seq.clear_replay()
         # The anchor is derived from `num_prompt_tokens` alone, so it would
         # still be correct on re-admission — but `_record_checkpoint_end` runs
         # unconditionally in `can_allocate`, and leaving a stale value here

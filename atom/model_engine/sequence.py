@@ -180,6 +180,11 @@ class OffloadJointRecord:
     # reported it -- the KV leg's ceiling. Written before `can_allocate`, which
     # is where the two legs agree on one boundary. 0 = no lookup.
     kv_prefix_tokens: int = 0
+    # The LMCache-resident KV prefix with no regard for window state, in
+    # tokens: how far the full-attention KV alone reaches, at or past
+    # `kv_prefix_tokens`. Asked only when a bounded replay could use it
+    # (`Sequence.replay_kv_load`). 0 = not asked or not answered.
+    kv_only_tokens: int = 0
     # The boundary both legs of a joint load are aimed at, or 0. Chosen by
     # `can_allocate`: the rightmost checkpoint rung the LMCache KV prefix
     # covers. `num_cached_tokens` stays at the HBM prefix until both legs
@@ -309,6 +314,12 @@ class Sequence:
         # written by `BlockManager.can_allocate`, cleared by `deallocate`.
         self.replay_start = 0
         self.replay_end = 0
+        # Part of `[.., replay_end)` is not in HBM: an LMCache MP load brings
+        # the KV alone from `replay_load_start` (the HBM hit) to `replay_end`,
+        # and the replay starts once it lands. Until then `num_cached_tokens`
+        # stays at `replay_load_start`, where the load begins.
+        self.replay_kv_load = False
+        self.replay_load_start = 0
         # That gap as a prompt position, once it is worth a forward: the one
         # place off the checkpoint grid where this seq's prefill is cut so a
         # checkpoint can be kept. 0 = nowhere. Both written by
@@ -470,6 +481,12 @@ class Sequence:
         # are deliberately kept out of the model-facing request payload.
         self.dp_session_id = dp_session_id
         self.dp_parent_session_id = dp_parent_session_id
+
+    def clear_replay(self) -> None:
+        """Forget a bounded replay: this admission resumes the ordinary way."""
+        self.replay_start = self.replay_end = 0
+        self.replay_kv_load = False
+        self.replay_load_start = 0
 
     def __len__(self):
         return self._num_tokens

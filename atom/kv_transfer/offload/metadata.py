@@ -135,6 +135,10 @@ class NativeStateTransfer:
     boundary_tokens: int
     prefix_hash: int
     destination_slot: int | None = None
+    # PAGE only, no image: a load whose window state is rebuilt by a bounded
+    # replay (`Sequence.replay_start`). `unit_ids` is empty and nothing is
+    # restored; the retrieve runs under the request's KV-only lookup session.
+    kv_only: bool = False
 
 
 @dataclass

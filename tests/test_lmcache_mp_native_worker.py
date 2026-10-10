@@ -48,6 +48,7 @@ class _TransferSpec:
     block_ids: list[list[int]]
     start: int = 0
     end: int = 0
+    request_configs: dict | None = None
 
 
 @pytest.fixture(autouse=True)
@@ -251,6 +252,35 @@ def test_failed_retrieve_does_not_restore_or_report_success(worker, monkeypatch)
     finished = worker.get_finished()
     assert finished.failed_loading == {req.load_operation}
     assert not finished.finished_loading
+
+
+def _kv_only_load(hbm=8):
+    return replace(
+        request(loading=True, hbm=hbm),
+        native_state=NativeStateTransfer((), 16, 998, None, kv_only=True),
+    )
+
+
+def test_kv_only_load_reads_page_alone_under_its_own_session(worker):
+    req = _kv_only_load()
+    worker._submit_load(req, object())
+    assert worker.submitted_request_ids == ["atom-offload-dp0:7:kv"]
+    [spec] = worker.submitted
+    assert spec.request_configs == {"object_groups": [0]}
+    # PAGE for [8, 16), and a null placeholder per image group the retrieve skips.
+    states = worker._native_layout.checkpoint_spec.units_per_checkpoint
+    assert spec.block_ids == [[3, 4]] + [[-1]] * states
+
+
+def test_kv_only_load_restores_nothing(worker, monkeypatch):
+    monkeypatch.setattr(
+        worker, "_begin_restore", lambda _: pytest.fail("no image to restore")
+    )
+    req = _kv_only_load()
+    worker._submit_load(req, object())
+    worker.future.ready = True
+    finished = worker.get_finished()
+    assert finished.finished_loading == {req.load_operation}
 
 
 def test_load_completion_waits_for_native_restore(worker, monkeypatch):

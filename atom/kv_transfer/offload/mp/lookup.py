@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,6 +23,29 @@ _ASYNC_ADAPTER_ATTRS = (
     "_pending_lookups",
     "_lookup_results",
 )
+
+# `IPCCacheServerKey.request_configs` entry an LMCache server reads to cover
+# only some object groups in a lookup or retrieve (PAGE alone, say, for a
+# request that rebuilds its window state by replay).
+OBJECT_GROUPS_CONFIG = "object_groups"
+
+
+def kv_only_lookup_id(lookup_id: str) -> str:
+    """The id a request's KV-only lookup (and its retrieve) runs under.
+
+    A separate LMCache session from the request's ordinary lookup, so each
+    holds and releases its own read locks.
+    """
+    return f"{lookup_id}:kv"
+
+
+def with_object_groups(key: Any, object_groups: Sequence[int] | None) -> Any:
+    """`key` restricted to `object_groups`; unchanged for None."""
+    if object_groups is None:
+        return key
+    configs = dict(key.request_configs or {})
+    configs[OBJECT_GROUPS_CONFIG] = list(object_groups)
+    return dataclasses.replace(key, request_configs=configs)
 
 
 @dataclass
@@ -77,8 +102,19 @@ class _MPLookupClient:
     # `lookup` that later consumes it returns at once and every lock
     # lifecycle after that is unchanged.
 
-    def submit(self, token_ids: list[int], lookup_id: str) -> bool:
-        """Send this request's lookup without waiting. False if not sent."""
+    def submit(
+        self,
+        token_ids: list[int],
+        lookup_id: str,
+        object_groups: Sequence[int] | None = None,
+    ) -> bool:
+        """Send this request's lookup without waiting. False if not sent.
+
+        `object_groups` restricts the lookup to those LMCache object groups:
+        the answer is then the longest prefix those groups cover, and only
+        they are read-locked. The lookup is its own session under its own
+        `lookup_id`, so it never disturbs the request's ordinary lookup.
+        """
 
         if (
             not self._async_supported
@@ -104,6 +140,7 @@ class _MPLookupClient:
             request_id=request_id,
             worker_id=None,
         )
+        key = with_object_groups(key, object_groups)
         future = adapter._client.lookup(key, adapter._parallel.tp_size)
         self._async[lookup_id] = [request_id, len(token_ids), "lookup", future]
         self._async_tokens[lookup_id] = token_ids
@@ -112,6 +149,16 @@ class _MPLookupClient:
     def is_pending(self, lookup_id: str) -> bool:
         """Submitted and not answered yet."""
         return lookup_id in self._async
+
+    def has_answer(self, lookup_id: str) -> bool:
+        """An async lookup answered and its result is waiting to be consumed.
+
+        Lets a caller consume it through `lookup` without that ever falling
+        back to a synchronous lookup of its own (which would not carry the
+        submitted lookup's options).
+        """
+        request_id = _mp_session_id(self._config, lookup_id)
+        return request_id in self._adapter._lookup_results
 
     def poll(self, lookup_id: str) -> bool:
         """Advance one async lookup without blocking. True once it answered."""
