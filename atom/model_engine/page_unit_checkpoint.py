@@ -217,6 +217,11 @@ class PageUnitCheckpointStore:
         # source was reclaimed underneath it may not be indexed -- see
         # `was_reclaimed`.
         self._offload_reclaimed: OrderedDict = OrderedDict()
+        # Eviction order against cached history. False keeps every checkpoint
+        # until the pool has no cached history block left to spend; True
+        # spends the coldest checkpoint before the coldest history block. See
+        # `ensure_free_units`.
+        self.evict_before_history = False
 
     @property
     def units_per_checkpoint(self) -> int:
@@ -312,9 +317,22 @@ class PageUnitCheckpointStore:
         no. The test lives here rather than in the one caller that used to
         carry it, because every caller needs it and only the argument being
         1 keeps `_fresh_block` from needing it today.
+
+        `num_free` counts cached history blocks, which `pop` spends once the
+        vacant ones are gone, so by default a checkpoint outlives all of them.
+        `evict_before_history` turns that around: while the vacant blocks fall
+        short, the coldest checkpoint goes first, and history is spent only
+        once no checkpoint is left to give. A lost checkpoint costs a bounded
+        replay; a lost history block truncates every hit that crosses it.
         """
         if not self.has_available_units(count):
             return False
+        if self.evict_before_history:
+            while self.pool.num_free - self.pool.num_reusable_free < count:
+                victim = self._next_victim()
+                if victim < 0:
+                    break
+                self._evict(victim)
         while self.pool.num_free < count:
             victim = self._next_victim()
             if victim < 0:

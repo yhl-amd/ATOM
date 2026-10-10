@@ -149,6 +149,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to rebuild every layer's window and compressor state exactly.
     "ATOM_DSV4_STATE_REPLAY": lambda: os.getenv("ATOM_DSV4_STATE_REPLAY", "0").lower()
     in {"1", "true", "yes", "on"},
+    # PAGE pool eviction order. Off: a fresh block spends the coldest cached
+    # history block before any state checkpoint. On: the coldest checkpoint
+    # first, history only once none is left to spend. Pairs with
+    # ATOM_DSV4_STATE_REPLAY, which bounds what a lost checkpoint costs.
+    "ATOM_STATE_CHECKPOINT_EVICT_FIRST": lambda: os.getenv(
+        "ATOM_STATE_CHECKPOINT_EVICT_FIRST", "0"
+    ).lower()
+    in {"1", "true", "yes", "on"},
     # Experiments only: replay this many tokens instead of the receptive field.
     # Anything shorter is no longer exact. 0 = the receptive field.
     "ATOM_DSV4_STATE_REPLAY_TOKENS": lambda: int(

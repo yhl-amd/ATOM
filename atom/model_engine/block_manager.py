@@ -245,6 +245,12 @@ class BlockManager:
                 checkpoint_spec,
                 enabled=enabled,
             )
+            if envs.ATOM_STATE_CHECKPOINT_EVICT_FIRST:
+                self.paged_state_checkpoints.store.evict_before_history = True
+                logger.info(
+                    "[State Cache] PAGE eviction spends the coldest checkpoint "
+                    "before any cached history block."
+                )
         # The rolling state class: per-request slots plus a content index over
         # the free ones. A checkpoint IS a free slot whose content is still
         # valid, so it holds no capacity of its own and never blocks admission.
