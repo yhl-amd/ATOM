@@ -536,9 +536,10 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         # DP prefill cost balancing (ATOM_DP_PREFILL_COST_BALANCE): every rank
-        # starts a prefill step from `prefill_base_tokens`; a rank whose chunk
-        # is cheaper than the step's costliest one may grow it up to
-        # `max_num_batched_tokens`. Off, the base is the whole batch budget.
+        # estimates its chunk at `prefill_base_tokens`; the ranks then aim at
+        # one cost target, a costlier rank shrinking its chunk and a cheaper
+        # one growing it up to `max_num_batched_tokens`. Off, the base is the
+        # whole batch budget.
         self._cost_balance = envs.ATOM_DP_PREFILL_COST_BALANCE
         base_tokens = envs.ATOM_DP_PREFILL_BALANCE_BASE_TOKENS
         self.prefill_base_tokens = (
@@ -547,11 +548,14 @@ class Scheduler:
             else self.max_num_batched_tokens
         )
         self._balance_token_weight = envs.ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT
+        self._balance_slack = envs.ATOM_DP_PREFILL_BALANCE_SLACK
+        self._balance_min_tokens = envs.ATOM_DP_PREFILL_BALANCE_MIN_TOKENS
         # This tick's prefill limits; see `_prefill_room`.
         self._tick_token_cap = self.prefill_base_tokens
         self._tick_cost_limit = math.inf
         self._tick_cost = 0.0
-        self._balance_stats = [0, 0, 0.0, 0.0]  # steps, tokens, own cost, target
+        # steps, tokens, own cost, target, steps shrunk, steps grown
+        self._balance_stats = [0, 0, 0.0, 0.0, 0, 0]
         self.long_prefill_token_threshold = config.long_prefill_token_threshold
         self.max_model_len = config.max_model_len
         self.bos_token_id = config.bos_token_id
@@ -891,15 +895,18 @@ class Scheduler:
     def _prefill_room(self, batched_tokens: int, start: int) -> int:
         """New tokens a seq whose chunk starts at `start` may still add this
         tick: the token cap, and under cost balancing the cost left to the
-        step's target (largest k with `_chunk_cost(start, k)` <= what is left)."""
-        room = self._tick_token_cap - batched_tokens
-        if self._tick_cost_limit < math.inf:
-            left = self._tick_cost_limit - self._tick_cost
-            if left <= 0:
-                return 0
+        step's target (largest k with `_chunk_cost(start, k)` <= what is left),
+        but never below the balancing floor of `_balance_min_tokens`."""
+        cap_room = self._tick_token_cap - batched_tokens
+        if self._tick_cost_limit == math.inf:
+            return max(cap_room, 0)
+        left = self._tick_cost_limit - self._tick_cost
+        room = 0
+        if left > 0:
             a = self._balance_token_weight + start
-            room = min(room, int(math.sqrt(a * a + 2.0 * left) - a))
-        return max(room, 0)
+            room = int(math.sqrt(a * a + 2.0 * left) - a)
+        room = max(room, self._balance_min_tokens - batched_tokens)
+        return max(min(room, cap_room), 0)
 
     def _estimate_prefill_chunk_cost(self, token_cap: int) -> float:
         """Cost of the chunk this rank would prefill with `token_cap` tokens:
@@ -949,18 +956,24 @@ class Scheduler:
 
         Every rank calls this on the same tick (the delayer released prefill
         and some rank has prefill work: both rank-identical), so the one
-        collective inside stays in lockstep. The costliest rank keeps its base
-        chunk; the others may take more tokens until they reach its cost."""
+        collective inside stays in lockstep. The target is the costliest chunk,
+        lowered to `1 + slack` times the mean over the ranks that prefill: a
+        rank above it shrinks its chunk, a rank below it may grow it (when the
+        token cap is above the base)."""
         own = self._estimate_prefill_chunk_cost(self.prefill_base_tokens)
-        target = self.prefill_delayer.max_across_ranks(own)
-        if target <= 0:
+        costs = [c for c in self.prefill_delayer.gather_across_ranks(own) if c > 0]
+        if not costs:
             return
-        self._tick_token_cap = self.max_num_batched_tokens
+        target = min(max(costs), sum(costs) / len(costs) * (1 + self._balance_slack))
         self._tick_cost_limit = target
+        if self.max_num_batched_tokens > self.prefill_base_tokens:
+            self._tick_token_cap = self.max_num_batched_tokens
         st = self._balance_stats
         st[0] += 1
         st[2] += own
         st[3] += target
+        st[4] += own > target
+        st[5] += own < target and self._tick_token_cap > self.prefill_base_tokens
 
     def _log_prefill_balance(self, tokens: int) -> None:
         st = self._balance_stats
@@ -968,10 +981,12 @@ class Scheduler:
         if st[0] and st[0] % 50 == 0:
             logger.info(
                 "prefill cost balance: steps=%d mean_tokens=%.0f "
-                "own/target cost=%.3f (base %d, cap %d tokens)",
+                "own/target cost=%.3f shrunk=%d grown=%d (base %d, cap %d tokens)",
                 st[0],
                 st[1] / st[0],
                 st[2] / st[3] if st[3] else 0.0,
+                st[4],
+                st[5],
                 self.prefill_base_tokens,
                 self.max_num_batched_tokens,
             )
