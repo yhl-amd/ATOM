@@ -135,3 +135,16 @@ def test_idle_rank_still_joins_the_exchange(monkeypatch):
     sched.set_prefill_delayer(delayer)
     assert sched.schedule() is None
     assert delayer.reported == [0.0]
+
+
+def test_gather_across_ranks_on_a_stateless_gloo_group():
+    """The engine's DP group is created without a default process group, so the
+    delayer must not go through torch.distributed.get_rank()."""
+    import torch.distributed as dist
+
+    from atom.model_engine.prefill_delayer import PrefillDelayer
+
+    assert not dist.is_initialized()
+    group = dist.ProcessGroupGloo(dist.HashStore(), 0, 1)
+    delayer = PrefillDelayer(dp_size=1, cpu_group=group, max_num_batched_tokens=64)
+    assert delayer.gather_across_ranks(3.5) == [3.5]

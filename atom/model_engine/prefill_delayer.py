@@ -470,7 +470,8 @@ class PrefillDelayer:
         if self.cpu_group is None:
             return [float(value)]
         buf = torch.zeros(self.dp_size, dtype=torch.float64)
-        buf[torch.distributed.get_rank(group=self.cpu_group)] = float(value)
+        # The DP group is stateless (no default process group): ask it directly.
+        buf[self.cpu_group.rank()] = float(value)
         torch.distributed.all_reduce(
             buf, op=torch.distributed.ReduceOp.SUM, group=self.cpu_group
         )
