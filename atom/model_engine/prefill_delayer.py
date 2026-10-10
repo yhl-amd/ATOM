@@ -370,7 +370,7 @@ class PrefillDelayer:
         self._prefill_executed_since_last_decision = False
         # Identical on every rank (it comes from the reduced buffer): whether
         # any rank has prefill work this tick. A FIRE with this set is where
-        # the ranks may run one more lockstep collective (max_across_ranks).
+        # the ranks may run one more lockstep collective (gather_across_ranks).
         self.any_rank_prefillable = n_prefillable > 0
         any_kv_high = kv_high_n > 0
         any_kv_low = kv_low_n > 0
@@ -460,20 +460,21 @@ class PrefillDelayer:
         self._maybe_log()
         return True
 
-    def max_across_ranks(self, value: float) -> float:
-        """Largest ``value`` over the DP ranks (this rank's own value locally).
+    def gather_across_ranks(self, value: float) -> list[float]:
+        """Every DP rank's ``value``, indexed by rank (just ``[value]`` locally).
 
         A lockstep collective like ``should_allow_prefill``: every rank must call
         it on the same tick, which holds when the call is conditioned on that
-        tick's (rank-identical) decision.
+        tick's (rank-identical) decision. One SUM over a one-hot vector.
         """
         if self.cpu_group is None:
-            return value
-        buf = torch.tensor([float(value)], dtype=torch.float64)
+            return [float(value)]
+        buf = torch.zeros(self.dp_size, dtype=torch.float64)
+        buf[torch.distributed.get_rank(group=self.cpu_group)] = float(value)
         torch.distributed.all_reduce(
-            buf, op=torch.distributed.ReduceOp.MAX, group=self.cpu_group
+            buf, op=torch.distributed.ReduceOp.SUM, group=self.cpu_group
         )
-        return float(buf.item())
+        return buf.tolist()
 
     def notify_prefill_executed(self) -> None:
         """Report a completed local prefill forward.

@@ -174,17 +174,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Under DP attention every rank prefills in the same lockstep step and the
     # step lasts as long as the slowest rank. With the same token budget, a rank
     # whose chunk attends long contexts is that straggler. When on, the ranks
-    # agree each prefill step on the largest estimated chunk cost (cost of a
-    # chunk = new tokens x (TOKEN_WEIGHT + prior context + new / 2)), and a
-    # rank below it takes more tokens, up to --max-num-batched-tokens, until it
-    # reaches that cost. Ranks start from BASE_TOKENS (0 = the whole
-    # --max-num-batched-tokens, which leaves no room to grow).
+    # exchange the estimated cost of their chunk each prefill step (cost = new
+    # tokens x (TOKEN_WEIGHT + prior context + new / 2)) and aim at
+    # min(costliest, mean x (1 + SLACK)): a rank above it takes fewer tokens
+    # (never fewer than MIN_TOKENS), and a rank below it may take more, up to
+    # --max-num-batched-tokens, when that exceeds BASE_TOKENS (0 = the whole
+    # --max-num-batched-tokens: ranks only shrink).
     "ATOM_DP_PREFILL_COST_BALANCE": lambda: _flag_env("ATOM_DP_PREFILL_COST_BALANCE"),
     "ATOM_DP_PREFILL_BALANCE_BASE_TOKENS": lambda: _int_env(
         "ATOM_DP_PREFILL_BALANCE_BASE_TOKENS", 0
     ),
     "ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT": lambda: _int_env(
-        "ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT", 65536
+        "ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT", 360000
+    ),
+    "ATOM_DP_PREFILL_BALANCE_SLACK": lambda: float(
+        os.getenv("ATOM_DP_PREFILL_BALANCE_SLACK", "0.1")
+    ),
+    "ATOM_DP_PREFILL_BALANCE_MIN_TOKENS": lambda: _int_env(
+        "ATOM_DP_PREFILL_BALANCE_MIN_TOKENS", 4096
     ),
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
