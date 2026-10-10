@@ -96,6 +96,8 @@ def test_mtp_counts_as_one_more_layer(monkeypatch):
         {"hf_config": _hf(compress_ratios=[1, 2])},
         {"speculative_config": SimpleNamespace(method="dspark")},
         {"prefill_context_parallel_size": 2},
+        # An LMCache MP load would write the claimed blocks a replay reads.
+        {"kv_transfer_config": {"kv_connector": "lmcache_mp", "kv_role": "offload"}},
     ],
 )
 def test_off_where_the_receptive_field_argument_does_not_hold(monkeypatch, overrides):

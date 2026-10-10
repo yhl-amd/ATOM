@@ -663,10 +663,10 @@ class BlockManager:
         counts as one more layer.
 
         Off unless ATOM_DSV4_STATE_REPLAY is set, and only for the plain V4
-        trunk on a single-rank prefill with no state tier: context parallel
+        trunk on a single-rank prefill with no KV connector: context parallel
         splits the query axis the floors are indexed by, a DSpark draft has
-        windows of its own, and the LMCache joint boundary has not learned to
-        replay (yet).
+        windows of its own, and connector loads (LMCache, P/D) have not
+        learned to replay (yet).
         """
         if not envs.ATOM_DSV4_STATE_REPLAY:
             return 0
@@ -685,8 +685,12 @@ class BlockManager:
             reason = f"speculative method {method!r}"
         elif config.prefill_context_parallel_size > 1 or self.dcp_world_size > 1:
             reason = "context parallelism"
-        elif self.state_tier_capability.hosts_state_tier:
-            reason = "a CPU state tier (joint boundaries do not replay yet)"
+        elif getattr(config, "kv_transfer_config", None):
+            # Every connector load starts at `num_cached_tokens` and raises it
+            # when the load lands, and a replay moves exactly that field below
+            # blocks it has claimed: an LMCache MP load would write those
+            # shared blocks and resume past the replay. Not wired up yet.
+            reason = "a KV connector (connector loads do not replay yet)"
         if reason is not None:
             logger.warning("[State Cache] bounded replay off: %s.", reason)
             return 0
