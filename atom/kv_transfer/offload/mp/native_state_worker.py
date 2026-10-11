@@ -27,10 +27,7 @@ from atom.kv_transfer.offload.mp.deployment import (
     _tp_replication_factor,
     _validate_mp_config,
 )
-from atom.kv_transfer.offload.mp.lookup import (
-    OBJECT_GROUPS_CONFIG,
-    kv_only_lookup_id,
-)
+from atom.kv_transfer.offload.mp.lookup import OBJECT_GROUPS_CONFIG
 from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
 )
@@ -53,6 +50,9 @@ NATIVE_STATE_MP_STORE_CHANNEL = "native_state_mp_store"
 # which `--separate-object-groups` numbers ahead of the image's window group
 # (`build_native_state_mp_layout` gives PAGE engine group 0).
 PAGE_OBJECT_GROUP = 0
+# The image's group: LMCache orders regular groups by (recurrent, window), so
+# the recurrent state follows the full-attention PAGE.
+STATE_OBJECT_GROUP = 1
 
 
 def require_native_state_server(adapter: Any, config: Any) -> None:
@@ -292,10 +292,8 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 self._adapter.submit_store_request,
             )
         )
-        # A KV-only load reads under the lookup session that locked it.
-        lookup_id = kv_only_lookup_id(str(req.req_id)) if kv_only else req.req_id
         try:
-            future = submit(_mp_session_id(self._config, lookup_id), spec, event)
+            future = submit(_mp_session_id(self._config, req.req_id), spec, event)
         except Exception:
             # Retain the exact source/destination lease. The server might have
             # received the request before the connection raised an exception.

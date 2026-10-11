@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,11 +21,11 @@ from atom.kv_transfer.offload._offload_common import (
     validated_kv_role,
 )
 from atom.kv_transfer.offload.metadata import LoadSpec, NativeStateTransfer
-from atom.kv_transfer.offload.mp.deployment import _mp_session_id, _validate_mp_config
-from atom.kv_transfer.offload.mp.lookup import kv_only_lookup_id
+from atom.kv_transfer.offload.mp.deployment import _validate_mp_config
 from atom.kv_transfer.offload.mp.native_state_worker import (
     NATIVE_STATE_MP_STORE_CHANNEL,
     PAGE_OBJECT_GROUP,
+    STATE_OBJECT_GROUP,
     require_native_state_server,
 )
 from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
@@ -123,13 +122,15 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         self._save_failures: dict[str, tuple[Any, int, int]] = {}
         self._retired_requests: dict[str, Any] = {}
         # Bounded replay (`Sequence.replay_kv_load`): tokens one replays, or 0
-        # when it is off. With it on, each request also asks how far the PAGE
-        # KV alone reaches, which a replay can resume past the last image.
+        # when it is off. With it on, every lookup also reports how far the
+        # PAGE KV alone reaches, which a replay can resume past the last image.
         self._replay_tokens = int(getattr(block_manager, "state_replay_tokens", 0))
-        # sid -> (seq, KV-only reach in tokens, or None while it is asked).
-        self._kv_reach: dict[str, tuple[Any, int | None]] = {}
-        # Requests whose KV-only lookup session must be ended with them.
-        self._kv_sessions: set[str] = set()
+        if self._replay_tokens:
+            self._lookup_client.ask_reach((PAGE_OBJECT_GROUP,))
+        # sid -> (seq, KV-only reach in tokens) of the request's lookup, from
+        # its answer until admission weighs it. The lookup keeps the PAGE KV
+        # locked up to the reach meanwhile, so nothing releases it before then.
+        self._kv_reach: dict[str, tuple[Any, int]] = {}
         # Requests parked for a load the next dispatch has yet to send, and
         # those whose load it dropped instead: nothing will ever report on
         # those, so `process_completions` wakes them as failed loads.
@@ -191,111 +192,60 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
 
     # -- KV-only reach, for a bounded replay -------------------------------
     #
-    # The ordinary lookup reports the longest prefix whose PAGE KV is present
-    # AND whose state image sits at its end. A replay needs only the first:
-    # it rebuilds the window state from the KV. So with replay on, a second
-    # lookup over the PAGE object group alone runs beside the first, under its
-    # own session and locks, and `BlockManager._replay_hit` weighs its answer.
+    # A lookup reports the longest prefix whose PAGE KV is present AND whose
+    # state image sits at its end (the hit). A replay needs only the first:
+    # it rebuilds the window state from the KV. With replay on, the same
+    # lookup also reports how far the PAGE KV alone reaches (the reach; the
+    # server folds the same presence bitmaps twice), and keeps the PAGE KV
+    # locked up to it. `BlockManager._replay_hit` weighs it at admission.
 
-    def prefetch_lookups(self, seqs) -> None:
-        # The scheduler hands over an iterator (a slice of `waiting`), which
-        # the base would exhaust before the loop below sees a single request.
-        seqs = list(seqs)
-        super().prefetch_lookups(seqs)
+    def _fresh_tier_lookup(self, seq: Any, sid: str) -> int | None:
         if not self._replay_tokens:
-            return
-        client = self._lookup_client
-        submitted = client.pending_ids()
-        for seq in seqs:
-            sid = str(seq.id)
-            entry = self._kv_reach.get(sid)
-            if entry is not None and entry[0] is seq:
-                continue
-            # Alongside the ordinary lookup only: one never sent (the request
-            # was admitted on a remembered hit, say) has nothing to beat.
-            if sid not in submitted or not getattr(seq, "has_per_req_cache", False):
-                continue
-            if entry is not None:
-                self._drop_kv_reach(sid)
-            if client.submit(
-                self._lookup_token_ids(seq),
-                kv_only_lookup_id(sid),
-                object_groups=(PAGE_OBJECT_GROUP,),
-            ):
-                self._kv_reach[sid] = (seq, None)
-                self._kv_sessions.add(sid)
-
-    def lookup_pending(self, seq: Any) -> bool:
-        if super().lookup_pending(seq):
-            return True
-        sid = str(seq.id)
-        entry = self._kv_reach.get(sid)
-        if entry is None or entry[0] is not seq or entry[1] is not None:
-            return False
-        kv_id = kv_only_lookup_id(sid)
-        client = self._lookup_client
-        if not client.is_pending(kv_id) or client.poll(kv_id):
-            self._lookup_defer_since.pop(kv_id, None)
-            return False
-        # Waiting for it is bounded by the same window as the ordinary lookup.
-        now = time.monotonic()
-        first = self._lookup_defer_since.setdefault(kv_id, now)
-        return now - first <= envs.OFFLOAD_LOOKUP_DEFER_S
+            return super()._fresh_tier_lookup(seq, sid)
+        # A lookup this request still holds (one whose reach kept the PAGE KV
+        # locked past a hit of 0, say) goes back first: asking again replaces
+        # the server's record of what the earlier one locked.
+        self._kv_reach.pop(sid, None)
+        if self._lookup_client.reach_tokens(sid) is not None:
+            self._lookup_client.clear_lookup_status(sid)
+        hit = super()._fresh_tier_lookup(seq, sid)
+        if hit is not None:
+            # Never below the hit: a server that does not know the option
+            # answers with the hit alone, and then there is no reach past it.
+            reach = max(int(hit), int(self._lookup_client.reach_tokens(sid) or 0))
+            self._kv_reach[sid] = (seq, reach)
+        return hit
 
     def _kv_only_reach(self, seq: Any) -> int:
         """This request's KV-only reach in tokens, or 0 if unknown."""
-        sid = str(seq.id)
-        entry = self._kv_reach.get(sid)
+        entry = self._kv_reach.get(str(seq.id))
         if entry is None or entry[0] is not seq:
             return 0
-        if entry[1] is None:
-            kv_id = kv_only_lookup_id(sid)
-            client = self._lookup_client
-            if client.is_pending(kv_id) and not client.poll(kv_id):
-                return 0  # still unanswered: decide without it
-            if not client.has_answer(kv_id):
-                self._drop_kv_reach(sid)  # the lookup failed
-                return 0
-            reach = int(client.lookup(self._lookup_token_ids(seq), kv_id) or 0)
-            # The ordinary lookup's answer this step, before any cap.
-            with_state = int(self._last_tier_hit(seq, sid) or 0)
-            if reach < with_state:
-                # PAGE alone cannot reach less than PAGE plus the image: the
-                # lookup did not cover the group this assumes is PAGE.
-                logger.warning(
-                    "LMCache MP KV-only lookup for %s reached %d < %d with "
-                    "state; object group %d is not PAGE? Not using it.",
-                    sid,
-                    reach,
-                    with_state,
-                    PAGE_OBJECT_GROUP,
-                )
-                reach = 0
-            entry = (seq, reach)
-            self._kv_reach[sid] = entry
         return entry[1]
 
-    def _drop_kv_reach(self, sid: str) -> None:
-        """Give back a KV-only lookup no load will use, and its locks."""
-        entry = self._kv_reach.pop(sid, None)
-        if entry is None:
+    def _release_lookup(self, sid: str) -> None:
+        if sid in self._kv_reach:
+            # Its reach is not weighed yet (admission does that), and its
+            # locks are what back a load to it: `update_state_after_alloc`
+            # decides, and releases the lookup if nothing loads under it.
             return
-        kv_id = kv_only_lookup_id(sid)
-        self._lookup_defer_since.pop(kv_id, None)
-        if entry[1] is None:
-            self._lookup_client.discard(kv_id)  # in flight or never consumed
-        else:
-            self._lookup_client.clear_lookup_status(kv_id)
+        super()._release_lookup(sid)
+
+    def _begin_load_lifecycle(self, seq: Any) -> None:
+        entry = self._kv_reach.get(str(seq.id))
+        if entry is not None and entry[0] is not seq:
+            # An earlier lifecycle's reach: its lookup goes with it.
+            del self._kv_reach[str(seq.id)]
+        super()._begin_load_lifecycle(seq)
 
     def update_state_after_alloc(self, seq: Any) -> None:
         sid = str(seq.id)
-        entry = self._kv_reach.get(sid)
-        if seq.replay_kv_load and entry is not None and entry[0] is seq:
-            # The KV-only lookup loads instead of the ordinary one: release
-            # that one's locks, and aim the load at the KV-only reach. Its own
-            # locks pass to the retrieve (`build_connector_meta`).
-            del self._kv_reach[sid]
-            self._lookup_client.clear_lookup_status(sid)
+        entry = self._kv_reach.pop(sid, None)
+        mine = entry is not None and entry[0] is seq
+        if seq.replay_kv_load and mine:
+            # Load the PAGE KV alone, up to the reach, under the locks the
+            # lookup took for it (they pass to the retrieve in
+            # `build_connector_meta`).
             reach = int(seq.replay_end)
             self._load_specs[sid] = LoadSpec(
                 hbm_cached_tokens=int(seq.num_cached_tokens),
@@ -303,11 +253,15 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             )
             self._hit_save_floors[sid] = reach
         else:
-            self._drop_kv_reach(sid)
             if getattr(seq, "replay_kv_load", False):
                 # Nothing here backs that load (a stale reach from an earlier
                 # admission): replay from the HBM hit instead.
                 self._block_manager.fall_back_to_hbm_replay(seq)
+            if mine and sid not in self._load_specs:
+                # Nothing loads under the lookup: its locks, to the reach, go
+                # back now. An ordinary load keeps them; its retrieve hands
+                # back the part past the hit (`prepare_retrieve`).
+                super()._release_lookup(sid)
         super().update_state_after_alloc(seq)
 
     def should_park_for_load_after_alloc(self, seq: Any) -> bool:
@@ -325,14 +279,17 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         operation = self._native_load_operations.get(sid)
         lease = self._native_loads.get(operation)
         if lease is None or lease.seq is not seq or not lease.transfer.kv_only:
-            return super()._ensure_lookup_pin(seq, sid, spec)
-        # A KV-only load reads under the KV-only lookup, whose locks nothing
-        # has released since it answered (no dispatch unpins it). The ordinary
-        # lookup asks for an image at the end as well, so asking it again --
-        # what the base does for a load admitted on a remembered hit -- falls
-        # short of any reach past the last image and drops every such load.
-        hit = self._lookup_client.hit_tokens(kv_only_lookup_id(sid))
-        return hit is not None and int(hit) >= int(spec.lmcache_cached_tokens)
+            pinned = super()._ensure_lookup_pin(seq, sid, spec)
+            # Admission already weighed this request: a lookup run just now
+            # has no reach left to weigh.
+            self._kv_reach.pop(sid, None)
+            return pinned
+        # A KV-only load reads under its lookup, whose locks nothing has
+        # released since it answered (no dispatch unpins it). Asking again --
+        # what the base does for a load admitted on a remembered hit -- would
+        # weigh the hit, which falls short of any reach past the last image.
+        reach = self._lookup_client.reach_tokens(sid)
+        return reach is not None and int(reach) >= int(spec.lmcache_cached_tokens)
 
     def _save_frontier(self, seq: Any) -> int:
         if not getattr(seq, "has_per_req_cache", False):
@@ -575,12 +532,13 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
                 transfer = self._native_loads[request.load_operation].transfer
                 request.native_state = transfer
                 if transfer.kv_only:
-                    # The base handed the ordinary lookup's (already released)
-                    # range over; the retrieve reads under the KV-only one.
-                    self._lookup_client.prepare_retrieve(
-                        kv_only_lookup_id(str(request.req_id)),
+                    # The retrieve reads PAGE alone; the lookup also locked the
+                    # image at its hit, which nothing would read or release.
+                    self._lookup_client.release_groups(
+                        str(request.req_id),
                         int(request.load_spec.hbm_cached_tokens),
                         int(transfer.boundary_tokens),
+                        (STATE_OBJECT_GROUP,),
                     )
         return metadata
 
@@ -608,13 +566,6 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
                 self._active_load_operations.pop(sid, None)
             if getattr(lease.seq, "_load_operation", None) == operation:
                 delattr(lease.seq, "_load_operation")
-        if self._replay_tokens and sid not in self._kv_reach:
-            # A KV-only load dropped before its retrieve: its lookup's locks
-            # come back too. A no-op once the retrieve owns them, or with none.
-            # While `_kv_reach` holds the lookup it is not weighed yet -- an
-            # ordinary hit HBM already covers lands here first -- and
-            # `_drop_kv_reach` gives it back if nothing uses it.
-            self._lookup_client.clear_lookup_status(kv_only_lookup_id(sid))
         super()._clear_pending_load(sid)
 
     def _finish_native_load(self, operation: Any, *, succeeded: bool) -> bool:
@@ -625,11 +576,8 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             return False
         lease = self._native_loads[operation]
         if lease.transfer.kv_only:
-            # No image, no units: only the KV-only lookup's retrieve to close.
+            # No image, no units: the retrieve is closed with any other load's.
             self._release_native_load(operation, release_units=False)
-            self._lookup_client.complete_retrieve(
-                kv_only_lookup_id(str(operation.req_id)), succeeded=succeeded
-            )
         elif succeeded:
             if not self._checkpoints.adopt_transfer_units(
                 operation, lease.transfer.prefix_hash
@@ -676,7 +624,14 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         lease = self._native_loads.get(operation)
         if lease is not None and lease.seq is seq and lease.dispatched:
             return  # A request cancellation does not cancel an MP DMA.
+        self._forget_kv_reach(seq)
         super().cancel_pending_load(seq)
+
+    def _forget_kv_reach(self, seq: Any) -> None:
+        """Stop holding `seq`'s lookup for its reach; the base releases it."""
+        entry = self._kv_reach.get(str(seq.id))
+        if entry is not None and entry[0] is seq:
+            del self._kv_reach[str(seq.id)]
 
     def request_finished(self, seq: Any) -> None:
         sid = str(seq.id)
@@ -685,23 +640,10 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         lease = self._native_loads.get(operation)
         if lease is not None and lease.seq is seq and lease.dispatched:
             return
+        # Aborted while waiting: the lookup held for its reach goes back too.
+        self._forget_kv_reach(seq)
         super().request_finished(seq)
         self._finish_retired_request(sid)
-        # Its KV-only lookup, if one was never used (aborted while waiting),
-        # and its session -- which no save ever runs under, so it can end now.
-        self._drop_kv_reach(sid)
-        if sid in self._kv_sessions:
-            self._kv_sessions.discard(sid)
-            try:
-                self._mp_adapter.end_session(
-                    _mp_session_id(self._config, kv_only_lookup_id(sid))
-                )
-            except Exception:
-                logger.warning(
-                    "LMCache MP end_session failed for the KV-only lookup of %s",
-                    sid,
-                    exc_info=True,
-                )
 
     def _finish_retired_request(self, sid: str) -> None:
         super()._finish_retired_request(sid)

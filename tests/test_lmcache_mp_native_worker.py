@@ -261,10 +261,11 @@ def _kv_only_load(hbm=8):
     )
 
 
-def test_kv_only_load_reads_page_alone_under_its_own_session(worker):
+def test_kv_only_load_reads_page_alone_under_the_request_session(worker):
     req = _kv_only_load()
     worker._submit_load(req, object())
-    assert worker.submitted_request_ids == ["atom-offload-dp0:7:kv"]
+    # The one lookup that reported the reach also locked it, under this session.
+    assert worker.submitted_request_ids == ["atom-offload-dp0:7"]
     [spec] = worker.submitted
     assert spec.request_configs == {"object_groups": [0]}
     # PAGE for [8, 16), and a null placeholder per image group the retrieve skips.
