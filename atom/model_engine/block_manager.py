@@ -654,13 +654,16 @@ class BlockManager:
         trailing positions of a layer's input, which that span already covers
         (and H is a multiple of 128, so no C128 group is open there). An MTP
         layer reads the trunk's output and carries a window of its own, so it
-        counts as one more layer.
+        counts as one more layer. So does a DSpark draft: each of its layers
+        writes its window from the same fused target hidden states
+        (`project_context` of `dspark_target_layer_ids`, position by position),
+        none from another draft layer, and it reads that window only at a
+        verified anchor, which the replay always lies W or more below.
 
         Off unless ATOM_DSV4_STATE_REPLAY is set, and only for the plain V4
         trunk on a single-rank prefill with no KV connector: context parallel
-        splits the query axis the floors are indexed by, a DSpark draft has
-        windows of its own, and connector loads (LMCache, P/D) have not
-        learned to replay (yet).
+        splits the query axis the floors are indexed by, and connector loads
+        (LMCache, P/D) have not learned to replay (yet).
         """
         if not envs.ATOM_DSV4_STATE_REPLAY:
             return 0
@@ -675,7 +678,7 @@ class BlockManager:
             reason = f"architecture {arches} is not the DeepSeek-V4 trunk"
         elif not set(getattr(hf, "compress_ratios", ()) or ()) <= {0, 4, 128}:
             reason = "compress ratios other than 4 / 128"
-        elif method not in ("", "mtp"):
+        elif method not in ("", "mtp", "dspark"):
             reason = f"speculative method {method!r}"
         elif config.prefill_context_parallel_size > 1 or self.dcp_world_size > 1:
             reason = "context parallelism"
@@ -692,6 +695,8 @@ class BlockManager:
         layers = int(hf.num_hidden_layers)
         if method == "mtp":
             layers += int(getattr(hf, "num_nextn_predict_layers", 1) or 1)
+        elif method == "dspark":
+            layers += 1  # one hop: every draft layer reads the trunk directly
         tokens = window + (layers - 1) * (window - 1)
         if override := envs.ATOM_DSV4_STATE_REPLAY_TOKENS:
             logger.warning(
