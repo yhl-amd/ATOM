@@ -16,32 +16,27 @@ from atom.model_engine.scheduler import Scheduler
 
 
 class _Delayer:
-    """Cross-DP delayer stub: releases prefill every tick (holds it inside the
-    decode-protection window when `protecting`) and answers the cost exchange
-    with this rank's cost followed by `others`."""
+    """Cross-DP delayer stub that releases prefill every tick and answers the
+    cost exchange with this rank's cost followed by `others`."""
 
     is_local = False
     max_queue_ms = None
     any_rank_prefillable = True
 
-    def __init__(self, others=(), protecting=False):
+    def __init__(self, others=()):
         self.others = list(others)
-        self.protecting = protecting
         self.reported = []
         self.rank_prefill_costs = []
 
     def protects_decode(self, running_decode_batch: int) -> bool:
         return False
 
-    def holds_for_decode(self) -> bool:
-        return self.protecting
-
     def should_allow_prefill(
         self, prefillable, pending_tokens, prefill_cost=0.0, **kwargs
     ):
         self.reported.append(prefill_cost)
         self.rank_prefill_costs = [prefill_cost, *self.others]
-        return not self.protecting
+        return True
 
 
 def _sched(
@@ -143,18 +138,30 @@ def test_idle_rank_reports_no_cost(monkeypatch):
     assert delayer.reported == [0.0]
 
 
-def test_no_estimate_inside_the_decode_protection_window(monkeypatch, seq_factory):
+def test_balances_a_prefill_released_inside_the_decode_window(monkeypatch, seq_factory):
+    """With no decode on any rank the real delayer fires through its
+    post-prefill decode-protection window (its usual exit under DP attention).
+    The rank must have estimated its cost for that tick, or nothing balances."""
+    import torch.distributed as dist
+
+    from atom.model_engine.prefill_delayer import PrefillDelayer
+
     sched = _sched(monkeypatch)
-    delayer = _Delayer(others=[512.0] * 7, protecting=True)
+    group = dist.ProcessGroupGloo(dist.HashStore(), 0, 1)
+    delayer = PrefillDelayer(
+        dp_size=1,
+        cpu_group=group,
+        max_num_batched_tokens=sched.prefill_base_tokens,
+        prefill_decode_interval=5,
+        exchange_prefill_costs=True,
+    )
     sched.set_prefill_delayer(delayer)
-
-    def _no_estimate(token_cap):
-        raise AssertionError("estimated a chunk cost on a decode-protected tick")
-
-    monkeypatch.setattr(sched, "_estimate_prefill_chunk_cost", _no_estimate)
+    delayer._first = False
+    delayer._decode_interval_remaining = 3
     sched.add(seq_factory(list(range(100, 164))))
-    sched.schedule()
-    assert delayer.reported == [0.0]
+    assert _prefill_tokens(sched) == 64
+    assert delayer.rank_prefill_costs == [2048.0]
+    assert sched._balance_stats[0] == 1
 
 
 def test_costs_ride_the_delayer_reduce_on_a_stateless_gloo_group():

@@ -1707,13 +1707,13 @@ class Scheduler:
                     self.prefill_base_tokens,
                 )
             # DP prefill cost balancing: this rank's chunk cost rides the same
-            # all_reduce. Estimated only when this rank has prefill work and the
-            # tick is not one the delayer holds for decode protection.
+            # all_reduce, estimated only when this rank has prefill work. Not
+            # skipped inside the decode-protection window: whether the delayer
+            # holds there depends on every rank's decode load, known only after
+            # the reduce (with no decode anywhere it fires through that window).
             prefill_cost = (
                 self._estimate_prefill_chunk_cost(self.prefill_base_tokens)
-                if self.cost_balance
-                and prefillable
-                and not self.prefill_delayer.holds_for_decode()
+                if self.cost_balance and prefillable
                 else 0.0
             )
             delayer_allows = self.prefill_delayer.should_allow_prefill(
