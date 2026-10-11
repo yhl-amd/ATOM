@@ -527,11 +527,11 @@ class Scheduler:
         # one cost target, a costlier rank shrinking its chunk and a cheaper
         # one growing it up to `max_num_batched_tokens`. Off, the base is the
         # whole batch budget.
-        self._cost_balance = envs.ATOM_DP_PREFILL_COST_BALANCE
+        self.cost_balance = envs.ATOM_DP_PREFILL_COST_BALANCE
         base_tokens = envs.ATOM_DP_PREFILL_BALANCE_BASE_TOKENS
         self.prefill_base_tokens = (
             min(base_tokens, self.max_num_batched_tokens)
-            if self._cost_balance and base_tokens > 0
+            if self.cost_balance and base_tokens > 0
             else self.max_num_batched_tokens
         )
         self._balance_token_weight = envs.ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT
@@ -938,17 +938,15 @@ class Scheduler:
                 tokens += k
         return cost
 
-    def _balance_prefill_step(self) -> None:
-        """Agree with the other DP ranks on this prefill step's cost target.
+    def _balance_prefill_step(self, own: float) -> None:
+        """Set this prefill step's cost target from every DP rank's chunk cost.
 
-        Every rank calls this on the same tick (the delayer released prefill
-        and some rank has prefill work: both rank-identical), so the one
-        collective inside stays in lockstep. The target is the costliest chunk,
-        lowered to `1 + slack` times the mean over the ranks that prefill: a
-        rank above it shrinks its chunk, a rank below it may grow it (when the
-        token cap is above the base)."""
-        own = self._estimate_prefill_chunk_cost(self.prefill_base_tokens)
-        costs = [c for c in self.prefill_delayer.gather_across_ranks(own) if c > 0]
+        The costs rode the delayer's all_reduce this tick (`own` is this rank's,
+        0 when it estimated none), so every rank sees the same list. The target
+        is the costliest chunk, lowered to `1 + slack` times the mean over the
+        ranks that prefill: a rank above it shrinks its chunk, a rank below it
+        may grow it (when the token cap is above the base)."""
+        costs = [c for c in self.prefill_delayer.rank_prefill_costs if c > 0]
         if not costs:
             return
         target = min(max(costs), sum(costs) / len(costs) * (1 + self._balance_slack))
@@ -1708,6 +1706,16 @@ class Scheduler:
                     + self._partial_prefill_remaining_tokens(),
                     self.prefill_base_tokens,
                 )
+            # DP prefill cost balancing: this rank's chunk cost rides the same
+            # all_reduce. Estimated only when this rank has prefill work and the
+            # tick is not one the delayer holds for decode protection.
+            prefill_cost = (
+                self._estimate_prefill_chunk_cost(self.prefill_base_tokens)
+                if self.cost_balance
+                and prefillable
+                and not self.prefill_delayer.holds_for_decode()
+                else 0.0
+            )
             delayer_allows = self.prefill_delayer.should_allow_prefill(
                 prefillable=prefillable,
                 pending_tokens=pending_tokens,
@@ -1723,22 +1731,22 @@ class Scheduler:
                     and self.prefill_delayer.max_queue_ms is not None
                     else 0.0
                 ),
+                prefill_cost=prefill_cost,
             )
         else:
             delayer_allows = True
+            prefill_cost = 0.0
 
         self._tick_token_cap = self.prefill_base_tokens
         self._tick_cost_limit = math.inf
         self._tick_cost = 0.0
         if (
-            self._cost_balance
+            self.cost_balance
             and delayer_allows
             and self.prefill_delayer is not None
             and self.prefill_delayer.any_rank_prefillable
         ):
-            # Before the idle early return: an idle rank still joins the
-            # collective (with cost 0) that the busy ranks run this tick.
-            self._balance_prefill_step()
+            self._balance_prefill_step(prefill_cost)
 
         # Rejections may still need an empty batch to dispatch connector cleanup.
         if not self.running and not self.waiting and not self._rejected:
