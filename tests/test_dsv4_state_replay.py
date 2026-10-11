@@ -104,12 +104,22 @@ def test_mtp_counts_as_one_more_layer(monkeypatch):
     assert state_replay_tokens(config) == 3 + 3 * 2
 
 
+def test_a_dspark_draft_counts_as_one_more_layer(monkeypatch):
+    # Its three layers each project the same fused target hidden states, so
+    # their windows sit one hop above the trunk, as the serial MTP layer's does.
+    monkeypatch.setenv("ATOM_DSV4_STATE_REPLAY", "1")
+    config = _config(
+        speculative_config=SimpleNamespace(method="dspark", num_speculative_tokens=6),
+    )
+    assert state_replay_tokens(config) == 3 + 3 * 2
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
         {"hf_config": _hf(architectures=["DeepseekV41ForCausalLM"])},
         {"hf_config": _hf(compress_ratios=[1, 2])},
-        {"speculative_config": SimpleNamespace(method="dspark")},
+        {"speculative_config": SimpleNamespace(method="eagle3")},
         {"prefill_context_parallel_size": 2},
         {"decode_context_parallel_size": 2},
     ],
