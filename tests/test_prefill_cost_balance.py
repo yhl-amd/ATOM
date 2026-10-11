@@ -2,8 +2,8 @@
 
 Under DP attention every rank prefills in the same lockstep step, so the step
 lasts as long as the costliest rank's chunk. With balancing on, the ranks
-exchange their estimated chunk costs (`PrefillDelayer.gather_across_ranks`)
-and aim at min(costliest, mean x (1 + slack)): a costlier rank shrinks its
+exchange their estimated chunk costs on the PrefillDelayer's per-tick
+all_reduce (`prefill_cost` in, `rank_prefill_costs` out) and aim at min(costliest, mean x (1 + slack)): a costlier rank shrinks its
 chunk, a cheaper one may grow it when the token cap is above the base.
 
 With weight 0 a chunk of k tokens from position 0 costs k * k / 2.
@@ -16,26 +16,32 @@ from atom.model_engine.scheduler import Scheduler
 
 
 class _Delayer:
-    """Cross-DP delayer stub that releases prefill every tick and answers the
-    cost exchange with this rank's cost followed by `others`."""
+    """Cross-DP delayer stub: releases prefill every tick (holds it inside the
+    decode-protection window when `protecting`) and answers the cost exchange
+    with this rank's cost followed by `others`."""
 
     is_local = False
     max_queue_ms = None
     any_rank_prefillable = True
 
-    def __init__(self, others=()):
+    def __init__(self, others=(), protecting=False):
         self.others = list(others)
+        self.protecting = protecting
         self.reported = []
+        self.rank_prefill_costs = []
 
     def protects_decode(self, running_decode_batch: int) -> bool:
         return False
 
-    def should_allow_prefill(self, prefillable, pending_tokens, **kwargs):
-        return True
+    def holds_for_decode(self) -> bool:
+        return self.protecting
 
-    def gather_across_ranks(self, value: float) -> list[float]:
-        self.reported.append(value)
-        return [value, *self.others]
+    def should_allow_prefill(
+        self, prefillable, pending_tokens, prefill_cost=0.0, **kwargs
+    ):
+        self.reported.append(prefill_cost)
+        self.rank_prefill_costs = [prefill_cost, *self.others]
+        return not self.protecting
 
 
 def _sched(
@@ -69,14 +75,14 @@ def _prefill_tokens(sched):
     return int(batch.total_tokens_num)
 
 
-def test_off_keeps_the_whole_budget_and_skips_the_exchange(monkeypatch, seq_factory):
+def test_off_keeps_the_whole_budget_and_estimates_nothing(monkeypatch, seq_factory):
     sched = _sched(monkeypatch, balance=False)
     delayer = _Delayer(others=[1.0] * 7)
     sched.set_prefill_delayer(delayer)
     sched.add(seq_factory(list(range(100, 164))))
     assert sched.prefill_base_tokens == 64
     assert _prefill_tokens(sched) == 64
-    assert delayer.reported == []
+    assert delayer.reported == [0.0]
 
 
 @pytest.mark.parametrize("start", [0, 1000, 250_000])
@@ -129,7 +135,7 @@ def test_cheaper_rank_grows_when_the_cap_is_above_the_base(monkeypatch, seq_fact
     assert delayer.reported == [128.0]
 
 
-def test_idle_rank_still_joins_the_exchange(monkeypatch):
+def test_idle_rank_reports_no_cost(monkeypatch):
     sched = _sched(monkeypatch)
     delayer = _Delayer(others=[512.0] * 7)
     sched.set_prefill_delayer(delayer)
@@ -137,14 +143,38 @@ def test_idle_rank_still_joins_the_exchange(monkeypatch):
     assert delayer.reported == [0.0]
 
 
-def test_gather_across_ranks_on_a_stateless_gloo_group():
+def test_no_estimate_inside_the_decode_protection_window(monkeypatch, seq_factory):
+    sched = _sched(monkeypatch)
+    delayer = _Delayer(others=[512.0] * 7, protecting=True)
+    sched.set_prefill_delayer(delayer)
+
+    def _no_estimate(token_cap):
+        raise AssertionError("estimated a chunk cost on a decode-protected tick")
+
+    monkeypatch.setattr(sched, "_estimate_prefill_chunk_cost", _no_estimate)
+    sched.add(seq_factory(list(range(100, 164))))
+    sched.schedule()
+    assert delayer.reported == [0.0]
+
+
+def test_costs_ride_the_delayer_reduce_on_a_stateless_gloo_group():
     """The engine's DP group is created without a default process group, so the
-    delayer must not go through torch.distributed.get_rank()."""
+    delayer takes its rank from the group, not torch.distributed.get_rank()."""
     import torch.distributed as dist
 
     from atom.model_engine.prefill_delayer import PrefillDelayer
 
     assert not dist.is_initialized()
     group = dist.ProcessGroupGloo(dist.HashStore(), 0, 1)
-    delayer = PrefillDelayer(dp_size=1, cpu_group=group, max_num_batched_tokens=64)
-    assert delayer.gather_across_ranks(3.5) == [3.5]
+    delayer = PrefillDelayer(
+        dp_size=1,
+        cpu_group=group,
+        max_num_batched_tokens=64,
+        exchange_prefill_costs=True,
+    )
+    delayer.should_allow_prefill(prefillable=True, pending_tokens=8, prefill_cost=3.5e9)
+    assert delayer.rank_prefill_costs == [3.5e9]
+    # Without the exchange the buffer keeps its 8 decision slots only.
+    plain = PrefillDelayer(dp_size=1, cpu_group=group, max_num_batched_tokens=64)
+    plain.should_allow_prefill(prefillable=True, pending_tokens=8, prefill_cost=3.5e9)
+    assert plain.rank_prefill_costs == []

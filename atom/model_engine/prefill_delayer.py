@@ -103,6 +103,8 @@ class PrefillDelayer:
         "_prefill_executed_since_last_decision",
         "_prev_pending",
         # buffer / episode state
+        "_cost_slots",
+        "_rank",
         "_reduce_buf",
         "_stall_count",
         # stats
@@ -125,6 +127,7 @@ class PrefillDelayer:
         "max_queue_ms",
         "partial_max_ticks",
         "prefill_decode_interval",
+        "rank_prefill_costs",
         "stall_ticks",
         "target_fill",
         "token_usage_low_watermark",
@@ -144,6 +147,7 @@ class PrefillDelayer:
         token_usage_low_watermark: float | None = None,
         max_queue_ms: float | None = None,
         prefill_decode_interval: int = 0,
+        exchange_prefill_costs: bool = False,
     ):
         if dp_size > 1 and cpu_group is None:
             raise ValueError("Cross-DP prefill coalescing requires a CPU group")
@@ -205,7 +209,18 @@ class PrefillDelayer:
         #                                aged past max_queue_ms; TTFT SLA guard)
         #   slot 7 = prefill_ran flag   (SUM>0 → a rank completed a prefill
         #                                forward on the previous scheduler tick)
-        self._reduce_buf = torch.zeros(8, dtype=torch.int64, device="cpu")
+        # With exchange_prefill_costs (DP prefill cost balancing), dp_size more:
+        #   slot 8 + r = rank r's prefill chunk cost (one-hot, SUM → every
+        #                rank's cost), read back as rank_prefill_costs
+        self._cost_slots = dp_size if exchange_prefill_costs else 0
+        # The DP group is stateless (no default process group): ask it directly.
+        self._rank = (
+            cpu_group.rank() if self._cost_slots and cpu_group is not None else 0
+        )
+        self._reduce_buf = torch.zeros(
+            8 + self._cost_slots, dtype=torch.int64, device="cpu"
+        )
+        self.rank_prefill_costs: list[float] = []
 
         # Episode state. All ticks decide FIRE/HOLD in lockstep, so these evolve
         # identically on every rank (deterministic).
@@ -264,20 +279,22 @@ class PrefillDelayer:
     def is_local(self) -> bool:
         return self.dp_size == 1 and self.cpu_group is None
 
-    def protects_decode(self, running_decode_batch: int) -> bool:
-        """Whether the local decision can skip cache probes during protection."""
-        return (
-            self.is_local
-            and not self._first
-            and running_decode_batch > 0
-            and (
-                self._decode_interval_remaining > 0
-                or (
-                    self._prefill_executed_since_last_decision
-                    and self.prefill_decode_interval > 0
-                )
+    def holds_for_decode(self) -> bool:
+        """Whether this tick falls in the post-prefill decode-protection window,
+        known before the reduce: the delayer then holds prefill while any rank
+        decodes, so per-tick prefill work (cache probes, cost estimates) can be
+        skipped."""
+        return not self._first and (
+            self._decode_interval_remaining > 0
+            or (
+                self._prefill_executed_since_last_decision
+                and self.prefill_decode_interval > 0
             )
         )
+
+    def protects_decode(self, running_decode_batch: int) -> bool:
+        """Whether the local decision can skip cache probes during protection."""
+        return self.is_local and running_decode_batch > 0 and self.holds_for_decode()
 
     def should_allow_prefill(
         self,
@@ -287,6 +304,7 @@ class PrefillDelayer:
         kv_usage: float = 0.0,
         has_partial: bool = False,
         oldest_waiting_age_ms: float = 0.0,
+        prefill_cost: float = 0.0,
     ) -> bool:
         """Return True iff this rank may admit new prefills this tick (FIRE).
 
@@ -317,6 +335,9 @@ class PrefillDelayer:
                 schedulable waiting prefill. If it reaches max_queue_ms, this
                 rank flags the age guard; all ranks release after decode
                 protection. No waiting prefill / max_queue_ms=None → inactive.
+            prefill_cost: this rank's estimated prefill chunk cost (0 if none).
+                With exchange_prefill_costs every rank's value is in
+                ``rank_prefill_costs`` after the call.
         """
         # KV + queue-age bounds are gated on this rank actually having prefill to
         # push (firing when this rank can't admit anything would be a no-op).
@@ -337,6 +358,9 @@ class PrefillDelayer:
         self._reduce_buf[5] = 1 if has_partial else 0
         self._reduce_buf[6] = 1 if queue_hot else 0
         self._reduce_buf[7] = 1 if self._prefill_executed_since_last_decision else 0
+        if self._cost_slots:
+            self._reduce_buf[8:] = 0
+            self._reduce_buf[8 + self._rank] = int(prefill_cost)
         if self.cpu_group is not None:
             try:
                 torch.distributed.all_reduce(
@@ -351,10 +375,12 @@ class PrefillDelayer:
                 )
                 self._reset()
                 self.any_rank_prefillable = False
+                self.rank_prefill_costs = []
                 return True
 
-        # One host<-device readback for all 8 slots (a single .tolist() beats
-        # eight .item() boundary crossings on this per-tick hot path).
+        # One readback for all slots (a single .tolist() beats per-slot .item()
+        # boundary crossings on this per-tick hot path).
+        reduced = self._reduce_buf.tolist()
         (
             n_prefillable,
             g_pending,
@@ -364,13 +390,13 @@ class PrefillDelayer:
             partial_n,
             queue_hot_n,
             prefill_ran_n,
-        ) = self._reduce_buf.tolist()
+        ) = reduced[:8]
+        self.rank_prefill_costs = [float(c) for c in reduced[8:]]
         # This local execution report has now participated in the global
         # decision. A later successful prefill forward sets it again.
         self._prefill_executed_since_last_decision = False
         # Identical on every rank (it comes from the reduced buffer): whether
-        # any rank has prefill work this tick. A FIRE with this set is where
-        # the ranks may run one more lockstep collective (gather_across_ranks).
+        # any rank has prefill work this tick.
         self.any_rank_prefillable = n_prefillable > 0
         any_kv_high = kv_high_n > 0
         any_kv_low = kv_low_n > 0
@@ -459,23 +485,6 @@ class PrefillDelayer:
         self._reset()
         self._maybe_log()
         return True
-
-    def gather_across_ranks(self, value: float) -> list[float]:
-        """Every DP rank's ``value``, indexed by rank (just ``[value]`` locally).
-
-        A lockstep collective like ``should_allow_prefill``: every rank must call
-        it on the same tick, which holds when the call is conditioned on that
-        tick's (rank-identical) decision. One SUM over a one-hot vector.
-        """
-        if self.cpu_group is None:
-            return [float(value)]
-        buf = torch.zeros(self.dp_size, dtype=torch.float64)
-        # The DP group is stateless (no default process group): ask it directly.
-        buf[self.cpu_group.rank()] = float(value)
-        torch.distributed.all_reduce(
-            buf, op=torch.distributed.ReduceOp.SUM, group=self.cpu_group
-        )
-        return buf.tolist()
 
     def notify_prefill_executed(self) -> None:
         """Report a completed local prefill forward.
