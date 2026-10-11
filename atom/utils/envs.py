@@ -187,8 +187,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whose chunk attends long contexts is that straggler. When on, the ranks
     # exchange the estimated cost of their chunk on the PrefillDelayer's per-tick
     # all_reduce (cost = new tokens x (TOKEN_WEIGHT + prior context + new / 2);
-    # estimated only by ranks with prefill work, outside the post-prefill decode
-    # window) and on a prefill step aim at
+    # estimated only by ranks with prefill work) and on a prefill step aim at
     # min(costliest, mean x (1 + SLACK)): a rank above it takes fewer tokens
     # (never fewer than MIN_TOKENS), and a rank below it may take more, up to
     # --max-num-batched-tokens, when that exceeds BASE_TOKENS (0 = the whole

@@ -279,22 +279,20 @@ class PrefillDelayer:
     def is_local(self) -> bool:
         return self.dp_size == 1 and self.cpu_group is None
 
-    def holds_for_decode(self) -> bool:
-        """Whether this tick falls in the post-prefill decode-protection window,
-        known before the reduce: the delayer then holds prefill while any rank
-        decodes, so per-tick prefill work (cache probes, cost estimates) can be
-        skipped."""
-        return not self._first and (
-            self._decode_interval_remaining > 0
-            or (
-                self._prefill_executed_since_last_decision
-                and self.prefill_decode_interval > 0
-            )
-        )
-
     def protects_decode(self, running_decode_batch: int) -> bool:
         """Whether the local decision can skip cache probes during protection."""
-        return self.is_local and running_decode_batch > 0 and self.holds_for_decode()
+        return (
+            self.is_local
+            and not self._first
+            and running_decode_batch > 0
+            and (
+                self._decode_interval_remaining > 0
+                or (
+                    self._prefill_executed_since_last_decision
+                    and self.prefill_decode_interval > 0
+                )
+            )
+        )
 
     def should_allow_prefill(
         self,
