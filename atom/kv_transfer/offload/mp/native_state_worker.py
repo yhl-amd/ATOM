@@ -27,6 +27,7 @@ from atom.kv_transfer.offload.mp.deployment import (
     _tp_replication_factor,
     _validate_mp_config,
 )
+from atom.kv_transfer.offload.mp.lookup import OBJECT_GROUPS_CONFIG
 from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
 )
@@ -45,6 +46,13 @@ from atom.utils import envs
 
 logger = logging.getLogger("atom")
 NATIVE_STATE_MP_STORE_CHANNEL = "native_state_mp_store"
+# The LMCache object group the PAGE KV lands in: the full-attention group,
+# which `--separate-object-groups` numbers ahead of the image's window group
+# (`build_native_state_mp_layout` gives PAGE engine group 0).
+PAGE_OBJECT_GROUP = 0
+# The image's group: LMCache orders regular groups by (recurrent, window), so
+# the recurrent state follows the full-attention PAGE.
+STATE_OBJECT_GROUP = 1
 
 
 def require_native_state_server(adapter: Any, config: Any) -> None:
@@ -182,6 +190,16 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             )
         if state.boundary_tokens != end or len(req.token_ids) != end:
             raise ValueError("native STATE and PAGE endpoints must match")
+        count = (end - start) // self.chunk_size
+        if state.kv_only:
+            if not loading or state.unit_ids or state.destination_slot is not None:
+                raise ValueError("a KV-only native transfer is a load with no image")
+            # The image groups still need placeholder ids of full length; the
+            # retrieve skips them (`object_groups`), so none is ever read.
+            states = self._native_layout.checkpoint_spec.units_per_checkpoint
+            return [self._block_slice(req, start, end)] + [
+                [-1] * count for _ in range(states)
+            ]
         if loading and state.destination_slot is None:
             raise ValueError("native-state restore requires a destination SLOT")
         if not loading and state.destination_slot is not None:
@@ -190,7 +208,6 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         pages = self._block_slice(req, start, end)
         if set(pages) & set(unit_ids):
             raise ValueError("checkpoint PAGE units must not overlap KV PAGE blocks")
-        count = (end - start) // self.chunk_size
         # Earlier chunks have PAGE only. A boundary image is indivisible: all
         # its ordinal groups are present at exactly the same final chunk.
         return [pages] + [[-1] * (count - 1) + [unit] for unit in unit_ids]
@@ -238,6 +255,14 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 if loading
                 else req.save_spec.skip_leading_tokens
             )
+            kv_only = req.native_state is not None and req.native_state.kv_only
+            # PAGE alone: the image group is neither locked nor read. Passed
+            # only then, so an LMCache without the option still serves the rest.
+            options = (
+                {"request_configs": {OBJECT_GROUPS_CONFIG: [PAGE_OBJECT_GROUP]}}
+                if kv_only
+                else {}
+            )
             try:
                 groups = self._native_block_ids(req, start, end, loading=loading)
                 spec = AtomMPTransferSpec(
@@ -245,6 +270,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                     block_ids=groups,
                     start=start,
                     end=end,
+                    **options,
                 )
             except Exception:
                 logger.exception(
@@ -432,6 +458,10 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 )
                 return False
             if result is not True:
+                return True
+            if pending.request.native_state.kv_only:
+                # PAGE alone: nothing to restore; the replay rebuilds the state.
+                pending.restore_succeeded = True
                 return True
             try:
                 if not self._begin_restore(pending):
