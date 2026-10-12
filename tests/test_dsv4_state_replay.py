@@ -104,12 +104,6 @@ def test_mtp_counts_as_one_more_layer(monkeypatch):
     assert state_replay_tokens(config) == 3 + 3 * 2
 
 
-def test_a_forced_length_wins(monkeypatch):
-    monkeypatch.setenv("ATOM_DSV4_STATE_REPLAY", "1")
-    monkeypatch.setenv("ATOM_DSV4_STATE_REPLAY_TOKENS", "5")
-    assert state_replay_tokens(_config()) == 5
-
-
 @pytest.mark.parametrize(
     "overrides",
     [

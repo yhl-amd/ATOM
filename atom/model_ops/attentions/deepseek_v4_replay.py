@@ -63,14 +63,6 @@ def state_replay_tokens(config) -> int:
     if method == "mtp":
         layers += int(getattr(hf, "num_nextn_predict_layers", 1) or 1)
     tokens = window + (layers - 1) * (window - 1)
-    if override := envs.ATOM_DSV4_STATE_REPLAY_TOKENS:
-        logger.warning(
-            "[State Cache] bounded replay length forced to %d tokens "
-            "(the exact field is %d); shorter is not exact.",
-            override,
-            tokens,
-        )
-        return override
     logger.info(
         "[State Cache] bounded replay field: %d tokens (window %d, %d layers).",
         tokens,
