@@ -38,6 +38,8 @@ from atom.kv_transfer.offload.mp.native_state_worker import (
     NATIVE_STATE_MP_STORE_CHANNEL,
     NativeStateLMCacheMPConnector,
     require_native_state_server,
+    stores_state_images,
+    worker_replay_tokens,
 )
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 
@@ -94,8 +96,7 @@ def config(**extra):
     )
 
 
-@pytest.fixture
-def worker():
+def _make_worker(*, images=True):
     instance = NativeStateLMCacheMPConnector(config())
     page = torch.zeros((32, 1, 32), dtype=torch.uint8)
     spec = PagedStateCheckpointSpec(32, 128, "native-test-v1", 80)
@@ -113,7 +114,7 @@ def worker():
     )
     tensors.set_block_count(32)
     instance._native_layout = build_native_state_mp_layout(
-        tensors, block_size=4, chunk_size=8
+        tensors, block_size=4, chunk_size=8, images=images
     )
     instance.chunk_size = 8
     instance.submitted = []
@@ -129,6 +130,17 @@ def worker():
         submit_store_request=submit, submit_retrieve_request=submit
     )
     return instance
+
+
+@pytest.fixture
+def worker():
+    return _make_worker()
+
+
+@pytest.fixture
+def page_worker():
+    """A worker whose layout registered PAGE alone (`stores_state_images` False)."""
+    return _make_worker(images=False)
 
 
 def request(*, loading=False, units=(0, 25, 31), generation=1, hbm=0):
@@ -261,33 +273,29 @@ def _kv_only_load(hbm=8):
     )
 
 
-def test_kv_only_load_reads_page_alone_under_the_request_session(worker):
+def test_kv_only_load_reads_page_alone_under_the_request_session(page_worker):
     req = _kv_only_load()
-    worker._submit_load(req, object())
-    # The one lookup that reported the reach also locked it, under this session.
-    assert worker.submitted_request_ids == ["atom-offload-dp0:7"]
-    [spec] = worker.submitted
-    assert spec.request_configs == {"object_groups": [0]}
-    # PAGE for [8, 16), and a null placeholder per image group the retrieve skips.
-    states = worker._native_layout.checkpoint_spec.units_per_checkpoint
-    assert spec.block_ids == [[3, 4]] + [[-1]] * states
+    page_worker._submit_load(req, object())
+    # The lookup that reported the reach also locked it, under this session.
+    assert page_worker.submitted_request_ids == ["atom-offload-dp0:7"]
+    [spec] = page_worker.submitted
+    # PAGE for [8, 16) and nothing else: the layout has no image group.
+    assert spec.block_ids == [[3, 4]]
+    assert spec.request_configs is None
 
 
-def test_page_only_save_stores_page_with_null_image_groups(worker):
-    # ATOM_LMCACHE_MP_STATE_IMAGES=0: the store skips chunks whose ids are all
-    # null, so the image groups store nothing; no object-group option is sent.
+def test_page_only_save_stores_page_alone(page_worker):
     req = replace(
         request(), native_state=NativeStateTransfer((), 16, 998, None, kv_only=True)
     )
-    worker._submit_save(req, object())
-    [spec] = worker.submitted
+    page_worker._submit_save(req, object())
+    [spec] = page_worker.submitted
+    assert spec.block_ids == [[1, 2, 3, 4]]
     assert spec.request_configs is None
-    states = worker._native_layout.checkpoint_spec.units_per_checkpoint
-    assert spec.block_ids == [[1, 2, 3, 4]] + [[-1, -1]] * states
-    worker.future.ready = True
+    page_worker.future.ready = True
     terminals = [
         completion
-        for completion in worker.get_finished().connector_completions
+        for completion in page_worker.get_finished().connector_completions
         if completion.channel == NATIVE_STATE_MP_STORE_CHANNEL
     ]
     assert terminals == [
@@ -295,15 +303,67 @@ def test_page_only_save_stores_page_with_null_image_groups(worker):
     ]
 
 
-def test_kv_only_load_restores_nothing(worker, monkeypatch):
+def test_kv_only_load_restores_nothing(page_worker, monkeypatch):
     monkeypatch.setattr(
-        worker, "_begin_restore", lambda _: pytest.fail("no image to restore")
+        page_worker, "_begin_restore", lambda _: pytest.fail("no image to restore")
     )
     req = _kv_only_load()
-    worker._submit_load(req, object())
-    worker.future.ready = True
-    finished = worker.get_finished()
+    page_worker._submit_load(req, object())
+    page_worker.future.ready = True
+    finished = page_worker.get_finished()
     assert finished.finished_loading == {req.load_operation}
+
+
+def test_a_page_only_layout_registers_no_image_group(page_worker, worker):
+    assert not page_worker._native_layout.images
+    assert {g.engine_group_id for g in page_worker._native_layout.kernel_groups} == {0}
+    assert not any(g.recurrent_state for g in page_worker._native_layout.kernel_groups)
+    assert any(g.recurrent_state for g in worker._native_layout.kernel_groups)
+
+
+def test_page_alone_on_an_images_layout_fails_before_transport(worker):
+    # The scheduler and this worker disagree about images: nothing is sent.
+    worker._submit_load(_kv_only_load(), object())
+    assert worker.submitted == []
+
+
+def test_an_image_on_a_page_only_layout_fails_before_transport(page_worker):
+    page_worker._submit_save(request(), object())
+    assert page_worker.submitted == []
+
+
+@pytest.mark.parametrize(
+    "setting, replay, images",
+    [("auto", 7875, False), ("auto", 0, True), ("1", 7875, True), ("0", 7875, False)],
+)
+def test_images_follow_the_replay_unless_forced(monkeypatch, setting, replay, images):
+    monkeypatch.setenv("ATOM_LMCACHE_MP_STATE_IMAGES", setting)
+    assert stores_state_images(replay) is images
+
+
+@pytest.mark.parametrize("setting", ["0", "sometimes"])
+def test_images_off_without_a_replay_or_an_unknown_setting_is_refused(
+    monkeypatch, setting
+):
+    monkeypatch.setenv("ATOM_LMCACHE_MP_STATE_IMAGES", setting)
+    with pytest.raises(ValueError, match="ATOM_LMCACHE_MP_STATE_IMAGES"):
+        stores_state_images(0)
+
+
+def test_a_worker_counts_the_replay_the_scheduler_runs():
+    backend = SimpleNamespace(state_replay_tokens=lambda: 7875)
+    tensors = SimpleNamespace(state_backend=backend)
+    offload = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
+    on = SimpleNamespace(enable_prefix_caching=True, kv_transfer_config=offload)
+    assert worker_replay_tokens(on, tensors) == 7875
+    # What `BlockManager` refuses, the worker refuses too.
+    no_prefix = SimpleNamespace(enable_prefix_caching=False, kv_transfer_config=offload)
+    assert worker_replay_tokens(no_prefix, tensors) == 0
+    nixl = {"kv_connector": "nixl", "kv_role": "kv_both"}
+    other = SimpleNamespace(enable_prefix_caching=True, kv_transfer_config=nixl)
+    assert worker_replay_tokens(other, tensors) == 0
+    # A backend with no replay field (every model but DeepSeek-V4).
+    assert worker_replay_tokens(on, SimpleNamespace(state_backend=object())) == 0
 
 
 def test_load_completion_waits_for_native_restore(worker, monkeypatch):
@@ -648,3 +708,21 @@ def test_native_namespace_changes_with_image_codec(monkeypatch):
     assert _model_namespace(config(), checkpoint_spec=first) != _model_namespace(
         config(), checkpoint_spec=second
     )
+
+
+def test_a_layout_without_images_has_a_namespace_of_its_own(monkeypatch):
+    # Scheduler and workers that disagree about images find nothing, never
+    # each other's objects.
+    from atom.kv_transfer.offload.mp import deployment
+
+    monkeypatch.setattr(deployment.offcfg, "build_lmcache_config", lambda _: object())
+    monkeypatch.setattr(deployment.offcfg, "lmcache_replica_world_size", lambda _: 2)
+    monkeypatch.setattr(
+        deployment.offcfg, "build_page_namespace", lambda *_: "page-config"
+    )
+    spec = PagedStateCheckpointSpec(32, 128, "native-test-v1", 80)
+    with_images = _model_namespace(config(), checkpoint_spec=spec)
+    page_alone = _model_namespace(config(), checkpoint_spec=spec, images=False)
+    assert with_images != page_alone
+    assert "::native-state-v1-" in with_images
+    assert "::native-page-v1-" in page_alone

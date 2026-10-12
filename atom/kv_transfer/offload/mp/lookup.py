@@ -5,10 +5,8 @@
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 import time
-from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,25 +22,6 @@ _ASYNC_ADAPTER_ATTRS = (
     "_lookup_results",
 )
 
-# `IPCCacheServerKey.request_configs` entry an LMCache server reads to cover
-# only some object groups in a retrieve or a lock release (PAGE alone, say, for
-# a request that rebuilds its window state by replay).
-OBJECT_GROUPS_CONFIG = "object_groups"
-# Entry asking a lookup for the prefix these object groups cover on their own
-# (the reach) next to the prefix every group covers (the hit), in one answer,
-# and to keep their objects read-locked up to the reach.
-REACH_OBJECT_GROUPS_CONFIG = "reach_object_groups"
-
-
-def with_request_config(key: Any, name: str, value: Sequence[int] | None) -> Any:
-    """`key` with `request_configs[name] = list(value)`; unchanged for None."""
-    if value is None:
-        return key
-    configs = dict(key.request_configs or {})
-    configs[name] = list(value)
-    return dataclasses.replace(key, request_configs=configs)
-
-
 _ASYNC_LOOKUP_FAILED = (
     "LMCache MP async lookup failed for request %s in phase %s; "
     "read locks it may hold are left to the read TTL"
@@ -53,14 +32,8 @@ _ASYNC_LOOKUP_FAILED = (
 class _LookupState:
     token_ids: list[int]
     hit: int | None = None
-    # The reach groups' own prefix (`ask_reach`); None when not asked.
-    reach: int | None = None
     retrieve_start: int | None = None
     retrieve_end: int | None = None
-
-    def locked_end(self) -> int:
-        """Where this lookup's read locks end: its reach, or else its hit."""
-        return max(self.hit or 0, self.reach or 0)
 
 
 class _MPLookupClient:
@@ -90,10 +63,7 @@ class _MPLookupClient:
         # Answered async hits. Kept here, not only in the adapter's result
         # cache, which `cleanup_lookup_result` clears by request ID.
         self._async_hits: dict[str, int] = {}
-        self._async_reach: dict[str, int] = {}
         self._orphans: set[str] = set()
-        # Object groups whose own reach every lookup also asks for.
-        self._reach_groups: tuple[int, ...] = ()
         # The non-blocking path drives LMCache's ATOM adapter through its
         # internals (message-queue client and result caches). An adapter
         # without them falls back to the synchronous lookup.
@@ -114,17 +84,6 @@ class _MPLookupClient:
     # answered hit is kept in `_async_hits`, so the synchronous `lookup` that
     # later consumes it returns at once, and `discard` can still free its
     # locks after the adapter's result cache was cleaned up.
-
-    def ask_reach(self, object_groups: Sequence[int]) -> None:
-        """From now on every lookup also reports these groups' own reach.
-
-        The server folds the same presence bitmaps twice -- every group (the
-        hit), and these alone (the reach) -- so one lookup answers both, and
-        keeps these groups locked up to the reach. A caller that rebuilds the
-        other groups itself can then resume past the hit with no second
-        lookup. Needs a server that knows `REACH_OBJECT_GROUPS_CONFIG`.
-        """
-        self._reach_groups = tuple(sorted({int(g) for g in object_groups}))
 
     def submit(self, token_ids: list[int], lookup_id: str) -> bool:
         """Send this request's lookup without waiting. False if not sent."""
@@ -154,10 +113,6 @@ class _MPLookupClient:
             request_id=request_id,
             worker_id=None,
         )
-        if self._reach_groups:
-            key = with_request_config(
-                key, REACH_OBJECT_GROUPS_CONFIG, self._reach_groups
-            )
         future = adapter._client.lookup(key, adapter._parallel.tp_size)
         self._async[lookup_id] = [request_id, len(token_ids), "lookup", future]
         self._async_tokens[lookup_id] = token_ids
@@ -166,18 +121,6 @@ class _MPLookupClient:
     def is_pending(self, lookup_id: str) -> bool:
         """Submitted and not answered yet."""
         return lookup_id in self._async
-
-    def has_answer(self, lookup_id: str) -> bool:
-        """An async lookup answered and its result is waiting to be consumed.
-
-        Lets a caller consume it through `lookup` without that ever falling
-        back to a synchronous lookup of its own (which would not carry the
-        submitted lookup's options).
-        """
-        if lookup_id in self._async_hits:
-            return True
-        request_id = _mp_session_id(self._config, lookup_id)
-        return request_id in self._adapter._lookup_results
 
     def poll(self, lookup_id: str) -> bool:
         """Advance one async lookup without blocking. True once it answered."""
@@ -214,12 +157,7 @@ class _MPLookupClient:
         if result is None:
             entry[3] = adapter._client.query_prefetch_status(request_id)
             return False
-        chunk = int(adapter.lmcache_tokens_per_chunk)
-        if isinstance(result, (list, tuple)):
-            hit, reach = int(result[0]) * chunk, int(result[1]) * chunk
-            self._async_reach[lookup_id] = reach
-        else:
-            hit = int(result) * chunk
+        hit = int(result) * int(adapter.lmcache_tokens_per_chunk)
         adapter._lookup_results[request_id] = hit
         self._async_hits[lookup_id] = hit
         del self._async[lookup_id]
@@ -251,11 +189,10 @@ class _MPLookupClient:
     def _release_unconsumed(self, lookup_id: str) -> None:
         request_id = _mp_session_id(self._config, lookup_id)
         hit = self._async_hits.pop(lookup_id, None)
-        end = max(hit or 0, self._async_reach.pop(lookup_id, None) or 0)
         token_ids = self._async_tokens.pop(lookup_id, None)
-        if end and token_ids is not None:
+        if hit and token_ids is not None:
             self._adapter.free_lookup_locks(
-                token_ids=token_ids, start=0, end=end, request_id=request_id
+                token_ids=token_ids, start=0, end=hit, request_id=request_id
             )
         self._adapter.cleanup_lookup_result(request_id)
 
@@ -278,14 +215,6 @@ class _MPLookupClient:
         """
 
         self._orphans.discard(lookup_id)
-        if (
-            self._reach_groups
-            and lookup_id not in self._async
-            and lookup_id not in self._async_hits
-        ):
-            # The adapter's own synchronous lookup cannot ask for the reach;
-            # send this one as an async lookup and wait for it below.
-            self.submit(token_ids, lookup_id)
         if lookup_id in self._async:
             deadline = time.monotonic() + self._timeout
             while lookup_id in self._async:
@@ -311,7 +240,6 @@ class _MPLookupClient:
         self._async_tokens.pop(lookup_id, None)
         async_hit = self._async_hits.pop(lookup_id, None)
         state = _LookupState(token_ids=list(token_ids))
-        state.reach = self._async_reach.pop(lookup_id, None)
         self._lookups[lookup_id] = state
         if async_hit is not None:
             state.hit = async_hit
@@ -346,11 +274,11 @@ class _MPLookupClient:
         start: int,
         end: int | None = None,
     ) -> None:
-        """Hand one subrange of a lookup hit (or reach) to the worker retrieve.
+        """Hand one subrange of a lookup hit to the worker retrieve.
 
         The worker owns and releases locks in ``[start, end)``. Any hit prefix
-        already resident in HBM and any locked suffix beyond ``end`` will not
-        be consumed by that retrieve, so release those locks here.
+        already resident in HBM and any hit suffix beyond ``end`` will not be
+        consumed by that retrieve, so release those locks here.
         """
         if start < 0 or (end is not None and end < start):
             raise ValueError(
@@ -358,52 +286,38 @@ class _MPLookupClient:
             )
         state = self._lookups.get(lookup_id)
         request_id = _mp_session_id(self._config, lookup_id)
-        top = None if state is None or state.hit is None else state.locked_end()
-        if top is not None and end is not None and end > top:
-            bound = "hit" if state.reach is None else "reach"
+        if (
+            state is not None
+            and state.hit is not None
+            and end is not None
+            and end > state.hit
+        ):
             raise ValueError(
-                f"retrieve end {end} exceeds lookup {bound} {top} for {lookup_id}"
+                f"retrieve end {end} exceeds lookup hit {state.hit} for {lookup_id}"
             )
-        if top is not None and start > 0:
+        if state is not None and state.hit is not None and start > 0:
             self._adapter.free_lookup_locks(
                 token_ids=state.token_ids,
                 start=0,
-                end=min(start, top),
+                end=min(start, state.hit),
                 request_id=request_id,
             )
-        if top is not None and end is not None and end < top:
+        if (
+            state is not None
+            and state.hit is not None
+            and end is not None
+            and end < state.hit
+        ):
             self._adapter.free_lookup_locks(
                 token_ids=state.token_ids,
                 start=end,
-                end=top,
+                end=state.hit,
                 request_id=request_id,
             )
         if state is not None:
             state.retrieve_start = start
             state.retrieve_end = end
         self._adapter.cleanup_lookup_result(request_id)
-
-    def release_groups(
-        self, lookup_id: str, start: int, end: int, groups: Sequence[int]
-    ) -> None:
-        """Give back these object groups' locks in ``[start, end)`` only.
-
-        For a retrieve that reads the other groups alone: the lookup locked
-        these too, and the retrieve will neither read nor release them.
-        """
-        state = self._lookups.get(lookup_id)
-        if state is None or state.hit is None:
-            return
-        end = min(end, state.locked_end())
-        if start >= end:
-            return
-        self._adapter.free_lookup_locks(
-            token_ids=state.token_ids,
-            start=start,
-            end=end,
-            request_id=_mp_session_id(self._config, lookup_id),
-            request_configs={OBJECT_GROUPS_CONFIG: list(groups)},
-        )
 
     def complete_retrieve(self, lookup_id: str, *, succeeded: bool) -> None:
         # Once a retrieve is submitted, LMCache owns the remaining lookup
@@ -418,13 +332,6 @@ class _MPLookupClient:
     def hit_tokens(self, lookup_id: str) -> int | None:
         state = self._lookups.get(lookup_id)
         return None if state is None else state.hit
-
-    def reach_tokens(self, lookup_id: str) -> int | None:
-        """The consumed lookup's reach (`ask_reach`), else its hit; None if gone."""
-        state = self._lookups.get(lookup_id)
-        if state is None or state.hit is None:
-            return None
-        return state.locked_end()
 
     def clear_lookup_status(self, lookup_id: str) -> None:
         state = self._lookups.pop(lookup_id, None)
@@ -443,11 +350,16 @@ class _MPLookupClient:
             state.hit = int(result)
         # Once retrieve has started, the transfer owns the remaining read
         # locks. Failed terminal loads call complete_retrieve(False) first.
-        if state is not None and state.retrieve_start is None and state.locked_end():
+        if (
+            state is not None
+            and state.retrieve_start is None
+            and state.hit
+            and state.hit > 0
+        ):
             self._adapter.free_lookup_locks(
                 token_ids=state.token_ids,
                 start=0,
-                end=state.locked_end(),
+                end=state.hit,
                 request_id=request_id,
             )
         self._adapter.cleanup_lookup_result(request_id)

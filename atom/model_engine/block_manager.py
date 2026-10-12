@@ -93,6 +93,25 @@ def _connector_replays(kv_transfer_config: dict | None) -> bool:
     )
 
 
+def replay_refusal(config: Config, *, has_checkpoints: bool) -> str | None:
+    """Why this engine cannot run the backend's bounded replay; None if it can.
+
+    It needs the prefix index and the PAGE-backed checkpoints a replay stands
+    in for, and no KV connector but LMCache MP offload, the one whose loads
+    have learned to replay. Every connector load starts at `num_cached_tokens`
+    and raises it when the load lands, and a replay moves exactly that field
+    below blocks it has claimed: a load that does not know about the replay
+    would write those shared blocks and resume past it. A module function so
+    the LMCache MP workers, which decide their layout before any scheduler
+    exists, give the same answer as `BlockManager`.
+    """
+    if not has_checkpoints or not getattr(config, "enable_prefix_caching", False):
+        return "no PAGE-backed state checkpoints"
+    if not _connector_replays(getattr(config, "kv_transfer_config", None)):
+        return "a KV connector other than lmcache_mp offload"
+    return None
+
+
 @dataclass(frozen=True)
 class JointBoundaryDecision:
     """The outcome of the joint-boundary computation, as a value.
@@ -665,23 +684,14 @@ class BlockManager:
         (`AttentionMetadataBuilder.state_replay_tokens`, carried here on
         `StateRuntime`), and 0 when it does not; DeepSeek-V4's is the window's
         receptive field, see `deepseek_v4_replay`. What is left to ask here is
-        whether the manager can keep a hit with no checkpoint behind it: it
-        needs the prefix index and the PAGE-backed checkpoints a replay stands
-        in for, and no KV connector but LMCache MP offload, the one whose loads
-        have learned to replay.
+        whether the manager can keep a hit with no checkpoint behind it
+        (`replay_refusal`).
         """
         if not tokens:
             return 0
-        reason = None
-        if self.paged_state_checkpoints is None or not self.enable_prefix_caching:
-            reason = "no PAGE-backed state checkpoints"
-        elif not _connector_replays(getattr(config, "kv_transfer_config", None)):
-            # Every connector load starts at `num_cached_tokens` and raises it
-            # when the load lands, and a replay moves exactly that field below
-            # blocks it has claimed: a load that does not know about the
-            # replay would write those shared blocks and resume past it. Only
-            # LMCache MP's native-state scheduler is taught to (`replay_kv_load`).
-            reason = "a KV connector other than lmcache_mp offload"
+        reason = replay_refusal(
+            config, has_checkpoints=self.paged_state_checkpoints is not None
+        )
         if reason is not None:
             logger.warning("[State Cache] bounded replay off: %s.", reason)
             return 0

@@ -24,9 +24,8 @@ from atom.kv_transfer.offload.metadata import LoadSpec, NativeStateTransfer
 from atom.kv_transfer.offload.mp.deployment import _validate_mp_config
 from atom.kv_transfer.offload.mp.native_state_worker import (
     NATIVE_STATE_MP_STORE_CHANNEL,
-    PAGE_OBJECT_GROUP,
-    STATE_OBJECT_GROUP,
     require_native_state_server,
+    stores_state_images,
 )
 from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
 from atom.model_engine.page_unit_checkpoint import SuspendedCheckpointRestore
@@ -90,7 +89,14 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             raise ValueError(
                 "native-state LMCache MP requires PAGE checkpoint geometry"
             )
-        super().__init__(self._config, checkpoint_spec=coordinator.store.spec)
+        # Images or PAGE alone is settled before the adapter connects: the
+        # namespace names it, and every worker answers the same question with
+        # the same replay length (`stores_state_images`).
+        replay_tokens = int(getattr(block_manager, "state_replay_tokens", 0))
+        images = stores_state_images(replay_tokens)
+        super().__init__(
+            self._config, checkpoint_spec=coordinator.store.spec, images=images
+        )
         try:
             require_native_state_server(self._mp_adapter, self._config)
             self._hash_block_size = int(block_manager.hash_block_size)
@@ -123,30 +129,14 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         self._save_failures: dict[str, tuple[Any, int, int]] = {}
         self._retired_requests: dict[str, Any] = {}
         # Bounded replay (`Sequence.replay_kv_load`): tokens one replays, or 0
-        # when it is off. With it on, every lookup also reports how far the
-        # PAGE KV alone reaches, which a replay can resume past the last image.
-        self._replay_tokens = int(getattr(block_manager, "state_replay_tokens", 0))
-        if self._replay_tokens:
-            self._lookup_client.ask_reach((PAGE_OBJECT_GROUP,))
-        # PAGE-only (ATOM_LMCACHE_MP_STATE_IMAGES, the default whenever a replay
-        # runs): saves store PAGE KV alone, at any chunk boundary, and every hit
-        # is a KV-only load plus a replay. Without a replay nothing could ever
-        # resume from such a save, so images stay on then.
-        setting = envs.ATOM_LMCACHE_MP_STATE_IMAGES
-        if setting == "auto":
-            self._page_only = bool(self._replay_tokens)
-        elif setting in ("1", "true", "yes", "on", "0", "false", "no", "off"):
-            self._page_only = setting in ("0", "false", "no", "off")
-        else:
-            raise ValueError(
-                f"ATOM_LMCACHE_MP_STATE_IMAGES={setting!r}: expected auto, 1 or 0"
-            )
+        # when it is off.
+        self._replay_tokens = replay_tokens
+        # PAGE alone (the default whenever a replay runs): saves store the PAGE
+        # KV at any chunk boundary, the layout has no image group, so the
+        # server's hit is the PAGE KV's extent, and every hit is a KV-only load
+        # plus a replay.
+        self._page_only = not images
         if self._page_only:
-            if not self._replay_tokens:
-                raise ValueError(
-                    "ATOM_LMCACHE_MP_STATE_IMAGES=0 needs a bounded replay "
-                    "(ATOM_DSV4_STATE_REPLAY=1)"
-                )
             logger.info(
                 "LMCache MP: state images off; saves store PAGE KV alone and "
                 "every hit replays %d tokens below the KV it loads.",
@@ -217,32 +207,33 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
 
     # -- KV-only reach, for a bounded replay -------------------------------
     #
-    # A lookup reports the longest prefix whose PAGE KV is present AND whose
-    # state image sits at its end (the hit). A replay needs only the first:
-    # it rebuilds the window state from the KV. With replay on, the same
-    # lookup also reports how far the PAGE KV alone reaches (the reach; the
-    # server folds the same presence bitmaps twice), and keeps the PAGE KV
-    # locked up to it. `BlockManager._replay_hit` weighs it at admission.
+    # With images, a lookup's hit is the longest prefix whose PAGE KV is
+    # present AND whose state image sits at its end. Without them the layout
+    # has PAGE alone, so the server's hit is how far the PAGE KV reaches (the
+    # reach): no image ends it, so the state-carrying hit is 0 and the reach is
+    # a replay's to use. The lookup keeps the PAGE KV locked up to it, and
+    # `BlockManager._replay_hit` weighs it at admission.
 
     def _fresh_tier_lookup(self, seq: Any, sid: str) -> int | None:
-        if not self._replay_tokens:
+        if not self._page_only:
             return super()._fresh_tier_lookup(seq, sid)
-        # A lookup this request still holds (one whose reach kept the PAGE KV
-        # locked past a hit of 0, say) goes back first: asking again replaces
-        # the server's record of what the earlier one locked.
+        # A lookup this request still holds (one whose reach was never weighed,
+        # say) goes back first: asking again replaces the server's record of
+        # what the earlier one locked.
         self._kv_reach.pop(sid, None)
-        if self._lookup_client.reach_tokens(sid) is not None:
+        if self._lookup_client.hit_tokens(sid) is not None:
             self._lookup_client.clear_lookup_status(sid)
-        hit = super()._fresh_tier_lookup(seq, sid)
-        if hit is not None:
-            # Never below the hit: a server that does not know the option
-            # answers with the hit alone, and then there is no reach past it.
-            reach = max(int(hit), int(self._lookup_client.reach_tokens(sid) or 0))
-            self._kv_reach[sid] = (seq, reach)
-            # Kept on the request past admission, for a later admission that
-            # reuses this answer instead of asking again (the save floor).
-            seq._mp_page_reach = reach
-        return hit
+        reach = super()._fresh_tier_lookup(seq, sid)
+        if reach is None:
+            return None
+        self._kv_reach[sid] = (seq, int(reach))
+        # Kept on the request past admission, for a later admission that
+        # reuses this answer instead of asking again (the save floor).
+        seq._mp_page_reach = int(reach)
+        # The base recorded the reach as the hit; there is no image behind it.
+        self._lookup_results[sid] = (seq, 0)
+        self._remember_tier_hit(seq, sid, 0)
+        return 0
 
     def _kv_only_reach(self, seq: Any) -> int:
         """This request's KV-only reach in tokens, or 0 if unknown."""
@@ -323,8 +314,8 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         # A KV-only load reads under its lookup, whose locks nothing has
         # released since it answered (no dispatch unpins it). Asking again --
         # what the base does for a load admitted on a remembered hit -- would
-        # weigh the hit, which falls short of any reach past the last image.
-        reach = self._lookup_client.reach_tokens(sid)
+        # weigh a hit of 0 (no image), and drop the load.
+        reach = self._lookup_client.hit_tokens(sid)
         return reach is not None and int(reach) >= int(spec.lmcache_cached_tokens)
 
     def _save_frontier(self, seq: Any) -> int:
@@ -583,17 +574,9 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         self._parked_loads.clear()
         for request in metadata.requests:
             if request.load_operation is not None:
-                transfer = self._native_loads[request.load_operation].transfer
-                request.native_state = transfer
-                if transfer.kv_only:
-                    # The retrieve reads PAGE alone; the lookup also locked the
-                    # image at its hit, which nothing would read or release.
-                    self._lookup_client.release_groups(
-                        str(request.req_id),
-                        int(request.load_spec.hbm_cached_tokens),
-                        int(transfer.boundary_tokens),
-                        (STATE_OBJECT_GROUP,),
-                    )
+                request.native_state = self._native_loads[
+                    request.load_operation
+                ].transfer
         return metadata
 
     def _release_native_load(
