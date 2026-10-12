@@ -1880,8 +1880,12 @@ class Scheduler:
 
             self._notify_connector_after_prefill_alloc(seq)
 
+            # A replay that loads its KV first parks for that load whatever the
+            # lookup answered: the answer was the state-carrying hit, which a
+            # KV-only reach can exceed. Running the forward instead would start
+            # under the replay's floors before the KV below them arrived.
             needs_remote_load = self._confirm_remote_load_after_alloc(
-                seq, needs_remote_load
+                seq, needs_remote_load or getattr(seq, "replay_kv_load", False)
             )
 
             if needs_remote_load:
@@ -2338,6 +2342,11 @@ class Scheduler:
                 # re-admission rebuilds a clean one via can_allocate/allocate
                 # (empty block_table disqualifies the offload-resume shortcut).
                 self.block_manager.deallocate(seq)
+        if getattr(seq, "replay_kv_load", False):
+            # The KV past the HBM hit never arrived, and the state slot is
+            # fresh, so the HBM hit is no place to resume. Replay below it
+            # instead: everything under it is claimed and exact.
+            self.block_manager.fall_back_to_hbm_replay(seq)
         seq.offload_loaded = False
         seq.offload_loaded_tokens = seq.num_cached_tokens
         seq.offload_load_start_tokens = None
@@ -2439,6 +2448,10 @@ class Scheduler:
             # Report the extended CPU-offload hit without reducing any
             # prefix-cache hit inherited from an upstream prefill node.
             seq.prefix_cache_hit_tokens = max(seq.prefix_cache_hit_tokens, loaded)
+        if getattr(seq, "replay_kv_load", False):
+            # The KV alone came back (no state image): rebuild the windows by
+            # replaying up to where it reaches.
+            self.block_manager.begin_loaded_replay(seq)
         seq.offload_load_start_tokens = None
         seq.offload_loaded = True
         # A state load moves no KV, so the block above does nothing for it --
