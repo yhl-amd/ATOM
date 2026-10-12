@@ -230,6 +230,9 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             # answers with the hit alone, and then there is no reach past it.
             reach = max(int(hit), int(self._lookup_client.reach_tokens(sid) or 0))
             self._kv_reach[sid] = (seq, reach)
+            # Kept on the request past admission, for a later admission that
+            # reuses this answer instead of asking again (the save floor).
+            seq._mp_page_reach = reach
         return hit
 
     def _kv_only_reach(self, seq: Any) -> int:
@@ -278,6 +281,14 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
                 # back now. An ordinary load keeps them; its retrieve hands
                 # back the part past the hit (`prepare_retrieve`).
                 super()._release_lookup(sid)
+        if self._page_only:
+            # The base saves from the lookup's hit, which needs an image at its
+            # end and so is 0 here: every request would store its whole prompt
+            # again (a c384 run copied 6.3x the tokens). LMCache already holds
+            # the PAGE KV up to the reach, so the save starts there.
+            reach = self._chunk_floor(int(getattr(seq, "_mp_page_reach", 0) or 0))
+            if reach > int(self._hit_save_floors.get(sid, 0)):
+                self._hit_save_floors[sid] = reach
         super().update_state_after_alloc(seq)
 
     def should_park_for_load_after_alloc(self, seq: Any) -> bool:

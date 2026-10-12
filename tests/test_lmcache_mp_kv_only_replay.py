@@ -479,3 +479,34 @@ def test_page_only_never_restores_an_image(monkeypatch):
     assert not scheduler.should_park_for_load_after_alloc(seq)
     assert scheduler._native_loads == {}
     assert checkpoints.store.pool.num_free == free
+
+
+def test_a_page_only_save_starts_at_the_page_reach(monkeypatch):
+    # The lookup's hit needs an image, so it is 0 here; saving from it would
+    # store the whole prompt again. LMCache holds the PAGE KV to the reach.
+    scheduler, _, adapter, _ = _scheduler(
+        monkeypatch, chunks=0, kv_chunks=3, page_only=True
+    )
+    seq = _seq()
+    _look_up(scheduler, seq)
+    assert seq.offload_joint.kv_only_tokens == 24
+    seq.num_cached_tokens = 36  # HBM covers the reach: nothing loads
+    scheduler.update_state_after_alloc(seq)
+    assert not scheduler.should_park_for_load_after_alloc(seq)
+    [request] = scheduler.build_connector_meta().requests
+    assert request.load_spec is None
+    assert request.save_spec.skip_leading_tokens == 24
+    assert request.native_state.boundary_tokens == 32
+    # The lookup's locks, to the reach, went back at admission.
+    assert (0, 24, None) in _freed(adapter)
+
+
+def test_a_page_only_readmission_keeps_the_earlier_reach_as_its_floor(monkeypatch):
+    # A request admitted on a remembered answer asks nothing new.
+    scheduler, _, _, _ = _scheduler(monkeypatch, chunks=0, kv_chunks=0, page_only=True)
+    seq = _seq()
+    seq._mp_page_reach = 16
+    seq.num_cached_tokens = 36
+    scheduler.update_state_after_alloc(seq)
+    [request] = scheduler.build_connector_meta().requests
+    assert request.save_spec.skip_leading_tokens == 16
