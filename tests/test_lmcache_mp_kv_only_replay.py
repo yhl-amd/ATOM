@@ -150,9 +150,17 @@ def _scheduler(
     min_load=0,
     legacy=False,
     page_only=False,
+    images=None,
 ):
+    """`images`: ATOM_LMCACHE_MP_STATE_IMAGES as given ("unset" for none);
+    by default "0" with `page_only` and "1" without."""
     monkeypatch.setenv("OFFLOAD_MIN_SAVE_TOKENS", "0")
-    monkeypatch.setenv("ATOM_LMCACHE_MP_STATE_IMAGES", "0" if page_only else "1")
+    if images is None:
+        images = "0" if page_only else "1"
+    if images == "unset":
+        monkeypatch.delenv("ATOM_LMCACHE_MP_STATE_IMAGES", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_LMCACHE_MP_STATE_IMAGES", images)
     monkeypatch.setattr(
         deployment.offcfg,
         "build_lmcache_config",
@@ -433,6 +441,23 @@ def test_an_abort_while_waiting_returns_the_reach(monkeypatch):
 def test_page_only_needs_a_replay(monkeypatch):
     with pytest.raises(ValueError, match="ATOM_DSV4_STATE_REPLAY"):
         _scheduler(monkeypatch, chunks=0, kv_chunks=0, replay=0, page_only=True)
+
+
+def test_by_default_a_replay_stores_no_images(monkeypatch):
+    scheduler, _, _, _ = _scheduler(monkeypatch, chunks=0, kv_chunks=0, images="unset")
+    assert scheduler._page_only
+
+
+def test_by_default_no_replay_keeps_the_images(monkeypatch):
+    scheduler, _, _, _ = _scheduler(
+        monkeypatch, chunks=0, kv_chunks=0, replay=0, images="unset"
+    )
+    assert not scheduler._page_only
+
+
+def test_an_unknown_images_setting_is_refused(monkeypatch):
+    with pytest.raises(ValueError, match="expected auto, 1 or 0"):
+        _scheduler(monkeypatch, chunks=0, kv_chunks=0, images="sometimes")
 
 
 def test_a_page_only_save_stores_page_alone_with_no_checkpoint(monkeypatch):

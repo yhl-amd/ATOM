@@ -128,10 +128,19 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         self._replay_tokens = int(getattr(block_manager, "state_replay_tokens", 0))
         if self._replay_tokens:
             self._lookup_client.ask_reach((PAGE_OBJECT_GROUP,))
-        # ATOM_LMCACHE_MP_STATE_IMAGES=0: saves store PAGE KV alone, at any
-        # chunk boundary, and every hit is a KV-only load plus a replay. Without
-        # a replay nothing could ever resume from such a save.
-        self._page_only = not envs.ATOM_LMCACHE_MP_STATE_IMAGES
+        # PAGE-only (ATOM_LMCACHE_MP_STATE_IMAGES, the default whenever a replay
+        # runs): saves store PAGE KV alone, at any chunk boundary, and every hit
+        # is a KV-only load plus a replay. Without a replay nothing could ever
+        # resume from such a save, so images stay on then.
+        setting = envs.ATOM_LMCACHE_MP_STATE_IMAGES
+        if setting == "auto":
+            self._page_only = bool(self._replay_tokens)
+        elif setting in ("1", "true", "yes", "on", "0", "false", "no", "off"):
+            self._page_only = setting in ("0", "false", "no", "off")
+        else:
+            raise ValueError(
+                f"ATOM_LMCACHE_MP_STATE_IMAGES={setting!r}: expected auto, 1 or 0"
+            )
         if self._page_only:
             if not self._replay_tokens:
                 raise ValueError(
