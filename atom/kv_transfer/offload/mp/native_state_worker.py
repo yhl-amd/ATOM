@@ -192,10 +192,11 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             raise ValueError("native STATE and PAGE endpoints must match")
         count = (end - start) // self.chunk_size
         if state.kv_only:
-            if not loading or state.unit_ids or state.destination_slot is not None:
-                raise ValueError("a KV-only native transfer is a load with no image")
-            # The image groups still need placeholder ids of full length; the
-            # retrieve skips them (`object_groups`), so none is ever read.
+            if state.unit_ids or state.destination_slot is not None:
+                raise ValueError("a KV-only native transfer moves no image")
+            # The image groups still need placeholder ids of full length: a
+            # retrieve skips them (`object_groups`), and a store skips chunks
+            # whose ids are all null, so none is ever read or written.
             states = self._native_layout.checkpoint_spec.units_per_checkpoint
             return [self._block_slice(req, start, end)] + [
                 [-1] * count for _ in range(states)
@@ -256,11 +257,12 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 else req.save_spec.skip_leading_tokens
             )
             kv_only = req.native_state is not None and req.native_state.kv_only
-            # PAGE alone: the image group is neither locked nor read. Passed
-            # only then, so an LMCache without the option still serves the rest.
+            # A KV-only load reads PAGE alone: the image group is neither locked
+            # nor read. Passed only then, so an LMCache without the option
+            # still serves the rest; a PAGE-only store needs no option at all.
             options = (
                 {"request_configs": {OBJECT_GROUPS_CONFIG: [PAGE_OBJECT_GROUP]}}
-                if kv_only
+                if kv_only and loading
                 else {}
             )
             try:

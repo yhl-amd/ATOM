@@ -40,7 +40,8 @@ _MAX_SAVE_ATTEMPTS = 3
 @dataclass
 class _NativeSave:
     seq: Any
-    source: StateStoreOperationId
+    # The checkpoint lease the image is read from; None for a PAGE-only save.
+    source: StateStoreOperationId | None
     saved_before: int
     boundary: int
 
@@ -127,6 +128,21 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         self._replay_tokens = int(getattr(block_manager, "state_replay_tokens", 0))
         if self._replay_tokens:
             self._lookup_client.ask_reach((PAGE_OBJECT_GROUP,))
+        # ATOM_LMCACHE_MP_STATE_IMAGES=0: saves store PAGE KV alone, at any
+        # chunk boundary, and every hit is a KV-only load plus a replay. Without
+        # a replay nothing could ever resume from such a save.
+        self._page_only = not envs.ATOM_LMCACHE_MP_STATE_IMAGES
+        if self._page_only:
+            if not self._replay_tokens:
+                raise ValueError(
+                    "ATOM_LMCACHE_MP_STATE_IMAGES=0 needs a bounded replay "
+                    "(ATOM_DSV4_STATE_REPLAY=1)"
+                )
+            logger.info(
+                "LMCache MP: state images off; saves store PAGE KV alone and "
+                "every hit replays %d tokens below the KV it loads.",
+                self._replay_tokens,
+            )
         # sid -> (seq, KV-only reach in tokens) of the request's lookup, from
         # its answer until admission weighs it. The lookup keeps the PAGE KV
         # locked up to the reach meanwhile, so nothing releases it before then.
@@ -304,6 +320,9 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             else 0
         )
         floor = self._save_floor(exhausted)
+        if self._page_only:
+            # No image to wait for: any computed chunk boundary will do.
+            return frontier if frontier > floor else 0
         # Every tracked request asks every step. The answer changes only when
         # its frontier moves or one of ITS boundary checkpoints is published or
         # dropped, so rescan only then -- not whenever any request's
@@ -343,6 +362,8 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
 
     def _late_save_frontier(self, seq: Any, saved: int, available: int) -> int:
         available = self._chunk_floor(available)
+        if self._page_only:
+            return available if available > self._save_floor(saved) else saved
         for boundary in range(available, self._save_floor(saved), -self.chunk_size):
             if self._checkpoints.contains(self._boundary_hash(seq, boundary)):
                 return boundary
@@ -357,6 +378,15 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         if not self._may_emit_save():
             return None
         prefix_hash = self._boundary_hash(seq, aligned)
+        if self._page_only:
+            request = super()._build_save_request(
+                seq, saved, aligned, operation, block_ids, is_last_prefill
+            )
+            request.native_state = NativeStateTransfer(
+                (), aligned, prefix_hash, kv_only=True
+            )
+            self._native_saves[operation] = _NativeSave(seq, None, saved, aligned)
+            return request
         source = self._checkpoints.acquire_checkpoint_source(
             prefix_hash, max_inflight=self._max_pending_saves
         )
@@ -394,8 +424,9 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         )
         # The image pin is released on the terminal only: no PAGE chunk
         # milestone proves the server has finished reading the STATE groups.
-        self._checkpoints.release_offload_store_source(lease.source)
-        self._checkpoints.settle_offload_store(lease.source)
+        if lease.source is not None:
+            self._checkpoints.release_offload_store_source(lease.source)
+            self._checkpoints.settle_offload_store(lease.source)
         sid = str(operation.req_id)
         if succeeded:
             self._save_failures.pop(sid, None)
@@ -466,6 +497,9 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             self._active_load_operations[sid] = (seq, operation)
             seq._load_operation = operation
             return decision
+        if self._page_only:
+            # Nothing stores images, so no hit carries one to restore.
+            return False, "native_no_images", hbm, lmc, need, chunk
         # No byte budget on top of the PAGE pool: one load per request bounds
         # these by the admitted batch, and a pool without room for an image
         # refuses here. A refusal recomputes the prefix, which costs far more

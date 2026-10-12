@@ -15,7 +15,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
-from atom.kv_transfer.disaggregation.types import KVConnectorOutput, LoadOperationId
+import pytest
+
+from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
+    KVConnectorOutput,
+    LoadOperationId,
+)
 from atom.kv_transfer.offload.mp import deployment
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp.lookup import (
@@ -27,6 +33,7 @@ from atom.kv_transfer.offload.mp.native_state_scheduler import (
     NativeStateLMCacheMPConnectorScheduler,
 )
 from atom.kv_transfer.offload.mp.native_state_worker import (
+    NATIVE_STATE_MP_STORE_CHANNEL,
     PAGE_OBJECT_GROUP,
     STATE_OBJECT_GROUP,
 )
@@ -135,9 +142,17 @@ def _freed(adapter):
 
 
 def _scheduler(
-    monkeypatch, *, chunks, kv_chunks, replay=REPLAY, min_load=0, legacy=False
+    monkeypatch,
+    *,
+    chunks,
+    kv_chunks,
+    replay=REPLAY,
+    min_load=0,
+    legacy=False,
+    page_only=False,
 ):
     monkeypatch.setenv("OFFLOAD_MIN_SAVE_TOKENS", "0")
+    monkeypatch.setenv("ATOM_LMCACHE_MP_STATE_IMAGES", "0" if page_only else "1")
     monkeypatch.setattr(
         deployment.offcfg,
         "build_lmcache_config",
@@ -410,3 +425,57 @@ def test_an_abort_while_waiting_returns_the_reach(monkeypatch):
     _look_up(scheduler, seq)
     scheduler.request_finished(seq)
     assert (0, 32, None) in _freed(adapter)
+
+
+# -- ATOM_LMCACHE_MP_STATE_IMAGES=0: PAGE alone, every hit a replay ----------
+
+
+def test_page_only_needs_a_replay(monkeypatch):
+    with pytest.raises(ValueError, match="ATOM_DSV4_STATE_REPLAY"):
+        _scheduler(monkeypatch, chunks=0, kv_chunks=0, replay=0, page_only=True)
+
+
+def test_a_page_only_save_stores_page_alone_with_no_checkpoint(monkeypatch):
+    scheduler, checkpoints, _, _ = _scheduler(
+        monkeypatch, chunks=0, kv_chunks=0, page_only=True
+    )
+    seq = _seq()
+    seq.num_cached_tokens = 36  # computed so far; no checkpoint anywhere
+    free = checkpoints.store.pool.num_free
+    scheduler.update_state_after_alloc(seq)
+    [request] = scheduler.build_connector_meta().requests
+    # Up to the computed chunk boundary, with no image waited for or pinned.
+    assert request.native_state.kv_only
+    assert request.native_state.unit_ids == ()
+    assert request.native_state.boundary_tokens == 32
+    assert request.token_ids == list(seq.token_ids[:32])
+    assert request.save_spec.skip_leading_tokens == 0
+    assert checkpoints.store.pool.num_free == free
+    operation = request.save_operation
+    scheduler.process_completions(
+        KVConnectorOutput(
+            finished_saving={operation},
+            connector_completions={
+                ConnectorCompletion(NATIVE_STATE_MP_STORE_CHANNEL, operation, True)
+            },
+        )
+    )
+    assert scheduler._native_saves == {}
+    assert str(seq.id) not in scheduler._save_inflight
+    assert checkpoints.store.pool.num_free == free
+
+
+def test_page_only_never_restores_an_image(monkeypatch):
+    # A hit carrying an image cannot come from this layout, but if a server
+    # reported one the load would read units nothing ever wrote.
+    scheduler, checkpoints, _, _ = _scheduler(
+        monkeypatch, chunks=2, kv_chunks=2, page_only=True
+    )
+    seq = _seq()
+    _look_up(scheduler, seq)
+    seq.num_cached_tokens = 0
+    free = checkpoints.store.pool.num_free
+    scheduler.update_state_after_alloc(seq)
+    assert not scheduler.should_park_for_load_after_alloc(seq)
+    assert scheduler._native_loads == {}
+    assert checkpoints.store.pool.num_free == free
