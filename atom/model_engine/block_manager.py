@@ -298,7 +298,9 @@ class BlockManager:
         self.state_caches: tuple[StateCache, ...] = (self._state_checkpoint_cache,)
         # Bounded replay: tokens to recompute below a compressed-history hit so
         # every layer's window state there comes out exact. 0 = off.
-        self.state_replay_tokens = self._state_replay_tokens(config)
+        self.state_replay_tokens = self._state_replay_tokens(
+            config, state_runtime.replay_tokens
+        )
 
         # Class names already warned about in `state_checkpoint_fates`. See
         # there for why the warning latches.
@@ -642,43 +644,23 @@ class BlockManager:
         hbs = self.hash_block_size
         return seq.token_ids[i * hbs : (i + 1) * hbs]
 
-    def _state_replay_tokens(self, config: Config) -> int:
-        """Tokens a bounded replay recomputes below a hit, or 0 when it is off.
+    def _state_replay_tokens(self, config: Config, tokens: int) -> int:
+        """`tokens`, the backend's replay field, or 0 where this manager can't.
 
-        DeepSeek-V4's per-request state is each layer's sliding window plus the
-        compressors' partial groups. Neither is in the cached blocks, but both
-        are local: layer l's window at H depends only on layer l-1 over the
-        last `W` positions, so with every layer's compressed KV and indexer K
-        cached (read-only), recomputing `W + (L-1)(W-1)` tokens below H rebuilds
-        all L windows exactly. The compressor groups need at most `2*ratio - 1`
-        trailing positions of a layer's input, which that span already covers
-        (and H is a multiple of 128, so no C128 group is open there). An MTP
-        layer reads the trunk's output and carries a window of its own, so it
-        counts as one more layer.
-
-        Off unless ATOM_DSV4_STATE_REPLAY is set, and only for the plain V4
-        trunk on a single-rank prefill with no KV connector: context parallel
-        splits the query axis the floors are indexed by, a DSpark draft has
-        windows of its own, and connector loads (LMCache, P/D) have not
-        learned to replay (yet).
+        How far below a hit the state rebuilds is the backend's answer
+        (`AttentionMetadataBuilder.state_replay_tokens`, carried here on
+        `StateRuntime`), and 0 when it does not; DeepSeek-V4's is the window's
+        receptive field, see `deepseek_v4_replay`. What is left to ask here is
+        whether the manager can keep a hit with no checkpoint behind it: it
+        needs the prefix index and the PAGE-backed checkpoints a replay stands
+        in for, and no KV connector, whose loads have not learned to replay
+        (yet).
         """
-        if not envs.ATOM_DSV4_STATE_REPLAY:
+        if not tokens:
             return 0
         reason = None
-        hf = config.hf_config
-        arches = getattr(hf, "architectures", None) or []
-        spec = config.speculative_config
-        method = (spec.method or "") if spec is not None else ""
         if self.paged_state_checkpoints is None or not self.enable_prefix_caching:
             reason = "no PAGE-backed state checkpoints"
-        elif not any(str(a).startswith("DeepseekV4For") for a in arches):
-            reason = f"architecture {arches} is not the DeepSeek-V4 trunk"
-        elif not set(getattr(hf, "compress_ratios", ()) or ()) <= {0, 4, 128}:
-            reason = "compress ratios other than 4 / 128"
-        elif method not in ("", "mtp"):
-            reason = f"speculative method {method!r}"
-        elif config.prefill_context_parallel_size > 1 or self.dcp_world_size > 1:
-            reason = "context parallelism"
         elif getattr(config, "kv_transfer_config", None):
             # Every connector load starts at `num_cached_tokens` and raises it
             # when the load lands, and a replay moves exactly that field below
@@ -688,25 +670,10 @@ class BlockManager:
         if reason is not None:
             logger.warning("[State Cache] bounded replay off: %s.", reason)
             return 0
-        window = int(hf.sliding_window)
-        layers = int(hf.num_hidden_layers)
-        if method == "mtp":
-            layers += int(getattr(hf, "num_nextn_predict_layers", 1) or 1)
-        tokens = window + (layers - 1) * (window - 1)
-        if override := envs.ATOM_DSV4_STATE_REPLAY_TOKENS:
-            logger.warning(
-                "[State Cache] bounded replay length forced to %d tokens "
-                "(the exact field is %d); shorter is not exact.",
-                override,
-                tokens,
-            )
-            tokens = override
         logger.info(
             "[State Cache] bounded replay on: a hit past the nearest checkpoint "
-            "by more than %d tokens (window %d, %d layers) replays that many.",
+            "by more than %d tokens replays that many.",
             tokens,
-            window,
-            layers,
         )
         return tokens
 
@@ -1053,10 +1020,10 @@ class BlockManager:
         # so a boundary is only resumable where somebody checkpointed the state.
         # `_gated_hit` settles the two gates jointly; neither can be applied to
         # the other's answer.
-        num_cached_blocks = self._gated_hit(seq, compressed_hit, block_hashes)
+        resumable = self._gated_hit(seq, compressed_hit, block_hashes)
         # A checkpoint far below the compressed hit loses to a bounded replay,
         # which keeps the whole hit and rebuilds the state at its end.
-        num_cached_blocks = self._replay_hit(seq, compressed_hit, num_cached_blocks)
+        num_cached_blocks = self._replay_hit(seq, compressed_hit, resumable)
         # Instrumentation: the pre-gate hit, so EngineStats can separate reuse
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
@@ -1073,9 +1040,14 @@ class BlockManager:
         # After `num_new_blocks`, not before: the demand's room check has to
         # account for what this very admission is about to take, or it reads a
         # pool it then drains itself.
+        #
+        # `resumable`, not the replayed hit: a replay keeps the reuse, but every
+        # later admission that finds no checkpoint at its end pays the replay
+        # again. The gap the gates left is still worth a rung, and the replay's
+        # end, where the state is exact again, is where it lands.
         self._record_checkpoint_demand(
             seq,
-            hit=num_cached_blocks,
+            hit=resumable,
             compressed_hit=compressed_hit,
             block_hashes=block_hashes,
             live_blocks=num_new_blocks,
@@ -1964,6 +1936,11 @@ class BlockManager:
             if interval_on and self.state_checkpoint_demand and wanted > hit
             else 0
         )
+        # Below a replay's end the state is not exact yet, so neither the cut
+        # nor the keep lands there (`checkpoint_cut`, `checkpointers_at`): a
+        # demand inside the replay would be counted and never filled.
+        if demand < seq.replay_end:
+            demand = 0
         # A demand is an instruction to cut a prefill chunk onto a rung, and
         # that cut costs the request a forward. Buying one for a store
         # `begin_store` is about to refuse is the only part of this funnel

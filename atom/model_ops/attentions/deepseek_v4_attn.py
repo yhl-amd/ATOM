@@ -67,6 +67,7 @@ from atom.model_engine.page_unit_checkpoint import (
 )
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
+from atom.model_ops.attentions import deepseek_v4_replay
 from atom.model_ops.attentions.backends import (
     AttentionBackend,
     AttentionMetadataBuilder,
@@ -1117,6 +1118,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     def checkpoint_image_bytes(self) -> int:
         """Bytes one checkpoint image holds. Priced before the pool exists."""
         return sum(self._checkpoint_segment_sizes())
+
+    def state_replay_tokens(self) -> int:
+        """The window's receptive field; see `deepseek_v4_replay`."""
+        return deepseek_v4_replay.state_replay_tokens(self.model_runner.config)
 
     def _assert_ratios_divide_the_alignment(self) -> None:
         """A checkpoint boundary has to be a compression boundary too.

@@ -1924,6 +1924,7 @@ class ModelRunner:
         state_runtime = StateRuntime(
             transfer=transfer,
             checkpoint_spec=checkpoint_spec,
+            replay_tokens=self.attn_metadata_builder.state_replay_tokens(),
         )
         self.state_runtime = state_runtime
         for name in sorted(plan.entries):
