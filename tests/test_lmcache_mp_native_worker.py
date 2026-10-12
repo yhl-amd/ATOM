@@ -273,6 +273,28 @@ def test_kv_only_load_reads_page_alone_under_the_request_session(worker):
     assert spec.block_ids == [[3, 4]] + [[-1]] * states
 
 
+def test_page_only_save_stores_page_with_null_image_groups(worker):
+    # ATOM_LMCACHE_MP_STATE_IMAGES=0: the store skips chunks whose ids are all
+    # null, so the image groups store nothing; no object-group option is sent.
+    req = replace(
+        request(), native_state=NativeStateTransfer((), 16, 998, None, kv_only=True)
+    )
+    worker._submit_save(req, object())
+    [spec] = worker.submitted
+    assert spec.request_configs is None
+    states = worker._native_layout.checkpoint_spec.units_per_checkpoint
+    assert spec.block_ids == [[1, 2, 3, 4]] + [[-1, -1]] * states
+    worker.future.ready = True
+    terminals = [
+        completion
+        for completion in worker.get_finished().connector_completions
+        if completion.channel == NATIVE_STATE_MP_STORE_CHANNEL
+    ]
+    assert terminals == [
+        ConnectorCompletion(NATIVE_STATE_MP_STORE_CHANNEL, req.save_operation, True)
+    ]
+
+
 def test_kv_only_load_restores_nothing(worker, monkeypatch):
     monkeypatch.setattr(
         worker, "_begin_restore", lambda _: pytest.fail("no image to restore")
