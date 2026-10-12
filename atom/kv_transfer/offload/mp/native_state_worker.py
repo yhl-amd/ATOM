@@ -27,7 +27,6 @@ from atom.kv_transfer.offload.mp.deployment import (
     _tp_replication_factor,
     _validate_mp_config,
 )
-from atom.kv_transfer.offload.mp.lookup import OBJECT_GROUPS_CONFIG
 from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
 )
@@ -41,18 +40,52 @@ from atom.kv_transfer.offload.mp.transfer import (
     _UnprovableSubmission,
 )
 from atom.kv_transfer.offload.mp.worker import LMCacheMPConnector
+from atom.model_engine.block_manager import state_replay_tokens
 from atom.model_engine.page_unit_checkpoint import CheckpointRestoreOp
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
 NATIVE_STATE_MP_STORE_CHANNEL = "native_state_mp_store"
-# The LMCache object group the PAGE KV lands in: the full-attention group,
-# which `--separate-object-groups` numbers ahead of the image's window group
-# (`build_native_state_mp_layout` gives PAGE engine group 0).
-PAGE_OBJECT_GROUP = 0
-# The image's group: LMCache orders regular groups by (recurrent, window), so
-# the recurrent state follows the full-attention PAGE.
-STATE_OBJECT_GROUP = 1
+
+_ON = ("1", "true", "yes", "on")
+_OFF = ("0", "false", "no", "off")
+
+
+def stores_state_images(replay_tokens: int) -> bool:
+    """Whether native-state saves carry a state image (ATOM_LMCACHE_MP_STATE_IMAGES).
+
+    "auto", the default, stores one only without a bounded replay
+    (`replay_tokens`, 0 when off). With one the replay rebuilds the state from
+    the PAGE KV, so saves store that alone, the layout registers no image
+    group, and LMCache's own hit is the PAGE KV's extent. Without one a save
+    must carry its image: nothing could resume from PAGE alone. The scheduler
+    and every worker ask with the same replay length and register under the
+    namespace their answer names (`_model_namespace`).
+    """
+    setting = envs.ATOM_LMCACHE_MP_STATE_IMAGES
+    if setting == "auto":
+        return not replay_tokens
+    if setting in _ON:
+        return True
+    if setting in _OFF:
+        if not replay_tokens:
+            raise ValueError(
+                "ATOM_LMCACHE_MP_STATE_IMAGES=0 needs a bounded replay "
+                "(ATOM_DSV4_STATE_REPLAY=1)"
+            )
+        return False
+    raise ValueError(f"ATOM_LMCACHE_MP_STATE_IMAGES={setting!r}: expected auto, 1 or 0")
+
+
+def worker_replay_tokens(config: Any, transfer_tensors: Any) -> int:
+    """The bounded replay length the scheduler's `BlockManager` will run, or 0.
+
+    The same gate (`state_replay_tokens`): a native-state worker always has
+    PAGE-backed checkpoints. `transfer_tensors` is unused on this branch,
+    whose replay gate reads the config alone.
+    """
+    del transfer_tensors
+    return state_replay_tokens(config, has_checkpoints=True)
 
 
 def require_native_state_server(adapter: Any, config: Any) -> None:
@@ -126,7 +159,12 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 "replicated"
             )
         self._is_kv_writer = rank % requested_replication == 0
-        adapter = _make_worker_adapter(self._config, rank, checkpoint_spec=spec)
+        images = stores_state_images(
+            worker_replay_tokens(self._config, transfer_tensors)
+        )
+        adapter = _make_worker_adapter(
+            self._config, rank, checkpoint_spec=spec, images=images
+        )
         try:
             require_native_state_server(adapter, self._config)
             chunk_size = int(adapter.lmcache_tokens_per_chunk)
@@ -135,6 +173,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 block_size=self.block_size,
                 chunk_size=chunk_size,
                 num_blocks=num_blocks,
+                images=images,
             )
             adapter.register_kv_caches(
                 {
@@ -162,9 +201,10 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         if callable(reserve):
             reserve(self._restore_descriptor_slots)
         logger.info(
-            "LMCache MP native state registered rank=%d native_image=%d "
+            "LMCache MP native state registered rank=%d images=%s native_image=%d "
             "units=%d groups=%d chunk=%d",
             rank,
+            images,
             spec.image_bytes,
             spec.units_per_checkpoint,
             len(layout.kernel_groups),
@@ -191,16 +231,17 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         if state.boundary_tokens != end or len(req.token_ids) != end:
             raise ValueError("native STATE and PAGE endpoints must match")
         count = (end - start) // self.chunk_size
+        if state.kv_only != (not self._native_layout.images):
+            # PAGE alone exactly when the layout registered no image group: the
+            # scheduler and this worker asked `stores_state_images` the same.
+            raise ValueError(
+                "a KV-only native transfer needs a layout without images, and "
+                "only it"
+            )
         if state.kv_only:
             if state.unit_ids or state.destination_slot is not None:
                 raise ValueError("a KV-only native transfer moves no image")
-            # The image groups still need placeholder ids of full length: a
-            # retrieve skips them (`object_groups`), and a store skips chunks
-            # whose ids are all null, so none is ever read or written.
-            states = self._native_layout.checkpoint_spec.units_per_checkpoint
-            return [self._block_slice(req, start, end)] + [
-                [-1] * count for _ in range(states)
-            ]
+            return [self._block_slice(req, start, end)]
         if loading and state.destination_slot is None:
             raise ValueError("native-state restore requires a destination SLOT")
         if not loading and state.destination_slot is not None:
@@ -256,15 +297,6 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 if loading
                 else req.save_spec.skip_leading_tokens
             )
-            kv_only = req.native_state is not None and req.native_state.kv_only
-            # A KV-only load reads PAGE alone: the image group is neither locked
-            # nor read. Passed only then, so an LMCache without the option
-            # still serves the rest; a PAGE-only store needs no option at all.
-            options = (
-                {"request_configs": {OBJECT_GROUPS_CONFIG: [PAGE_OBJECT_GROUP]}}
-                if kv_only and loading
-                else {}
-            )
             try:
                 groups = self._native_block_ids(req, start, end, loading=loading)
                 spec = AtomMPTransferSpec(
@@ -272,7 +304,6 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                     block_ids=groups,
                     start=start,
                     end=end,
-                    **options,
                 )
             except Exception:
                 logger.exception(

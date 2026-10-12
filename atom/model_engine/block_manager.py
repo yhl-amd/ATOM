@@ -93,6 +93,99 @@ def _connector_replays(kv_transfer_config: dict | None) -> bool:
     )
 
 
+def replay_refusal(config: Config, *, has_checkpoints: bool) -> str | None:
+    """Why this engine cannot run the backend's bounded replay; None if it can.
+
+    It needs the prefix index and the PAGE-backed checkpoints a replay stands
+    in for, and no KV connector but LMCache MP offload, the one whose loads
+    have learned to replay. Every connector load starts at `num_cached_tokens`
+    and raises it when the load lands, and a replay moves exactly that field
+    below blocks it has claimed: a load that does not know about the replay
+    would write those shared blocks and resume past it. A module function so
+    the LMCache MP workers, which decide their layout before any scheduler
+    exists, give the same answer as `BlockManager`.
+    """
+    if not has_checkpoints or not getattr(config, "enable_prefix_caching", False):
+        return "no PAGE-backed state checkpoints"
+    if not _connector_replays(getattr(config, "kv_transfer_config", None)):
+        return "a KV connector other than lmcache_mp offload"
+    return None
+
+
+def state_replay_tokens(config: Config, *, has_checkpoints: bool) -> int:
+    """Tokens a bounded replay recomputes below a hit, or 0 when it is off.
+
+        DeepSeek-V4's per-request state is each layer's sliding window plus the
+        compressors' partial groups. Neither is in the cached blocks, but both
+        are local: layer l's window at H depends only on layer l-1 over the
+        last `W` positions, so with every layer's compressed KV and indexer K
+        cached (read-only), recomputing `W + (L-1)(W-1)` tokens below H rebuilds
+        all L windows exactly. The compressor groups need at most `2*ratio - 1`
+        trailing positions of a layer's input, which that span already covers
+        (and H is a multiple of 128, so no C128 group is open there). An MTP
+        layer reads the trunk's output and carries a window of its own, so it
+        counts as one more layer. So does a DSpark draft: each of its layers
+        writes its window from the same fused target hidden states
+        (`project_context` of `dspark_target_layer_ids`, position by position),
+        none from another draft layer, and it reads that window only at a
+        verified anchor, which the replay always lies W or more below.
+
+        Off unless ATOM_DSV4_STATE_REPLAY is set, and only for the plain V4
+        trunk on a single-rank prefill: context parallel splits the query axis
+        the floors are indexed by, and connector loads other than LMCache MP
+        offload have not learned to replay.
+
+    A module function so the LMCache MP workers, which decide their layout
+    before any scheduler exists, give the same answer as `BlockManager`.
+    """
+    if not envs.ATOM_DSV4_STATE_REPLAY:
+        return 0
+    reason = None
+    hf = config.hf_config
+    arches = getattr(hf, "architectures", None) or []
+    spec = config.speculative_config
+    method = (spec.method or "") if spec is not None else ""
+    if not any(str(a).startswith("DeepseekV4For") for a in arches):
+        reason = f"architecture {arches} is not the DeepSeek-V4 trunk"
+    elif not set(getattr(hf, "compress_ratios", ()) or ()) <= {0, 4, 128}:
+        reason = "compress ratios other than 4 / 128"
+    elif method not in ("", "mtp", "dspark"):
+        reason = f"speculative method {method!r}"
+    elif (
+        config.prefill_context_parallel_size > 1
+        or config.decode_context_parallel_size > 1
+    ):
+        reason = "context parallelism"
+    else:
+        reason = replay_refusal(config, has_checkpoints=has_checkpoints)
+    if reason is not None:
+        logger.warning("[State Cache] bounded replay off: %s.", reason)
+        return 0
+    window = int(hf.sliding_window)
+    layers = int(hf.num_hidden_layers)
+    if method == "mtp":
+        layers += int(getattr(hf, "num_nextn_predict_layers", 1) or 1)
+    elif method == "dspark":
+        layers += 1  # one hop: every draft layer reads the trunk directly
+    tokens = window + (layers - 1) * (window - 1)
+    if override := envs.ATOM_DSV4_STATE_REPLAY_TOKENS:
+        logger.warning(
+            "[State Cache] bounded replay length forced to %d tokens "
+            "(the exact field is %d); shorter is not exact.",
+            override,
+            tokens,
+        )
+        tokens = override
+    logger.info(
+        "[State Cache] bounded replay on: a hit past the nearest checkpoint "
+        "by more than %d tokens (window %d, %d layers) replays that many.",
+        tokens,
+        window,
+        layers,
+    )
+    return tokens
+
+
 @dataclass(frozen=True)
 class JointBoundaryDecision:
     """The outcome of the joint-boundary computation, as a value.
@@ -657,78 +750,10 @@ class BlockManager:
         return seq.token_ids[i * hbs : (i + 1) * hbs]
 
     def _state_replay_tokens(self, config: Config) -> int:
-        """Tokens a bounded replay recomputes below a hit, or 0 when it is off.
-
-        DeepSeek-V4's per-request state is each layer's sliding window plus the
-        compressors' partial groups. Neither is in the cached blocks, but both
-        are local: layer l's window at H depends only on layer l-1 over the
-        last `W` positions, so with every layer's compressed KV and indexer K
-        cached (read-only), recomputing `W + (L-1)(W-1)` tokens below H rebuilds
-        all L windows exactly. The compressor groups need at most `2*ratio - 1`
-        trailing positions of a layer's input, which that span already covers
-        (and H is a multiple of 128, so no C128 group is open there). An MTP
-        layer reads the trunk's output and carries a window of its own, so it
-        counts as one more layer. So does a DSpark draft: each of its layers
-        writes its window from the same fused target hidden states
-        (`project_context` of `dspark_target_layer_ids`, position by position),
-        none from another draft layer, and it reads that window only at a
-        verified anchor, which the replay always lies W or more below.
-
-        Off unless ATOM_DSV4_STATE_REPLAY is set, and only for the plain V4
-        trunk on a single-rank prefill: context parallel splits the query axis
-        the floors are indexed by, and connector loads other than LMCache MP
-        offload have not learned to replay.
-        """
-        if not envs.ATOM_DSV4_STATE_REPLAY:
-            return 0
-        reason = None
-        hf = config.hf_config
-        arches = getattr(hf, "architectures", None) or []
-        spec = config.speculative_config
-        method = (spec.method or "") if spec is not None else ""
-        if self.paged_state_checkpoints is None or not self.enable_prefix_caching:
-            reason = "no PAGE-backed state checkpoints"
-        elif not any(str(a).startswith("DeepseekV4For") for a in arches):
-            reason = f"architecture {arches} is not the DeepSeek-V4 trunk"
-        elif not set(getattr(hf, "compress_ratios", ()) or ()) <= {0, 4, 128}:
-            reason = "compress ratios other than 4 / 128"
-        elif method not in ("", "mtp", "dspark"):
-            reason = f"speculative method {method!r}"
-        elif config.prefill_context_parallel_size > 1 or self.dcp_world_size > 1:
-            reason = "context parallelism"
-        elif not _connector_replays(getattr(config, "kv_transfer_config", None)):
-            # Every connector load starts at `num_cached_tokens` and raises it
-            # when the load lands, and a replay moves exactly that field below
-            # blocks it has claimed: a load that does not know about the
-            # replay would write those shared blocks and resume past it. Only
-            # LMCache MP's native-state scheduler is taught to (`replay_kv_load`).
-            reason = "a KV connector other than lmcache_mp offload"
-        if reason is not None:
-            logger.warning("[State Cache] bounded replay off: %s.", reason)
-            return 0
-        window = int(hf.sliding_window)
-        layers = int(hf.num_hidden_layers)
-        if method == "mtp":
-            layers += int(getattr(hf, "num_nextn_predict_layers", 1) or 1)
-        elif method == "dspark":
-            layers += 1  # one hop: every draft layer reads the trunk directly
-        tokens = window + (layers - 1) * (window - 1)
-        if override := envs.ATOM_DSV4_STATE_REPLAY_TOKENS:
-            logger.warning(
-                "[State Cache] bounded replay length forced to %d tokens "
-                "(the exact field is %d); shorter is not exact.",
-                override,
-                tokens,
-            )
-            tokens = override
-        logger.info(
-            "[State Cache] bounded replay on: a hit past the nearest checkpoint "
-            "by more than %d tokens (window %d, %d layers) replays that many.",
-            tokens,
-            window,
-            layers,
+        """`state_replay_tokens` for this manager's checkpoints."""
+        return state_replay_tokens(
+            config, has_checkpoints=self.paged_state_checkpoints is not None
         )
-        return tokens
 
     def _replay_hit(self, seq: Sequence, compressed_hit: int, hit: int) -> int:
         """`hit` widened to `compressed_hit` when replaying is cheaper.

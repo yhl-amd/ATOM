@@ -92,7 +92,8 @@ def make_scheduler(
     adapter = Adapter()
     connections = []
 
-    def connect(config, *, checkpoint_spec=None):
+    def connect(config, *, checkpoint_spec=None, images=True):
+        assert images  # no bounded replay here, so saves carry their images
         connections.append(checkpoint_spec)
         return adapter
 
