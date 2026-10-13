@@ -522,10 +522,17 @@ class Scheduler:
     ):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
-        # DP prefill cost balancing (ATOM_DP_PREFILL_COST_BALANCE): every rank
-        # estimates the cost of its chunk at the whole batch budget; the ranks
-        # then aim at one cost target, a costlier rank shrinking its chunk.
-        self.cost_balance = envs.ATOM_DP_PREFILL_COST_BALANCE
+        # DP prefill cost balancing, on whenever DP attention runs more than
+        # one rank: every rank estimates the cost of its chunk at the whole
+        # batch budget; the ranks then aim at one cost target, a costlier rank
+        # shrinking its chunk. The costs ride the PrefillDelayer's all_reduce,
+        # so balancing needs the delayer (ATOM_ENABLE_PREFILL_DELAYER).
+        dp_size = getattr(
+            getattr(config, "parallel_config", None), "data_parallel_size", 1
+        )
+        self.cost_balance = (
+            getattr(config, "enable_dp_attention", False) and dp_size > 1
+        )
         self._balance_token_weight = envs.ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT
         self._balance_slack = envs.ATOM_DP_PREFILL_BALANCE_SLACK
         self._balance_min_tokens = envs.ATOM_DP_PREFILL_BALANCE_MIN_TOKENS
@@ -912,7 +919,12 @@ class Scheduler:
             if self._is_offload_prefill_resume(seq):
                 start = seq.num_cached_tokens
             else:
-                cached_blocks = self.block_manager.can_allocate(seq, record=False)
+                # Runs on every tick with prefill work, holds included: keep
+                # the head's prompt-block hashes instead of rehashing its
+                # cached prefix each time.
+                cached_blocks = self.block_manager.can_allocate(
+                    seq, record=False, reuse_hashes=True
+                )
                 if cached_blocks < 0:
                     break
                 start = cached_blocks * self.block_manager.hash_block_size

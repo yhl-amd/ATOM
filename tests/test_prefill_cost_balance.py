@@ -1,4 +1,4 @@
-"""DP prefill cost balancing (ATOM_DP_PREFILL_COST_BALANCE).
+"""DP prefill cost balancing (on under DP attention with more than one rank).
 
 Under DP attention every rank prefills in the same lockstep step, so the step
 lasts as long as the costliest rank's chunk. With balancing on, the ranks
@@ -10,6 +10,7 @@ With weight 0 a chunk of k tokens from position 0 costs k * k / 2.
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
 from conftest import MockConfig
@@ -45,13 +46,14 @@ class _Delayer:
 def _sched(
     monkeypatch,
     *,
-    balance=True,
+    dp_attention=True,
     weight=0,
     slack=0.1,
     min_tokens=8,
     max_tokens=64,
+    dp_size=8,
+    prefix_caching=False,
 ):
-    monkeypatch.setenv("ATOM_DP_PREFILL_COST_BALANCE", "1" if balance else "0")
     monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT", str(weight))
     monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_SLACK", str(slack))
     monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_MIN_TOKENS", str(min_tokens))
@@ -62,8 +64,23 @@ def _sched(
             kv_cache_block_size=4,
             max_model_len=256,
             max_num_batched_tokens=max_tokens,
+            enable_prefix_caching=prefix_caching,
+            enable_dp_attention=dp_attention,
+            parallel_config=SimpleNamespace(data_parallel_size=dp_size),
         )
     )
+
+
+def _cached_prefix(sched, seq_factory, tokens):
+    """Publish `tokens` in the prefix cache, release them, and return the
+    blocks that hold them."""
+    bm = sched.block_manager
+    first = seq_factory(tokens)
+    bm.allocate(first, 0)
+    bm.hash_blocks(first, len(tokens))
+    resident = list(first.block_table)
+    bm.deallocate(first)
+    return resident
 
 
 def _prefill_tokens(sched):
@@ -71,13 +88,63 @@ def _prefill_tokens(sched):
     return int(batch.total_tokens_num)
 
 
-def test_off_keeps_the_whole_budget_and_estimates_nothing(monkeypatch, seq_factory):
-    sched = _sched(monkeypatch, balance=False)
+def test_off_without_dp_attention(monkeypatch, seq_factory):
+    sched = _sched(monkeypatch, dp_attention=False)
     delayer = _Delayer(others=[1.0] * 7)
     sched.set_prefill_delayer(delayer)
     sched.add(seq_factory(list(range(100, 164))))
+    assert not sched.cost_balance
     assert _prefill_tokens(sched) == 64
     assert delayer.reported == [0.0]
+
+
+def test_off_with_a_single_dp_rank(monkeypatch, seq_factory):
+    sched = _sched(monkeypatch, dp_size=1)
+    delayer = _Delayer()
+    sched.set_prefill_delayer(delayer)
+    sched.add(seq_factory(list(range(100, 164))))
+    assert not sched.cost_balance
+    assert _prefill_tokens(sched) == 64
+    assert delayer.reported == [0.0]
+
+
+def test_estimate_keeps_the_head_prompt_hashes(monkeypatch, seq_factory):
+    """The estimate probes the waiting head on every tick with prefill work.
+    Its prompt-block hashes are kept between ticks (content hashes only: pool
+    hits are rechecked), so a repeat probe hashes nothing and costs the same."""
+    sched = _sched(monkeypatch, prefix_caching=True)
+    prefix = list(range(100, 132))
+    _cached_prefix(sched, seq_factory, prefix)
+    sched.add(seq_factory(prefix + list(range(500, 532))))
+    bm = sched.block_manager
+    hashed = []
+    real = bm.compute_hash
+    monkeypatch.setattr(bm, "compute_hash", lambda *a: hashed.append(a) or real(*a))
+    # 8 cached blocks of 4 tokens: the chunk is the 32 new tokens after them.
+    cost = sched._estimate_prefill_chunk_cost()
+    assert cost == sched._chunk_cost(32, 32)
+    assert hashed
+    first_probe = len(hashed)
+    assert sched._estimate_prefill_chunk_cost() == cost
+    assert len(hashed) == first_probe
+
+
+def test_balanced_admission_takes_exactly_the_cached_prefix(monkeypatch, seq_factory):
+    """The estimate only sizes the chunk. Admission still reuses exactly the
+    cached prefix blocks, and the shrunk chunk starts right after them."""
+    sched = _sched(monkeypatch, prefix_caching=True)
+    sched.set_prefill_delayer(_Delayer(others=[512.0] * 7))
+    prefix = list(range(100, 132))
+    resident = _cached_prefix(sched, seq_factory, prefix)
+    seq = seq_factory(prefix + list(range(500, 564)))
+    sched.add(seq)
+    sched._estimate_prefill_chunk_cost()  # leave kept hashes behind
+    # Own 64-token chunk after 32 cached costs 4096, seven ranks at 512:
+    # target = 1.1 * 960 = 1056, i.e. 24 tokens.
+    batch, _ = sched.schedule()
+    assert seq.num_cached_tokens == 32
+    assert list(seq.block_table[:8]) == resident
+    assert list(batch.num_scheduled_tokens) == [24]
 
 
 @pytest.mark.parametrize("start", [0, 1000, 250_000])
@@ -135,9 +202,9 @@ def test_no_rank_with_prefill_work_balances_nothing(monkeypatch):
 
 
 def test_local_pending_probe_ignores_the_previous_step_limit(monkeypatch, seq_factory):
-    """The local coalescer sizes partial prefills (`_partial_prefill_chunk`)
-    for its pending-work signal before this tick's balancing decision. The
-    previous step's cost limit must not cut that probe down to the floor."""
+    """Nothing that sizes a chunk ahead of this tick's balancing decision (here
+    the local coalescer's pending probe, `_partial_prefill_chunk`) may see the
+    previous step's cost limit, or it cuts the probe down to the floor."""
     sched = _sched(monkeypatch)
     delayer = _Delayer(others=[512.0] * 7, is_local=True)
     sched.set_prefill_delayer(delayer)
