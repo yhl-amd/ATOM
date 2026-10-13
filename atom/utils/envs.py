@@ -178,13 +178,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all_reduce (cost = new tokens x (TOKEN_WEIGHT + prior context + new / 2);
     # estimated only by ranks with prefill work) and on a prefill step aim at
     # min(costliest, mean x (1 + SLACK)): a rank above it takes fewer tokens
-    # (never fewer than MIN_TOKENS), and a rank below it may take more, up to
-    # --max-num-batched-tokens, when that exceeds BASE_TOKENS (0 = the whole
-    # --max-num-batched-tokens: ranks only shrink).
+    # (never fewer than MIN_TOKENS).
     "ATOM_DP_PREFILL_COST_BALANCE": lambda: _flag_env("ATOM_DP_PREFILL_COST_BALANCE"),
-    "ATOM_DP_PREFILL_BALANCE_BASE_TOKENS": lambda: _int_env(
-        "ATOM_DP_PREFILL_BALANCE_BASE_TOKENS", 0
-    ),
     "ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT": lambda: _int_env(
         "ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT", 360000
     ),

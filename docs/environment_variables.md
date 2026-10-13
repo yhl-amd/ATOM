@@ -19,8 +19,7 @@ This document describes the environment variables used in the ATOM project.
 | **ATOM_DP_MASTER_PORT** | int | 29500 | Master port for DP ranks coordination. |
 | **ATOM_DP_LB_REQ_EQUIV** | int | 512 | Token-equivalent decode pressure assigned to each in-flight request by `least_tokens` routing. |
 | **ATOM_DP_SESSION_AFFINITY** | bool | false | Load-place each new session, then keep later turns on the same prefix-cache owner. Reads `X-Dynamo-Session-ID`, falling back to `X-Correlation-ID`. |
-| **ATOM_DP_PREFILL_COST_BALANCE** | bool | false | Balance each lockstep DP prefill step by estimated chunk cost: ranks exchange costs and aim at min(costliest, mean x (1 + slack)); a costlier rank takes fewer tokens, a cheaper one more when `--max-num-batched-tokens` exceeds the base. |
-| **ATOM_DP_PREFILL_BALANCE_BASE_TOKENS** | int | 0 | Chunk each rank estimates its cost at (0 = the whole `--max-num-batched-tokens`: ranks only shrink). |
+| **ATOM_DP_PREFILL_COST_BALANCE** | bool | false | Balance each lockstep DP prefill step by estimated chunk cost: ranks exchange costs and aim at min(costliest, mean x (1 + slack)); a costlier rank takes fewer tokens. |
 | **ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT** | int | 360000 | Per-token term of the chunk cost, in attended-context tokens: cost = new tokens x (weight + prior context + new / 2). |
 | **ATOM_DP_PREFILL_BALANCE_SLACK** | float | 0.1 | The target cost is at most mean x (1 + slack) over the ranks that prefill. |
 | **ATOM_DP_PREFILL_BALANCE_MIN_TOKENS** | int | 4096 | Fewest tokens a shrunk rank still prefills in a step. |

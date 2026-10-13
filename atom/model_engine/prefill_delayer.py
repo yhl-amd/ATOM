@@ -97,13 +97,13 @@ _DEBUG = os.environ.get("ATOM_PREFILL_DELAYER_DEBUG", "0") == "1"
 
 class PrefillDelayer:
     __slots__ = (
+        "_cost_slots",
         "_decode_interval_remaining",
         "_first",
         "_hold_ticks",
         "_prefill_executed_since_last_decision",
         "_prev_pending",
         # buffer / episode state
-        "_cost_slots",
         "_rank",
         "_reduce_buf",
         "_stall_count",
@@ -119,7 +119,6 @@ class PrefillDelayer:
         "_stat_hold",
         "_stat_hold_decode_interval",
         "_stat_log_every",
-        "any_rank_prefillable",
         "cpu_group",
         "dp_size",
         "kv_high_watermark",
@@ -232,7 +231,6 @@ class PrefillDelayer:
         self._first = True
         self._decode_interval_remaining = 0
         self._prefill_executed_since_last_decision = False
-        self.any_rank_prefillable = False
 
         # Per-exit fire counters + hold counter for periodic logging. Each exit
         # is counted separately so the log shows WHICH reason released prefill —
@@ -372,7 +370,6 @@ class PrefillDelayer:
                     "prefill and deferring to the DP-state shutdown barrier."
                 )
                 self._reset()
-                self.any_rank_prefillable = False
                 self.rank_prefill_costs = []
                 return True
 
@@ -393,9 +390,6 @@ class PrefillDelayer:
         # This local execution report has now participated in the global
         # decision. A later successful prefill forward sets it again.
         self._prefill_executed_since_last_decision = False
-        # Identical on every rank (it comes from the reduced buffer): whether
-        # any rank has prefill work this tick.
-        self.any_rank_prefillable = n_prefillable > 0
         any_kv_high = kv_high_n > 0
         any_kv_low = kv_low_n > 0
         any_partial = partial_n > 0

@@ -3,11 +3,13 @@
 Under DP attention every rank prefills in the same lockstep step, so the step
 lasts as long as the costliest rank's chunk. With balancing on, the ranks
 exchange their estimated chunk costs on the PrefillDelayer's per-tick
-all_reduce (`prefill_cost` in, `rank_prefill_costs` out) and aim at min(costliest, mean x (1 + slack)): a costlier rank shrinks its
-chunk, a cheaper one may grow it when the token cap is above the base.
+all_reduce (`prefill_cost` in, `rank_prefill_costs` out) and aim at
+min(costliest, mean x (1 + slack)): a costlier rank shrinks its chunk.
 
 With weight 0 a chunk of k tokens from position 0 costs k * k / 2.
 """
+
+import math
 
 import pytest
 from conftest import MockConfig
@@ -16,16 +18,16 @@ from atom.model_engine.scheduler import Scheduler
 
 
 class _Delayer:
-    """Cross-DP delayer stub that releases prefill every tick and answers the
-    cost exchange with this rank's cost followed by `others`."""
+    """Delayer stub that releases prefill every tick and answers the cost
+    exchange with this rank's cost followed by `others`."""
 
-    is_local = False
     max_queue_ms = None
-    any_rank_prefillable = True
 
-    def __init__(self, others=()):
+    def __init__(self, others=(), is_local=False):
         self.others = list(others)
+        self.is_local = is_local
         self.reported = []
+        self.pending = []
         self.rank_prefill_costs = []
 
     def protects_decode(self, running_decode_batch: int) -> bool:
@@ -35,6 +37,7 @@ class _Delayer:
         self, prefillable, pending_tokens, prefill_cost=0.0, **kwargs
     ):
         self.reported.append(prefill_cost)
+        self.pending.append(pending_tokens)
         self.rank_prefill_costs = [prefill_cost, *self.others]
         return True
 
@@ -43,14 +46,12 @@ def _sched(
     monkeypatch,
     *,
     balance=True,
-    base=0,
     weight=0,
     slack=0.1,
     min_tokens=8,
     max_tokens=64,
 ):
     monkeypatch.setenv("ATOM_DP_PREFILL_COST_BALANCE", "1" if balance else "0")
-    monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_BASE_TOKENS", str(base))
     monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT", str(weight))
     monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_SLACK", str(slack))
     monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_MIN_TOKENS", str(min_tokens))
@@ -75,7 +76,6 @@ def test_off_keeps_the_whole_budget_and_estimates_nothing(monkeypatch, seq_facto
     delayer = _Delayer(others=[1.0] * 7)
     sched.set_prefill_delayer(delayer)
     sched.add(seq_factory(list(range(100, 164))))
-    assert sched.prefill_base_tokens == 64
     assert _prefill_tokens(sched) == 64
     assert delayer.reported == [0.0]
 
@@ -83,7 +83,6 @@ def test_off_keeps_the_whole_budget_and_estimates_nothing(monkeypatch, seq_facto
 @pytest.mark.parametrize("start", [0, 1000, 250_000])
 def test_room_is_the_largest_chunk_within_the_cost_left(monkeypatch, start):
     sched = _sched(monkeypatch, weight=4096, min_tokens=0, max_tokens=1 << 20)
-    sched._tick_token_cap = 1 << 20
     sched._tick_cost_limit = 5e8
     sched._tick_cost = 1e8
     room = sched._prefill_room(0, start)
@@ -119,23 +118,49 @@ def test_cheaper_rank_keeps_its_chunk_without_room_to_grow(monkeypatch, seq_fact
     assert _prefill_tokens(sched) == 64
 
 
-def test_cheaper_rank_grows_when_the_cap_is_above_the_base(monkeypatch, seq_factory):
-    sched = _sched(monkeypatch, base=16)
-    # Own 16-token chunk costs 128; seven ranks at 512: target =
-    # min(512, 1.1 * 464) = 510.4, i.e. 31 tokens.
-    delayer = _Delayer(others=[512.0] * 7)
-    sched.set_prefill_delayer(delayer)
-    sched.add(seq_factory(list(range(100, 164))))
-    assert _prefill_tokens(sched) == 31
-    assert delayer.reported == [128.0]
-
-
 def test_idle_rank_reports_no_cost(monkeypatch):
     sched = _sched(monkeypatch)
     delayer = _Delayer(others=[512.0] * 7)
     sched.set_prefill_delayer(delayer)
     assert sched.schedule() is None
     assert delayer.reported == [0.0]
+
+
+def test_no_rank_with_prefill_work_balances_nothing(monkeypatch):
+    sched = _sched(monkeypatch)
+    sched.set_prefill_delayer(_Delayer(others=[0.0] * 7))
+    assert sched.schedule() is None
+    assert sched._tick_cost_limit == math.inf
+    assert sched._balance_stats[0] == 0
+
+
+def test_local_pending_probe_ignores_the_previous_step_limit(monkeypatch, seq_factory):
+    """The local coalescer sizes partial prefills (`_partial_prefill_chunk`)
+    for its pending-work signal before this tick's balancing decision. The
+    previous step's cost limit must not cut that probe down to the floor."""
+    sched = _sched(monkeypatch)
+    delayer = _Delayer(others=[512.0] * 7, is_local=True)
+    sched.set_prefill_delayer(delayer)
+    s_partial = seq_factory(list(range(100, 196)))
+    s_decode = seq_factory([1, 2, 3, 4])
+    sched.add(s_partial)
+    sched.add(s_decode)
+    # Own 64-token chunk costs 2048, seven ranks at 512: target = 774.4, i.e.
+    # 39 tokens of the 96-token prompt, then the 4-token prompt in what is left.
+    batch, _ = sched.schedule()
+    assert list(batch.num_scheduled_tokens) == [39, 4]
+    assert sched._tick_cost_limit < math.inf
+
+    s_partial.num_cached_tokens = 39
+    s_partial.is_partial_prefill = True
+    sched._partial_prefill_count = 1
+    s_decode.num_cached_tokens = s_decode.num_prompt_tokens
+    s_decode.append_token(99)
+    s_decode.is_partial_prefill = False
+
+    sched.schedule()
+    # The 57 tokens left of the prompt, not the 8-token floor.
+    assert delayer.pending[-1] == 57
 
 
 def test_balances_a_prefill_released_inside_the_decode_window(monkeypatch, seq_factory):
@@ -151,7 +176,7 @@ def test_balances_a_prefill_released_inside_the_decode_window(monkeypatch, seq_f
     delayer = PrefillDelayer(
         dp_size=1,
         cpu_group=group,
-        max_num_batched_tokens=sched.prefill_base_tokens,
+        max_num_batched_tokens=sched.max_num_batched_tokens,
         prefill_decode_interval=5,
         exchange_prefill_costs=True,
     )
