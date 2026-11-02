@@ -577,11 +577,40 @@ class DeepseekV41DSpark(DSparkDraftModel):
     _head_and_sample = _DSparkInner.head_and_sample
     forward_head = _DSparkInner.forward_head
 
+    # The lossless branch in `head_and_sample` draws through the head's
+    # `sample_block_q`, so `DSparkProposer` may arm lossless sampling here.
+    supports_lossless_draft = True
+
+    @property
+    def markov_head(self):
+        """The last stage's head; the proposer checks its weights."""
+        return self.mtp[-1].markov_head
+
     def head_and_sample(self, out, anchor_ids, num_draft):
         # `num_draft` is the shared surface's; the width rides `out[1]`.
+        if self.draft_sampling is not None:
+            return self._head_and_sample_q(*out, anchor_ids)
         if self._sharded_markov_sample():
             return self._head_and_sample_sharded(*out, anchor_ids)
         return self._head_and_sample(*out, anchor_ids)
+
+    def _head_and_sample_q(self, normed, hc_hidden, anchor_ids):
+        """Lossless draft: x_k drawn from, and q_k published to, the bound
+        store (see `DSparkMarkovHead.sample_block_q`). The store holds rows of
+        the full vocab, so the LM head is all-gathered here even where the
+        greedy path would keep it sharded."""
+        B, T, _ = hc_hidden.shape
+        last = self.mtp[-1]
+        base_logits = self.head.get_logits(normed).view(B, T, -1)  # [B, T, V]
+        out_ids = last.markov_head.sample_block_q(
+            base_logits, anchor_ids, self.draft_sampling
+        )
+        # The confidence head reads W1[x_{k-1}], as the greedy sampler hands
+        # it over; the sampled op does not, so it is gathered here.
+        prev_ids = torch.cat([anchor_ids[:, None], out_ids[:, :-1]], dim=1)
+        markov_embeds = last.markov_head.markov_w1(prev_ids)
+        confidence = last.confidence_head(hc_hidden, markov_embeds)
+        return out_ids, confidence
 
     def _sharded_markov_sample(self) -> bool:
         """Whether the block is sampled off this rank's vocab shard.
