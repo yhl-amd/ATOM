@@ -85,6 +85,9 @@ _RATIO_RESIDUAL_KEY = 2 << 32
 _RATIO_BLOCK_V = 4096
 # Stored q entries one lookup or densify iteration covers.
 _RATIO_BLOCK_Q = 1024
+# Sampled requests with q are verified as a block (`_ratio_accept_kernel`);
+# False keeps the token-by-token rule, which the dense reference tests pin.
+_BLOCK_VERIFY = True
 
 
 def _count_run_cells(num_tokens: int, vocab_size: int) -> int:
@@ -1003,6 +1006,7 @@ def _ratio_sample(
         BLOCK_T=triton.next_power_of_2(max(num_spec_steps, 1)),
         BLOCK_Q=min(triton.next_power_of_2(q_width), _RATIO_BLOCK_Q),
         FILTER=filtered,
+        BLOCK_VERIFY=_BLOCK_VERIFY,
         num_warps=1,
     )
     # The residual reads q across V: spread each rejecting request's stored

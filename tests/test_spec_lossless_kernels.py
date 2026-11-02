@@ -34,6 +34,7 @@ from atom.model_ops.dspark_markov_sample import (
     dspark_markov_sample,
     dspark_markov_sample_scratch,
 )
+from atom.model_ops import ratio_verify
 from atom.model_ops.ratio_verify import (
     _RATIO_ACCEPT_KEY,
     _RATIO_BLOCK_V,
@@ -1444,11 +1445,13 @@ def top_of(logits, k):
     return q.scatter_(-1, kept.indices, torch.softmax(kept.values, -1))
 
 
-def test_the_sparse_store_verifies_bit_for_bit_as_its_dense_q():
+def test_the_sparse_store_verifies_bit_for_bit_as_its_dense_q(monkeypatch):
     """Densified, the store is a dense q; the verify over the store and the
     verify over that q must emit the same tokens and verdicts, coin for coin:
     greedy rows, requests without q, an emitted slot that does not hold the
-    draft, and a draft the store does not hold all included."""
+    draft, and a draft the store does not hold all included. The dense
+    reference is the token rule, so the block rule is off here."""
+    monkeypatch.setattr(ratio_verify, "_BLOCK_VERIFY", False)
     torch.manual_seed(61)
     batch_n, width, vocab = 96, 4, 2 * _RATIO_BLOCK_V + 500
     rows = batch_n * width
@@ -1552,12 +1555,10 @@ def test_the_first_token_follows_p_at_any_store_width(width, temperature):
     assert 0 < accepted.float().mean().item() < 1
 
 
-@pytest.mark.parametrize("width", [7, 50])
-def test_a_chained_block_follows_the_autoregressive_target(width):
-    """Three chained positions, each drafted from the last and scored by a
-    target conditioned on it: every emitted token follows p(. | the token
-    emitted before it) -- position 0 given the anchor, later positions among
-    the requests that reached them -- and none lands where p is 0."""
+def chained_block(width):
+    """Three chained draft positions of 60000 requests, each drafted from the
+    last and scored by a target conditioned on it: ``(verify args, draft q,
+    the target's conditional table, anchor)``."""
     torch.manual_seed(79)
     n, vocab, rank, steps, anchor = 60000, 50, 16, 3, 3
     base, _, w1, w2 = tables(1, vocab, rank, seed=83)
@@ -1601,11 +1602,21 @@ def test_a_chained_block_follows_the_autoregressive_target(width):
         prev = out
     drafts = torch.stack(drafts, 1).view(-1).to(torch.int32)
     logits = torch.stack(scored, 1).view(n * steps, vocab)
-    out, (accepted, _, _) = rejection_sample(
-        **verify_batch(drafts, steps, logits, temps),
-        draft_q=RatioDraftQ(store, stale(n, vocab)),
-        ratio_step=29,
-    )
+    args = verify_batch(drafts, steps, logits, temps)
+    return args, RatioDraftQ(store, stale(n, vocab)), table, anchor
+
+
+@pytest.mark.parametrize("block", [True, False], ids=["block", "token"])
+@pytest.mark.parametrize("width", [7, 50])
+def test_a_chained_block_follows_the_autoregressive_target(monkeypatch, width, block):
+    """Every emitted token follows p(. | the token emitted before it) --
+    position 0 given the anchor, later positions among the requests that
+    reached them -- and none lands where p is 0, under either rule."""
+    monkeypatch.setattr(ratio_verify, "_BLOCK_VERIFY", block)
+    args, q, table, anchor = chained_block(width)
+    n, steps = args["cu_num_draft_tokens"].numel(), 3
+    vocab = table.shape[0]
+    out, (accepted, _, _) = rejection_sample(**args, draft_q=q, ratio_step=29)
     cond = torch.softmax(table, -1)
     given = torch.full((n,), anchor, dtype=torch.int64, device=DEV)
     for k in range(steps):
@@ -1622,6 +1633,20 @@ def test_a_chained_block_follows_the_autoregressive_target(width):
         chi2 = ((counts - expected)[live] ** 2 / expected[live]).sum().item()
         dof = int(live.sum()) - 1
         assert chi2 < dof + 6 * (2 * dof) ** 0.5, (k, chi2, dof)
+
+
+
+def test_the_block_rule_accepts_more_drafts_than_the_token_rule(monkeypatch):
+    """Block verification never accepts fewer drafts in expectation; on a
+    draft near its target it accepts strictly more."""
+    args, q, _, _ = chained_block(50)
+    means = {}
+    for block in (False, True):
+        monkeypatch.setattr(ratio_verify, "_BLOCK_VERIFY", block)
+        _, (accepted, _, _) = rejection_sample(**args, draft_q=q, ratio_step=31)
+        means[block] = accepted.double().mean().item()
+    # 60000 requests: the standard error of either mean is under 0.01.
+    assert means[True] > means[False] + 0.02, means
 
 
 # ---- verify: top-k / top-p, the target's filtered p ---------------------------
