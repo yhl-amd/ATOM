@@ -119,7 +119,8 @@ def test_the_sampled_block_chains_positions_through_the_shared_head():
     )
     calls = []
 
-    def sample_next_q(prev, base, out, bound, rows, position, noise_offset):
+    def sample_next_q(prev, base, out, bound, rows, position, noise_offset, tp_shard):
+        assert tp_shard is None
         calls.append((bound, rows, position, noise_offset))
         assert torch.equal(base, base_logits[:, position])
         out.copy_(prev + 1)

@@ -596,14 +596,25 @@ class DeepseekV41DSpark(DSparkDraftModel):
 
     def _head_and_sample_q(self, normed, hc_hidden, anchor_ids):
         """Lossless draft: x_k drawn from, and q_k published to, the bound
-        store (see `DSparkMarkovHead.sample_block_q`). The store holds rows of
-        the full vocab, so the LM head is all-gathered here even where the
-        greedy path would keep it sharded."""
+        store (see `DSparkMarkovHead.sample_block_q`). Where the greedy path
+        keeps the LM head sharded (`_sharded_markov_sample`) so does this one:
+        the ranks exchange histograms and their share of the stored entries
+        rather than the logits, and store and draw what the whole-vocab op
+        would (`dspark_markov_sample_tp`)."""
         B, T, _ = hc_hidden.shape
-        last = self.mtp[-1]
-        base_logits = self.head.get_logits(normed).view(B, T, -1)  # [B, T, V]
+        head, last = self.head, self.mtp[-1]
+        if self._sharded_markov_sample():
+            base_logits = tgemm.mm(normed, head.weight).view(B, T, -1)  # [B,T,V/tp]
+            tp_shard = (
+                head.vocab_start_idx,
+                get_tp_group(),
+                envs.ATOM_USE_CUSTOM_ALL_GATHER,
+            )
+        else:
+            base_logits = head.get_logits(normed).view(B, T, -1)  # [B, T, V]
+            tp_shard = None
         out_ids = last.markov_head.sample_block_q(
-            base_logits, anchor_ids, self.draft_sampling
+            base_logits, anchor_ids, self.draft_sampling, tp_shard
         )
         # The confidence head reads W1[x_{k-1}], as the greedy sampler hands
         # it over; the sampled op does not, so it is gathered here.
