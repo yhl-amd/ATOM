@@ -1400,6 +1400,7 @@ def dense_verify(args, q_dense, ratio_step):
         None,  # no floor: unfiltered
         q_dense[q_row.long()],
         base,
+        torch.ones(batch_n, device=DEV),  # token-wise: the residual's weight is 1
         keys,
         key_idx,
         batch_n,

@@ -106,6 +106,7 @@ def _ratio_scratch_shapes(num_tokens: int, batch_size: int, vocab_size: int):
         (tiles, batch_size),  # part_key
         (2, num_tokens, _FILTER_F32_WIDTH),  # filter_f32
         (tiles, num_tokens),  # floor_mass
+        (batch_size,),  # residual_weight
     ]
     i32 = [
         (num_tokens,),  # row_argmax
@@ -251,11 +252,84 @@ def _stored_q_of(q_ids_ptr, q_probs_ptr, q_row, n, x, BLOCK_Q: tl.constexpr):
     return q
 
 
+@triton.jit
+def _target_p_at(
+    logits_ptr,
+    row,
+    logits_row_stride,
+    x,
+    temp,
+    row_max_ptr,
+    row_inv_z_ptr,
+    row_floor_ptr,
+    mask,
+    FILTER: tl.constexpr,
+):
+    """``p_f`` of ``row`` at ids ``x`` (a scalar, or a vector under ``mask``)."""
+    logit = tl.load(
+        logits_ptr + row.to(tl.int64) * logits_row_stride + x, mask=mask, other=0.0
+    ).to(tl.float32)
+    p = tl.exp(logit / temp - tl.load(row_max_ptr + row)) * tl.load(
+        row_inv_z_ptr + row
+    )
+    if FILTER:
+        # Filtered out: p_f is 0 there.
+        p = tl.where(logit >= tl.load(row_floor_ptr + row), p, 0.0)
+    return tl.where(mask, p, 0.0)
+
+
+@triton.jit
+def _block_residual_mass(
+    logits_ptr,
+    row,
+    logits_row_stride,
+    temp,
+    row_max_ptr,
+    row_inv_z_ptr,
+    row_floor_ptr,
+    q_ids_ptr,
+    q_probs_ptr,
+    q_row,
+    n,
+    weight,
+    BLOCK_Q: tl.constexpr,
+    FILTER: tl.constexpr,
+):
+    """``sum_v relu(weight * p_f(v) - q(v))`` over one draft row's vocab.
+
+    q is 0 off its ``n`` stored ids, so only those are read: on them the term
+    is taken as is, and off them it is ``weight * p_f``, which totals
+    ``weight * (1 - p_f(stored ids))``."""
+    stored_p = 0.0
+    on_stored = 0.0
+    for start in range(0, n, BLOCK_Q):
+        offs = start + tl.arange(0, BLOCK_Q)
+        mask = offs < n
+        ids = tl.load(q_ids_ptr + q_row + offs, mask=mask, other=0)
+        q = tl.load(q_probs_ptr + q_row + offs, mask=mask, other=0.0)
+        p = _target_p_at(
+            logits_ptr,
+            row,
+            logits_row_stride,
+            ids,
+            temp,
+            row_max_ptr,
+            row_inv_z_ptr,
+            row_floor_ptr,
+            mask,
+            FILTER,
+        )
+        stored_p += tl.sum(p, axis=0)
+        on_stored += tl.sum(tl.where(mask, tl.maximum(weight * p - q, 0.0), 0.0))
+    return on_stored + weight * tl.maximum(1.0 - stored_p, 0.0)
+
+
 @triton.jit(do_not_specialize=["num_spec_steps", "q_width", "accept_seed"])
 def _ratio_accept_kernel(
     output_token_ids_ptr,  # [batch_size, num_spec_steps + 1]
     verdict_ptr,  # [3, batch_size]: accepted drafts, rejected, anchor row
     residual_row_ptr,  # [batch_size] int32 out: the row to resample, or -1
+    residual_weight_ptr,  # [batch_size] fp32 out: the residual's weight on p
     cu_num_draft_tokens_ptr,  # [batch_size]
     input_ids_ptr,  # the step's input ids
     target_logits_indices_ptr,  # [num_tokens]
@@ -279,11 +353,23 @@ def _ratio_accept_kernel(
     BLOCK_T: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     FILTER: tl.constexpr,
+    BLOCK_VERIFY: tl.constexpr = True,
 ):
     """One request: walk its drafts until the first rejection.
 
     Leaves the rejecting position's output to the residual kernels for a
     sampled request, and fills it with the target argmax for a greedy one.
+
+    ``BLOCK_VERIFY``: a sampled request with q is verified as one block (Sun
+    et al. 2024, "Block Verification Accelerates Speculative Decoding")
+    rather than token by token. With ``w_0 = 1`` and ``w_i = min(w_{i-1}
+    p(x_i) / q(x_i), 1)``, draft i is a stopping point with probability
+    ``h_i = R_i / (R_i + 1 - w_i)``, ``R_i = sum_v relu(w_i p_{i+1}(v) -
+    q_{i+1}(v))`` the next position's residual mass (``h = w`` at the last
+    draft). The request keeps its first ``tau = max{i : u_i <= h_i}`` drafts
+    (0 if none) and, short of the whole block, resamples position ``tau``
+    from ``relu(w_tau p - q)``. The output law is the token rule's; the
+    expected number of accepted drafts is never lower.
     """
     req_idx = tl.program_id(0)
     if req_idx == 0:
@@ -321,7 +407,81 @@ def _ratio_accept_kernel(
     rejected = False
     reject_pos = -1
     last_checked = -1
-    for pos in range(num_draft_tokens):
+    weight_at_tau = 1.0
+    walk = num_draft_tokens
+    if BLOCK_VERIFY & has_q & (temp > greedy_temperature):
+        weight = 1.0
+        tau = 0
+        for pos in range(num_draft_tokens):
+            row = start_idx + pos
+            x = _draft_token(input_ids_ptr, target_logits_indices_ptr, row)
+            p = _target_p_at(
+                logits_ptr,
+                row,
+                logits_row_stride,
+                x,
+                temp,
+                row_max_ptr,
+                row_inv_z_ptr,
+                row_floor_ptr,
+                True,
+                FILTER,
+            )
+            at_pos = offs_t == pos
+            q = tl.sum(tl.where(at_pos, slot_qs, 0.0), axis=0)
+            if tl.sum(tl.where(at_pos, slot_ids, 0), axis=0) != x:
+                q = _stored_q_of(
+                    q_ids_ptr,
+                    q_probs_ptr,
+                    (q_base + pos).to(tl.int64) * q_width,
+                    tl.sum(tl.where(at_pos, stored_n, 0), axis=0),
+                    x,
+                    BLOCK_Q,
+                )
+            # A q x cannot have been drawn from ends the block here.
+            valid_q = (q > 0.0) & (q <= 1.0)
+            ratio = p / tl.where(valid_q, q, 1.0)
+            weight = tl.where(valid_q, tl.minimum(weight * ratio, 1.0), 0.0)
+            h = weight
+            if pos + 1 < num_draft_tokens:
+                next_q = (q_base + pos + 1).to(tl.int64)
+                n_next = tl.minimum(
+                    tl.maximum(tl.load(q_meta_ptr + next_q * 2), 0), q_width
+                )
+                mass = _block_residual_mass(
+                    logits_ptr,
+                    row + 1,
+                    logits_row_stride,
+                    temp,
+                    row_max_ptr,
+                    row_inv_z_ptr,
+                    row_floor_ptr,
+                    q_ids_ptr,
+                    q_probs_ptr,
+                    next_q * q_width,
+                    n_next,
+                    weight,
+                    BLOCK_Q,
+                    FILTER,
+                )
+                denom = mass + 1.0 - weight
+                h = tl.where(denom > 0.0, mass / tl.where(denom > 0.0, denom, 1.0), 1.0)
+            keep = tl.rand(accept_seed, row) <= h
+            tau = tl.where(keep, pos + 1, tau)
+            weight_at_tau = tl.where(keep, weight, weight_at_tau)
+        for pos in range(num_draft_tokens):
+            if pos < tau:
+                x = _draft_token(
+                    input_ids_ptr, target_logits_indices_ptr, start_idx + pos
+                )
+                tl.store(out_row + pos, tl.cast(x, tl.int32))
+            elif pos > tau:
+                tl.store(out_row + pos, INVALID_TOKEN)
+        rejected = tau < num_draft_tokens
+        reject_pos = tau
+        last_checked = tl.minimum(tau, num_draft_tokens - 1)
+        walk = num_draft_tokens * 0
+    for pos in range(walk):
         if rejected:
             tl.store(out_row + pos, INVALID_TOKEN)
         else:
@@ -373,6 +533,7 @@ def _ratio_accept_kernel(
     if rejected and not greedy:
         residual_row = start_idx + reject_pos
     tl.store(residual_row_ptr + req_idx, residual_row)
+    tl.store(residual_weight_ptr + req_idx, weight_at_tau)
     _finish_request(
         output_token_ids_ptr,
         verdict_ptr,
@@ -484,6 +645,7 @@ def _ratio_residual_race_kernel(
     row_floor_ptr,  # [num_tokens] fp32, the lowest logit p_f keeps (FILTER)
     dense_ptr,  # [>= batch_size, V] fp32: a rejecting request's q at its row
     q_row_base_ptr,  # [batch_size] int32, this request's first q row, or < 0
+    residual_weight_ptr,  # [batch_size] fp32, the weight on p (1 token-wise)
     part_key_ptr,  # [n_tiles, batch_size] fp32: best residual key
     part_idx_ptr,  # [n_tiles, batch_size] int32: its lowest id
     batch_size,
@@ -524,7 +686,8 @@ def _ratio_residual_race_kernel(
         # Anything that is not a probability (NaN, inf, negative) counts as 0,
         # so the residual falls back toward p rather than inheriting garbage.
         q = tl.where((q >= 0.0) & (q <= 1.0), q, 0.0)
-        residual = tl.maximum(p - q, 0.0)
+        weight = tl.load(residual_weight_ptr + req_idx)
+        residual = tl.maximum(weight * p - q, 0.0)
         key = race_key(
             residual, residual_seed, row.to(tl.int64) * vocab_size, offs, vmask
         )
@@ -779,6 +942,7 @@ def _ratio_sample(
             part_key,
             filter_f32,
             floor_mass,
+            residual_weight,
         ),
         (
             row_argmax,
@@ -817,6 +981,7 @@ def _ratio_sample(
         output_token_ids,
         verdict,
         residual_row,
+        residual_weight,
         cu_num_draft_tokens,
         input_ids,
         target_logits_indices,
@@ -871,6 +1036,7 @@ def _ratio_sample(
         row_floor,
         dense,
         q_row_base,
+        residual_weight,
         part_key,
         part_idx,
         batch_size,
