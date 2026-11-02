@@ -681,7 +681,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # regression is suspected -- the fastest way to rule this kernel in or out,
     # since the two paths are not bit-identical by construction. Read once when
     # the Markov head is built, so it must be set before the server starts.
-    # Once ATOM_SPEC_LOSSLESS_SAMPLING arms, Kimi-K3's draft takes the
+    # Once ATOM_SPEC_LOSSLESS_SAMPLING arms, a K3 or V4.1 draft takes the
     # lossless sampled block for every row, greedy rows included, whatever
     # this says: "0" no longer selects the reference there. Turn that flag
     # off too to compare against the reference.
