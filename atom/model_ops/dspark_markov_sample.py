@@ -63,7 +63,11 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.model_ops.sampling_scratch import SamplingScratch, take
 from atom.model_ops.softmax_tiles import argmax_lowest_id, softmax_combine_kernel
-from atom.model_ops.sparse_q_select import q_select_scratch_shapes, select_and_draw_q
+from atom.model_ops.sparse_q_select import (
+    q_select_scratch_shapes,
+    select_and_draw_q,
+    select_and_draw_q_tp,
+)
 
 # Untuned, and chosen for headroom rather than peak: the stage-1 accumulator is
 # [BLOCK_ROW, BLOCK_V] fp32 (64x128 -> 16 VGPR/lane at 8 warps) and one pipeline
@@ -652,6 +656,8 @@ def _dspark_markov_sample_stage1(
     part_amax_idx_ptr,
     num_rows,
     vocab_size,
+    vocab_start,
+    id_sentinel,
     rank,
     stride_base_row,
     stride_prev,
@@ -666,6 +672,10 @@ def _dspark_markov_sample_stage1(
     """One (V tile, row tile): bias GEMV, add base, scale by 1/T, write ``s``
     into the row's scratch row and publish this tile's max of ``s``, plus the
     unscaled logits' (max, lowest id) a greedy row drafts from.
+
+    ``vocab_size`` columns from id ``vocab_start``: the whole vocab, or one
+    TP rank's shard of it (`dspark_markov_sample_tp`). Published ids are
+    global; ``id_sentinel`` is the one a tile with no maximal lane answers.
     """
     tile = tl.program_id(0)
     offs_row = tl.program_id(1) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
@@ -689,7 +699,7 @@ def _dspark_markov_sample_stage1(
         stride_w1_vocab,
         stride_embed_row,
         stride_w2_vocab,
-        0,
+        vocab_start,
         BLOCK_ROW,
         BLOCK_V,
         BLOCK_K,
@@ -697,7 +707,7 @@ def _dspark_markov_sample_stage1(
     # The greedy op's own (max, lowest id), taken before the division: a
     # near-zero temperature can round distinct logits onto one value.
     raw_max, raw_idx = argmax_lowest_id(
-        logits, offs_v[None, :], v_mask[None, :], vocab_size
+        logits, vocab_start + offs_v[None, :], v_mask[None, :], id_sentinel
     )
     tl.store(part_amax_val_ptr + tile * num_rows + offs_row, raw_max, mask=row_mask)
     tl.store(part_amax_idx_ptr + tile * num_rows + offs_row, raw_idx, mask=row_mask)
@@ -956,6 +966,8 @@ def dspark_markov_sample(
         part_amax_idx,
         num_rows,
         vocab_size,
+        0,
+        vocab_size,
         rank,
         stride_base_row=base_logits.stride(0),
         stride_prev=prev_ids.stride(0),
@@ -1001,5 +1013,148 @@ def dspark_markov_sample(
         select_scratch,
         position,
         noise_offset,
+    )
+    return markov_embed
+
+
+def dspark_markov_sample_tp(
+    base_logits: torch.Tensor,
+    prev_ids: torch.Tensor,
+    markov_w1: torch.Tensor,
+    markov_w2: torch.Tensor,
+    out: torch.Tensor,
+    q_ids: torch.Tensor,
+    q_probs: torch.Tensor,
+    q_meta: torch.Tensor,
+    s_scratch: torch.Tensor,
+    q_row_base: torch.Tensor,
+    position: int,
+    temperatures: torch.Tensor,
+    greedy_mask: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    seed: torch.Tensor,
+    noise_offset: int,
+    vocab_start: int,
+    tp_group,
+    use_custom: bool = True,
+) -> torch.Tensor:
+    """``dspark_markov_sample`` over a TP-sharded vocab: the same draw and the
+    same stored q, bit for bit, without all-gathering the logits.
+
+    ``base_logits`` is this rank's ``[B, V / tp]`` slice of the LM head, ids
+    ``vocab_start ..``; the Markov tables are whole. ``s_scratch`` is the
+    whole-vocab ``[>= B, V]`` scratch, of which this rank scores into the
+    first ``V / tp`` columns. Each rank publishes its stage-1 partials and
+    they are gathered, so the row max and raw argmax are the whole row's; the
+    selection then crosses ranks as `select_and_draw_q_tp` describes. What
+    crosses ranks per position is ``[3, V / (tp * 128), B]`` fp32 partials,
+    ``[B, V / (tp * 4096), 256]`` histogram counts and a ``[2, B, K]``
+    staging pair -- small against the ``[B, V]`` logits.
+
+    The intermediates are allocated per call, which the block head's graph
+    capture keeps in its pool.
+    """
+    num_rows, local_vocab = base_logits.shape
+    world = tp_group.world_size
+    vocab_size = local_vocab * world
+    rank = markov_w2.shape[1]
+    if s_scratch.shape[1] != vocab_size or s_scratch.dtype is not torch.float32:
+        raise ValueError(
+            f"s_scratch {tuple(s_scratch.shape)} {s_scratch.dtype} is not the "
+            f"[>= {num_rows}, {vocab_size}] fp32 whole-vocab scratch"
+        )
+    _check_rows("q_row_base", q_row_base, num_rows, torch.int32)
+    _check_rows("top_k", top_k, num_rows, torch.int32)
+    _check_rows("top_p", top_p, num_rows, torch.float32)
+    if base_logits.stride(1) != 1:
+        raise ValueError("base_logits rows must be contiguous over the vocab axis")
+    why = dspark_markov_sample_unsupported(markov_w1, markov_w2)
+    if why is not None:
+        raise ValueError(f"dspark_markov_sample_tp cannot run: {why}")
+    device = base_logits.device
+    markov_embed = torch.empty(num_rows, rank, dtype=markov_w1.dtype, device=device)
+    if num_rows == 0:
+        return markov_embed
+    block_row = min(
+        _MAX_BLOCK_ROW, max(_MIN_BLOCK_ROW, triton.next_power_of_2(num_rows))
+    )
+    gemv_tiles = triton.cdiv(local_vocab, _BLOCK_V)
+    s_local = s_scratch[:, :local_vocab]
+    # part_max, part_amax_val, part_amax_idx (int32 bits): one gather.
+    parts = torch.empty(3, gemv_tiles, num_rows, dtype=torch.float32, device=device)
+    _dspark_markov_sample_stage1[(gemv_tiles, triton.cdiv(num_rows, block_row))](
+        base_logits,
+        prev_ids,
+        markov_w1,
+        markov_w2,
+        temperatures,
+        q_row_base,
+        markov_embed,
+        s_local,
+        parts[0],
+        parts[1],
+        parts[2].view(torch.int32),
+        num_rows,
+        local_vocab,
+        vocab_start,
+        vocab_size,
+        rank,
+        stride_base_row=base_logits.stride(0),
+        stride_prev=prev_ids.stride(0),
+        stride_w1_vocab=markov_w1.stride(0),
+        stride_embed_row=markov_embed.stride(0),
+        stride_w2_vocab=markov_w2.stride(0),
+        stride_s_row=s_local.stride(0),
+        BLOCK_ROW=block_row,
+        BLOCK_V=_BLOCK_V,
+        BLOCK_K=_BLOCK_K,
+        num_warps=8 if block_row >= 32 else 4,
+        num_stages=2,
+    )
+    # Rank-major is id order, so the gathered tiles are the whole row's tiles.
+    gathered = (
+        tp_group.all_gather(parts, use_custom=use_custom, dim=0)
+        .view(world, 3, gemv_tiles, num_rows)
+        .transpose(0, 1)
+        .reshape(3, world * gemv_tiles, num_rows)
+    )
+    row_max = torch.empty(num_rows, dtype=torch.float32, device=device)
+    row_argmax = torch.empty(num_rows, dtype=torch.int32, device=device)
+    softmax_combine_kernel[(num_rows,)](
+        gathered[0],
+        None,
+        row_max,
+        None,
+        gathered[1],
+        gathered[2].view(torch.int32),
+        row_argmax,
+        num_rows,
+        world * gemv_tiles,
+        BLOCK_TILE=triton.next_power_of_2(world * gemv_tiles),
+        WITH_ARGMAX=True,
+        WITH_INV_Z=False,
+        num_warps=4,
+        num_stages=1,
+    )
+    select_and_draw_q_tp(
+        s_local,
+        row_max,
+        row_argmax,
+        q_row_base,
+        greedy_mask,
+        top_k,
+        top_p,
+        seed,
+        out,
+        q_ids,
+        q_probs,
+        q_meta,
+        position,
+        noise_offset,
+        vocab_size,
+        vocab_start,
+        tp_group,
+        use_custom,
     )
     return markov_embed

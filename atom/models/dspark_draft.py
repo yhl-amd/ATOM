@@ -181,6 +181,7 @@ class DSparkMarkovHead(nn.Module):
         bs: int,  # rows of the per-row inputs this block runs
         position: int,  # k: this position's row is q_row_base + k
         noise_offset: int,
+        tp_shard=None,  # (vocab_start, tp_group, use_custom): base_logits is a shard
     ) -> torch.Tensor:
         """One sampled block position: draw ``x_k`` from the top of
         ``softmax(biased / T)`` and write exactly that q out.
@@ -192,8 +193,33 @@ class DSparkMarkovHead(nn.Module):
         rule does not match.
         """
         # Imported here for the reason `sample_next` gives.
-        from atom.model_ops.dspark_markov_sample import dspark_markov_sample
+        from atom.model_ops.dspark_markov_sample import (
+            dspark_markov_sample,
+            dspark_markov_sample_tp,
+        )
 
+        if tp_shard is not None:
+            vocab_start, tp_group, use_custom = tp_shard
+            return dspark_markov_sample_tp(
+                base_logits,
+                token_ids,
+                self.markov_w1.weight,
+                self.markov_w2.weight,
+                out,
+                *sampling.q_store,
+                sampling.s_scratch,
+                sampling.q_row_base[:bs],
+                position,
+                sampling.temperatures[:bs],
+                sampling.greedy_mask[:bs],
+                sampling.top_k[:bs],
+                sampling.top_p[:bs],
+                sampling.seed,
+                noise_offset,
+                vocab_start,
+                tp_group,
+                use_custom,
+            )
         return dspark_markov_sample(
             base_logits,
             token_ids,
@@ -216,9 +242,10 @@ class DSparkMarkovHead(nn.Module):
 
     def sample_block_q(
         self,
-        base_logits: torch.Tensor,  # [B, T, V]
+        base_logits: torch.Tensor,  # [B, T, V], or [B, T, V / tp] with tp_shard
         anchor_ids: torch.Tensor,  # [B]
         sampling: "DraftSampling",
+        tp_shard=None,  # (vocab_start, tp_group, use_custom)
     ) -> torch.Tensor:
         """The sampled block, left to right, through ``sample_next_q``:
 
@@ -233,6 +260,10 @@ class DSparkMarkovHead(nn.Module):
         noise counters cannot differ between them.
         """
         bs, num_draft, vocab = base_logits.shape
+        if tp_shard is not None:
+            # Counters and the store are the whole vocab's whichever rank
+            # scores which shard.
+            vocab *= tp_shard[1].world_size
         assert sampling.s_scratch.shape[1] == vocab, (
             f"the score scratch is {sampling.s_scratch.shape[1]} wide but the "
             f"block scores {vocab} ids"
@@ -252,6 +283,7 @@ class DSparkMarkovHead(nn.Module):
                 bs,
                 k,
                 k * position_stride,
+                tp_shard,
             )
         return out_ids[:, 1:]
 
