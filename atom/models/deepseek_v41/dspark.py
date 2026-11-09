@@ -6,6 +6,7 @@ from copy import copy
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.tuned_gemm import tgemm
 from torch import nn
 
@@ -15,6 +16,7 @@ from atom.model_ops.deepseek_v41.draft_block import DraftStep, draft_step, rotat
 from atom.model_ops.deepseek_v41.dspark import (
     build_block_state,
     draft_attention,
+    draft_rows,
     draft_step_indices,
     fused_draft_kv_tail,
 )
@@ -524,7 +526,17 @@ class DeepseekV41DSpark(DSparkDraftModel):
             context,
             context_positions,
             num_draft=num_draft,
-            step=DraftStep(step_positions, indices),
+            step=DraftStep(
+                step_positions,
+                indices,
+                # The sparse MLA kernel's draft read is measured on gfx1250;
+                # elsewhere the stages keep the concatenating path.
+                rows=(
+                    draft_rows(indices, cache.geometry.ring_slots)
+                    if get_gfx_runtime() == "gfx1250"
+                    else None
+                ),
+            ),
         )
 
     def forward_spec(self, input_ids, positions, num_draft=None):
