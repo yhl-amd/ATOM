@@ -3,6 +3,7 @@
 
 import os
 from contextlib import contextmanager
+from copy import copy
 from types import SimpleNamespace
 
 import pytest
@@ -122,6 +123,7 @@ def build_v41(unallocated_moe):
             enforce_eager=True,
             compilation_config=SimpleNamespace(level=0, static_forward_context={}),
             online_quant_config=online,
+            max_num_seqs=4,
         )
         with torch.device("meta"):
             if entrypoint == "runtime":
@@ -135,8 +137,11 @@ def build_v41(unallocated_moe):
             if entrypoint == "draft":
                 return dspark.DeepseekV41DSpark(engine, alt_stream=alt_stream)
             if entrypoint == "draft_offline":
+                # Off the engine, the batch bound rides on the model config.
+                offline = copy(hf)
+                offline.max_num_seqs = 4
                 return dspark.DeepseekV41DSpark(
-                    hf, max_length=32, alt_stream=alt_stream
+                    offline, max_length=32, alt_stream=alt_stream
                 )
             raise ValueError(f"No V4.1 entry point named {entrypoint!r}")
 
