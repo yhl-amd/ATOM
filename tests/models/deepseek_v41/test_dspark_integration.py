@@ -341,10 +341,8 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch, two_s
     draft = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
     nn.Module.__init__(draft)
     draft.window_size = 4
-    draft.draft_src_buffers = None
-    if two_source:
-        monkeypatch.setattr(dspark_ops, "two_source_draft", lambda: True)
-        draft.draft_src_buffers = dspark_ops.DraftSrcBuffers(4, 5)
+    draft.draft_src_buffers = dspark_ops.DraftSrcBuffers(4, 5)
+    monkeypatch.setattr(dspark_ops, "two_source_draft", lambda: two_source)
     layer = nn.Module()
     layer.attn = nn.Module()
     layer.attn.spec = SimpleNamespace(layer_id=0)
@@ -431,6 +429,7 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch, two_s
             assert draft.draft_src_buffers.context.data_ptr() == src_ptr
         else:
             assert not actual_src
+            assert draft.draft_src_buffers.context is None
         assert torch.equal(builder.cache.backing, before)
     assert graph.is_captured(4)
 
