@@ -48,6 +48,18 @@ class BlockTableState:
         self.published = None
         self.page_limit = None
         self.checked = None
+        # Per row: the write that last changed it on the host, and what the
+        # destination is known to hold -- the write it last received (-1:
+        # unknown) and a bound past which it holds zeros. Rows a publish
+        # covers and the destination already holds go up no more, and the
+        # rest only as wide as their pages and old destination bound need
+        # (`_row_plan`).
+        rows = self.cpu.shape[0]
+        self.row_writes = np.zeros(rows, dtype=np.int64)
+        self.writes = 0
+        self.gpu_writes = np.full(rows, -1, dtype=np.int64)
+        self.gpu_bound = np.full(rows, self.cpu.shape[1], dtype=np.int64)
+        self.gpu_tracked = None
 
     def _acquire(self):
         self.buffer.acquire_write()
@@ -141,6 +153,11 @@ class BlockTableState:
         zero_to = max(end, self.zero_to) if n == old_n else end
         if changes or clear_tail:
             self._begin_write()  # all validation precedes the first write
+            # Mark the rows before writing them, so a failed write stays dirty.
+            self.writes += 1
+            self.row_writes[[i for i, _, _, _ in changes]] = self.writes
+            if clear_tail:
+                self.row_writes[n:end] = self.writes
             # A fully replaced batch can clear exposed tails in one pass.
             # Partial updates retain every unaffected row and copied prefix.
             bulk_clear = (
@@ -193,25 +210,102 @@ class BlockTableState:
         )
         return dirty, key
 
+    def _row_bounds(self, count):
+        """Per row below ``count``: a bound past which the host row is zero.
+        Prepared rows hold their pages, the padding rows zeros; any other
+        row (never prepared) could hold anything."""
+        bounds = np.full(count, self.cpu.shape[1], dtype=np.int64)
+        n = min(len(self.lengths), count)
+        bounds[:n] = self.lengths[:n]
+        bounds[n : min(self.zero_to, count)] = 0
+        return bounds
+
+    def _track(self, gpu):
+        if self.gpu_tracked is not gpu:
+            # A new destination holds nothing known.
+            self.gpu_writes.fill(-1)
+            self.gpu_bound.fill(self.cpu.shape[1])
+            self.gpu_tracked = gpu
+
+    def _row_plan(self, count):
+        """The rows below ``count`` the destination does not hold yet and the
+        leading bytes of each that differ from it, or None for all of them.
+
+        A row the destination holds is identical in every byte. Sending a
+        changed row's first ``width`` columns makes it so too: past ``width``
+        both sides are zero -- the host row past its pages, the destination
+        past its bound. Rows above ``count`` stay as they are, as with the
+        whole-prefix copy."""
+        self._track(self.buffer.gpu)
+        rows = np.flatnonzero(self.gpu_writes[:count] != self.row_writes[:count])
+        if not len(rows):
+            return rows, 0
+        columns = self.cpu.shape[1]
+        width = max(
+            int(self._row_bounds(count)[rows].max()),
+            int(self.gpu_bound[rows].max()),
+        )
+        if width == 0:
+            return rows[:0], 0  # zeros on both sides: nothing differs
+        # Whole 16-byte words, as the packed word copy moves them.
+        width = min(-(-width // 4) * 4, columns)
+        if len(rows) == count and width == columns:
+            return None, columns
+        return rows.astype(np.int32), width
+
+    def _sending(self, gpu, count):
+        """Before an upload of rows below ``count``: until it has succeeded
+        (`_published_rows`), its rows are unknown and may hold the host's
+        bytes, so a failed or partial upload is resent in full width."""
+        self._track(gpu)
+        self.gpu_writes[:count] = -1
+        np.maximum(
+            self.gpu_bound[:count], self._row_bounds(count), out=self.gpu_bound[:count]
+        )
+
+    def _published_rows(self, gpu, count):
+        """The destination took every row below ``count`` (planned or whole)."""
+        self._track(gpu)
+        self.gpu_writes[:count] = self.row_writes[:count]
+        self.gpu_bound[:count] = self._row_bounds(count)
+
     def stage(self, count, group):
         """Count a changed table into ``group``, whose owner publishes it.
 
         Omitting a table from a group does not omit its GPU view from metadata.
-        The revision is recorded once that publish has succeeded.
+        The revision is recorded once that publish has succeeded. A packed
+        transport sends only the rows the destination does not hold, each
+        only as wide as needed (`_row_plan`); the result is the same bytes.
         """
         dirty, key = self._dirty(count)
-        group.set_count(self.buffer, count if dirty else None)
         if dirty:
             gpu = self.buffer.gpu
-            group.after_publish(lambda: setattr(self, "published", (gpu, key)))
+            rows, width = self._row_plan(count)
+            binding = getattr(self.buffer, "_publication", None)
+            if rows is not None and not len(rows):
+                dirty = False  # the destination already holds every row
+            elif rows is not None and binding is not None:
+                binding.row_plan = (count, rows, width * self.cpu.itemsize)
+            if dirty:
+                self._sending(gpu, count)
+
+            def published():
+                self._published_rows(gpu, count)
+                self.published = (gpu, key)
+
+            group.after_publish(published)
+        group.set_count(self.buffer, count if dirty else None)
         return self.buffer.gpu[:count]
 
     def publish(self, count):
         """Upload a changed table on its own."""
         dirty, key = self._dirty(count)
         if dirty:
+            gpu = self.buffer.gpu
+            self._sending(gpu, count)
             self.buffer.copy_to_gpu(count)
-            self.published = (self.buffer.gpu, key)
+            self._published_rows(gpu, count)
+            self.published = (gpu, key)
         return self.buffer.gpu[:count]
 
 

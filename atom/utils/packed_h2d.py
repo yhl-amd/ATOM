@@ -1,21 +1,27 @@
 # SPDX-License-Identifier: MIT
 """Pack metadata into one pinned arena, upload once, scatter to stable addresses."""
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
 
 
 @triton.jit
-def scatter_packed_words(arena, destinations, wide, WORDS: tl.constexpr):
-    """Scatter each packed member (header: int64 arena offset, byte count) to
-    its destination, WORDS * 8 bytes a program: as int64 words where the
-    member starts 16-byte aligned in the arena (packing pads every member to
-    that) and its destination is too (`wide`), byte by byte otherwise."""
+def scatter_packed_words(arena, destinations, wide, pitches, WORDS: tl.constexpr):
+    """Scatter each packed member to its destination, WORDS * 8 bytes a
+    program: as int64 words where the member starts 16-byte aligned in the
+    arena (packing pads every member to that) and its destination is too
+    (`wide`), byte by byte otherwise.
+
+    A member's header is (start, byte count, row bytes, row map offset). Row
+    bytes 0: a contiguous prefix. Otherwise the payload holds rows of that many
+    bytes (a multiple of 16), each stored at the start of the destination row
+    the int32 row map names, ``pitches`` bytes apart (`PackedCopy.submit`)."""
     member = tl.program_id(0)
     header = arena.to(tl.pointer_type(tl.int64))
-    start = tl.load(header + 2 * member)
-    length = tl.load(header + 2 * member + 1)
+    start = tl.load(header + 4 * member)
+    length = tl.load(header + 4 * member + 1)
     address = tl.load(destinations + member)
     span = WORDS * 8
     base = tl.program_id(1).to(tl.int64) * span
@@ -23,19 +29,32 @@ def scatter_packed_words(arena, destinations, wide, WORDS: tl.constexpr):
         if tl.load(wide + member) != 0:
             words = length // 8
             index = base // 8 + tl.arange(0, WORDS)
+            mask = index < words
             source = (arena + tl.multiple_of(start, 16)).to(tl.pointer_type(tl.int64))
-            target = tl.multiple_of(address, 16).to(tl.pointer_type(tl.int64))
-            tl.store(
-                target + index, tl.load(source + index, index < words), index < words
-            )
-            # The last program also moves the 0-7 tail bytes.
-            if base + span >= length:
-                tail = words * 8 + tl.arange(0, 8)
-                tl.store(
-                    address.to(tl.pointer_type(tl.uint8)) + tail,
-                    tl.load(arena + start + tail, tail < length),
-                    tail < length,
+            values = tl.load(source + index, mask)
+            row_bytes = tl.load(header + 4 * member + 2)
+            if row_bytes == 0:
+                target = tl.multiple_of(address, 16).to(tl.pointer_type(tl.int64))
+                tl.store(target + index, values, mask)
+                # The last program also moves the 0-7 tail bytes.
+                if base + span >= length:
+                    tail = words * 8 + tl.arange(0, 8)
+                    tl.store(
+                        address.to(tl.pointer_type(tl.uint8)) + tail,
+                        tl.load(arena + start + tail, tail < length),
+                        tail < length,
+                    )
+            else:
+                row_words = row_bytes // 8
+                row_map = (arena + tl.load(header + 4 * member + 3)).to(
+                    tl.pointer_type(tl.int32)
                 )
+                row = index // row_words
+                column = index - row * row_words
+                target_row = tl.load(row_map + row, mask, other=0).to(tl.int64)
+                pitch_words = tl.load(pitches + member) // 8
+                target = tl.multiple_of(address, 16).to(tl.pointer_type(tl.int64))
+                tl.store(target + target_row * pitch_words + column, values, mask)
         else:
             offset = base + tl.arange(0, WORDS * 8)
             tl.store(
@@ -43,6 +62,10 @@ def scatter_packed_words(arena, destinations, wide, WORDS: tl.constexpr):
                 tl.load(arena + start + offset, offset < length),
                 offset < length,
             )
+
+
+def _pad16(nbytes):
+    return -(-nbytes // 16) * 16
 
 
 class PackedCopy:
@@ -59,10 +82,25 @@ class PackedCopy:
             return None, "strided regions use checked direct"
         result = cls()
         result.members = members
-        result.header_bytes = 16 * len(members)  # int64 (offset, byte count)
-        # Every member starts 16-byte aligned (`submit` pads), for the word copy.
+        # int64 (offset, byte count, row bytes, row map offset) per member.
+        result.header_bytes = 32 * len(members)
+        # Destinations the word copy may store to as int64 (16-byte aligned).
+        wide = [int(b.destination.data_ptr() % 16 == 0) for b in members]
+        # Members that may take a row plan (`BufferPublication.row_plan`):
+        # two-dimensional rows of whole 16-byte words at a word-aligned address.
+        result.row_members = tuple(
+            b.unit == "rows"
+            and b.source.ndim == 2
+            and b.bytes_per_count % 16 == 0
+            and bool(w)
+            for b, w in zip(members, wide)
+        )
+        # Every member starts 16-byte aligned (`submit` pads), for the word
+        # copy; a row member also reserves a row map of one int32 per row.
         capacity = result.header_bytes + sum(
-            -(-(b.capacity * b.bytes_per_count) // 16) * 16 for b in members
+            _pad16(b.capacity * b.bytes_per_count)
+            + (_pad16(4 * b.row_capacity) if rows else 0)
+            for b, rows in zip(members, result.row_members)
         )
         result.host = torch.empty(
             capacity, dtype=torch.uint8, device="cpu", pin_memory=True
@@ -70,25 +108,59 @@ class PackedCopy:
         result.device = torch.empty(capacity, dtype=torch.uint8, device=device)
         result.header = result.host[: result.header_bytes].view(torch.int64).numpy()
         result.payload = memoryview(result.host.numpy())
+        result.arena = result.host.numpy()
         # Byte views avoid typed copies canonicalizing bool or casting BF16.
         result.sources = tuple(
             memoryview(b.source.reshape(-1).view(torch.uint8).numpy()) for b in members
+        )
+        result.rows = tuple(
+            (
+                b.source.view(torch.uint8)
+                .numpy()
+                .reshape(b.row_capacity, b.bytes_per_count)
+                if rows
+                else None
+            )
+            for b, rows in zip(members, result.row_members)
         )
         result.destinations = torch.tensor(
             [b.destination.data_ptr() for b in members],
             dtype=torch.int64,
             device=device,
         )
-        # Destinations the word copy may store to as int64 (16-byte aligned).
-        result.wide = torch.tensor(
-            [int(b.destination.data_ptr() % 16 == 0) for b in members],
-            dtype=torch.int32,
+        result.wide = torch.tensor(wide, dtype=torch.int32, device=device)
+        result.pitches = torch.tensor(
+            [
+                b.bytes_per_count if rows else 0
+                for b, rows in zip(members, result.row_members)
+            ],
+            dtype=torch.int64,
             device=device,
         )
         result.prefixes = {}
         result.launch = scatter_packed_words
         result.kernel = None
         return result, None
+
+    def _plan(self, i, count):
+        """Member ``i``'s row plan for ``count`` rows, if it can take one: the
+        rows (strictly increasing int32) and the leading bytes of each to send
+        in place of the whole prefix."""
+        binding = self.members[i]
+        plan = binding.row_plan
+        if plan is None or not self.row_members[i] or plan[0] != count:
+            return None
+        rows, row_bytes = plan[1], plan[2]
+        if (
+            row_bytes <= 0
+            or row_bytes % 16
+            or row_bytes > binding.bytes_per_count
+            or not 0 < len(rows) <= count
+            or rows[0] < 0
+            or rows[-1] >= count
+        ):
+            return None
+        return rows, row_bytes
 
     def submit(self, counts):
         """Enqueue copies and return whether the packed arena is borrowed."""
@@ -101,12 +173,43 @@ class PackedCopy:
         offset = self.header_bytes
         largest = 0
         for i, (binding, count) in enumerate(zip(self.members, counts)):
+            plan = self._plan(i, count) if count else None
+            self.header[4 * i] = offset
+            self.header[4 * i + 2] = 0
+            self.header[4 * i + 3] = 0
+            if plan is not None:
+                # Only the planned rows' leading bytes; the rest of every
+                # destination row already holds the source's bytes.
+                rows, row_bytes = plan
+                length = len(rows) * row_bytes
+                block = self.arena[offset : offset + length].reshape(
+                    len(rows), row_bytes
+                )
+                source = self.rows[i][:, :row_bytes]
+                # Increasing rows: copy each run of consecutive rows as one
+                # slice (a shifted batch is one run); scattered rows gather.
+                breaks = np.flatnonzero(np.diff(rows) != 1) + 1
+                if len(breaks) < 8:
+                    lo = 0
+                    for hi in (*breaks.tolist(), len(rows)):
+                        first = int(rows[lo])
+                        block[lo:hi] = source[first : first + hi - lo]
+                        lo = hi
+                else:
+                    np.take(source, rows, axis=0, out=block)
+                row_map = offset + _pad16(length)
+                self.arena[row_map : row_map + 4 * len(rows)].view(np.int32)[:] = rows
+                self.header[4 * i + 1] = length
+                self.header[4 * i + 2] = row_bytes
+                self.header[4 * i + 3] = row_map
+                offset = row_map + _pad16(4 * len(rows))
+                largest = max(largest, length)
+                continue
             length = 0 if count is None else count * binding.bytes_per_count
-            self.header[2 * i] = offset
-            self.header[2 * i + 1] = length
+            self.header[4 * i + 1] = length
             if length:
                 self.payload[offset : offset + length] = self.sources[i][:length]
-                offset += -(-length // 16) * 16
+                offset += _pad16(length)
                 largest = max(largest, length)
         prefix = self.prefixes.get(offset)
         if prefix is None:
@@ -120,10 +223,15 @@ class PackedCopy:
         grid = (len(self.members), (largest + 8191) // 8192, 1)
         if self.kernel is None:
             self.kernel = self.launch[grid](
-                self.device, self.destinations, self.wide, WORDS=1024, num_warps=8
+                self.device,
+                self.destinations,
+                self.wide,
+                self.pitches,
+                WORDS=1024,
+                num_warps=8,
             )
         else:
             # Both argument storages and their layouts are fixed for this
             # binding. Reuse its compiled kernel; counts and grid stay dynamic.
-            self.kernel[grid](self.device, self.destinations, self.wide)
+            self.kernel[grid](self.device, self.destinations, self.wide, self.pitches)
         return True

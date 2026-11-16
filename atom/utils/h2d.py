@@ -223,6 +223,7 @@ class PublicationOwner:
         self._thread = threading.get_ident()
         for binding in self._bindings:
             binding._writable = True
+            binding.row_plan = None
         for group in self._groups:
             group._header_busy = False
             group._after_publish = []
@@ -313,6 +314,11 @@ class BufferPublication:
         self._epoch = -1
         self._writable = False
         self._single = None
+        # A producer's optional hint for the next packed publish of ``count``
+        # rows: (count, rows, row_bytes) -- only those rows' leading bytes
+        # differ from the destination (`PackedCopy.submit`). Any transport may
+        # ignore it and copy the whole prefix; publish clears it.
+        self.row_plan = None
         # At most four private prefix pairs per binding, with FIFO eviction.
         self._prefixes = {}
 
@@ -326,6 +332,8 @@ class BufferPublication:
         if not self._writable:
             self.owner._wait_sources()
             self._writable = True
+        # A rewritten source invalidates a row plan made against the old one.
+        self.row_plan = None
         return self.source
 
     def _validate(self, count, reason):
@@ -516,6 +524,8 @@ class PublicationGroup:
         only what its producers count, then run the `after_publish` callbacks."""
         for i in range(len(self.counts)):
             self.counts[i] = None
+        for binding in self.members:
+            binding.row_plan = None
         callbacks, self._after_publish = self._after_publish, []
         for callback in callbacks:
             callback()
