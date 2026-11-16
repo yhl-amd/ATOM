@@ -90,3 +90,19 @@ def test_unsupported_shapes_keep_the_settle_path():
         residual.transpose(0, 1).contiguous().transpose(0, 1), pending
     )
     assert not mhc.post_collapse_supported(residual.cpu(), pending.cpu())
+
+
+def test_post_collapse_writes_the_given_rows():
+    mhc = _mhc()
+    residual, pending, post, comb, _ = _data(9, 5120, 11, True)
+    buffer = torch.full((16, 5120), float("nan"), device="cuda", dtype=torch.bfloat16)
+    rows = buffer[5:14]
+    out = mhc.post_collapse_streams(pending, residual, post, comb, out=rows)
+    assert out.data_ptr() == rows.data_ptr()
+    expected = mhc.expand_residual(pending, residual, post, comb).mean(dim=-2)
+    assert torch.equal(buffer[5:14], expected)
+    assert buffer[:5].isnan().all() and buffer[14:].isnan().all()
+    # A destination of the wrong shape is not written: a new tensor comes back.
+    other = mhc.post_collapse_streams(pending, residual, post, comb, out=buffer[:4])
+    assert other.data_ptr() != buffer.data_ptr() and torch.equal(other, expected)
+    assert buffer[:5].isnan().all()

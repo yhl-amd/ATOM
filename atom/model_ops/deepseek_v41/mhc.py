@@ -145,16 +145,27 @@ def post_collapse_supported(residual, pending):
     )
 
 
-def post_collapse_streams(pending, residual, post_mix, combination, pre_mix=None):
+def post_collapse_streams(
+    pending, residual, post_mix, combination, pre_mix=None, out=None
+):
     """`settle()` then `collapse_streams` (or, with pre_mix=None, the BF16
     mean over the streams) in one launch, without writing the settled
-    residual. Bit-exact with mhc_post followed by either reduction."""
+    residual. Bit-exact with mhc_post followed by either reduction.
+    ``out``: a contiguous [tokens, H] tensor of the residual's dtype to write
+    into (e.g. a capture buffer's rows); otherwise a new one is returned."""
     hidden_size = residual.shape[-1]
     flat = residual.view(-1, 4, hidden_size)
     num_tokens = flat.shape[0]
-    out = torch.empty(
-        num_tokens, hidden_size, dtype=residual.dtype, device=residual.device
-    )
+    if not (
+        out is not None
+        and out.shape == (num_tokens, hidden_size)
+        and out.dtype == residual.dtype
+        and out.device == residual.device
+        and out.is_contiguous()
+    ):
+        out = torch.empty(
+            num_tokens, hidden_size, dtype=residual.dtype, device=residual.device
+        )
     if num_tokens == 0:
         return out
     post = post_mix.reshape(num_tokens, 4).contiguous()

@@ -311,23 +311,33 @@ class DeepseekV41DSpark(DSparkDraftModel):
         if set(layer_ids).intersection(self.config.engram_layer_ids):
             raise ValueError("V4.1 DSpark input taps cannot precede Engram injection")
         return AuxCaptureSpec(
-            layer_ids, hidden_size, self._target_layer_input, capture="input"
+            layer_ids,
+            hidden_size,
+            self._target_layer_input,
+            capture="input",
+            writes_into=True,
         )
 
     @staticmethod
-    def _target_layer_input(inputs, block):
+    def _target_layer_input(inputs, block, out_for=None):
         # Settled, because a pre-hook runs before the fold: the block ahead of
         # this one leaves its FFN post owed, and `residual` is by definition
         # the value before it. The block pays the same post again into its own
         # pre, which is the one seam where the draft costs the target a kernel.
-        # On the GPU that post and the mean run as one launch.
+        # On the GPU that post and the mean run as one launch, which writes
+        # the capture's own rows when the hook offers them (`out_for`).
         state = inputs[0]
         if state.pending is not None and post_collapse_supported(
             state.residual, state.pending
         ):
             hidden = state.residual.shape[-1]
+            rows = state.residual.numel() // (4 * hidden)
             return post_collapse_streams(
-                state.pending, state.residual, state.post_mix, state.combination
+                state.pending,
+                state.residual,
+                state.post_mix,
+                state.combination,
+                out=None if out_for is None else out_for(rows),
             ).reshape(-1, hidden)
         residual = state.settle().residual
         return residual.mean(dim=-2).reshape(-1, residual.shape[-1])

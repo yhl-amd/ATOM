@@ -50,6 +50,9 @@ class AuxCaptureSpec:
     # (layer_output, layer_module) -> [N, hidden_size], or None to skip this call.
     extract: Callable[[Any, nn.Module], torch.Tensor | None]
     capture: Literal["output", "input"] = "output"
+    # `extract` also takes `out_for=f`, where f(rows) is the [rows, hidden]
+    # destination it may write into and return (the hook then copies nothing).
+    writes_into: bool = False
 
     def __post_init__(self):
         if self.capture not in ("output", "input"):
@@ -168,10 +171,12 @@ def _identity_extract(output: Any, _module: nn.Module) -> torch.Tensor:
     return output[0] if isinstance(output, tuple) else output
 
 
-def _aux_hook(extract, write):
+def _aux_hook(extract, write, dest=None):
     """A target-layer forward hook handing ``write(tensor, tokens)`` the tap's
     aux tensor and the step's tokens it is for (a slice, or a split decode
-    micro-batch's packed positions), on target forwards only."""
+    micro-batch's packed positions), on target forwards only. With ``dest``
+    (``dest(tokens)`` -> the destination rows) an ``extract`` that writes into
+    a destination is offered the contiguous rows of a slice."""
 
     def _hook(module, _inputs, output):
         ctx = get_forward_context().context
@@ -180,7 +185,17 @@ def _aux_hook(extract, write):
         # rows with noise-token embeddings.
         if ctx.is_draft:
             return
-        tensor = extract(output, module)
+        if (
+            dest is not None
+            and ctx.ubatch_token_order is None
+            and not torch.compiler.is_compiling()
+        ):
+            offset = ctx.ubatch_token_offset
+            tensor = extract(
+                output, module, out_for=lambda n: dest(slice(offset, offset + n))
+            )
+        else:
+            tensor = extract(output, module)
         if tensor is None:
             return
         # Under TBO this hook fires once per micro-batch on its own tokens --
@@ -591,7 +606,10 @@ class Drafter(abc.ABC):
             spec,
             own,
             lambda lid, extract: self._make_aux_hook(
-                spec.layer_ids.index(lid), extract
+                spec.layer_ids.index(lid),
+                extract,
+                # The `-1` (embedding) tap takes its tensor verbatim.
+                writes_into=spec.writes_into and lid != -1,
             ),
         )
         self._captures_aux = True
@@ -613,14 +631,24 @@ class Drafter(abc.ABC):
         """Did `arm_aux_capture` tap target layers for this drafter?"""
         return self._captures_aux
 
-    def _make_aux_hook(self, buf_idx: int, extract):
+    def _make_aux_hook(self, buf_idx: int, extract, writes_into=False):
         buffer = self._aux_buffers[buf_idx]
 
         def write(tensor, tokens):
-            # In-place write into the fixed buffer (cudagraph-safe).
+            # In-place write into the fixed buffer (cudagraph-safe), unless
+            # `extract` already wrote these rows (`writes_into`).
+            if isinstance(tokens, slice) and not torch.compiler.is_compiling():
+                rows = buffer[tokens]
+                if (
+                    rows.data_ptr() == tensor.data_ptr()
+                    and rows.shape == tensor.shape
+                    and rows.stride() == tensor.stride()
+                ):
+                    return
             buffer[tokens] = tensor
 
-        return _aux_hook(extract, write)
+        dest = (lambda tokens: buffer[tokens]) if writes_into else None
+        return _aux_hook(extract, write, dest)
 
     def aux_for(self, target_hidden_states: torch.Tensor) -> list[torch.Tensor] | None:
         """The target aux hidden states captured during the last forward,
