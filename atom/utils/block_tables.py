@@ -228,7 +228,7 @@ class BlockTableState:
             self.gpu_bound.fill(self.cpu.shape[1])
             self.gpu_tracked = gpu
 
-    def _row_plan(self, count):
+    def _row_plan(self, count, bounds):
         """The rows below ``count`` the destination does not hold yet and the
         leading bytes of each that differ from it, or None for all of them.
 
@@ -236,14 +236,14 @@ class BlockTableState:
         changed row's first ``width`` columns makes it so too: past ``width``
         both sides are zero -- the host row past its pages, the destination
         past its bound. Rows above ``count`` stay as they are, as with the
-        whole-prefix copy."""
+        whole-prefix copy. ``bounds`` is `_row_bounds(count)`."""
         self._track(self.buffer.gpu)
         rows = np.flatnonzero(self.gpu_writes[:count] != self.row_writes[:count])
         if not len(rows):
             return rows, 0
         columns = self.cpu.shape[1]
         width = max(
-            int(self._row_bounds(count)[rows].max()),
+            int(bounds[rows].max()),
             int(self.gpu_bound[rows].max()),
         )
         if width == 0:
@@ -254,18 +254,17 @@ class BlockTableState:
             return None, columns
         return rows.astype(np.int32), width
 
-    def _sending(self, gpu, count):
+    def _sending(self, gpu, count, bounds):
         """Before an upload of rows below ``count``: until it has succeeded
         (`_published_rows`), its rows are unknown and may hold the host's
         bytes, so their destination bound widens to the host's. After a failed
         or partial upload every row below ``count`` is resent, as wide as the
         larger of the host's bound and that widened bound; only a destination
-        that is not tracked at all gets every row at full width (`_track`)."""
+        that is not tracked at all gets every row at full width (`_track`).
+        ``bounds`` is `_row_bounds(count)`."""
         self._track(gpu)
         self.gpu_writes[:count] = -1
-        np.maximum(
-            self.gpu_bound[:count], self._row_bounds(count), out=self.gpu_bound[:count]
-        )
+        np.maximum(self.gpu_bound[:count], bounds, out=self.gpu_bound[:count])
 
     def _published_rows(self, gpu, count):
         """The destination took every row below ``count`` (planned or whole)."""
@@ -285,17 +284,25 @@ class BlockTableState:
         plan = None
         if dirty:
             gpu = self.buffer.gpu
-            rows, width = self._row_plan(count)
+            bounds = self._row_bounds(count)
+            rows, width = self._row_plan(count, bounds)
             row_bytes = width * self.cpu.itemsize
             if rows is not None and not len(rows):
                 dirty = False  # the destination already holds every row
             elif rows is not None and row_bytes % 16 == 0:
-                # A table too narrow for whole 16-byte rows goes up whole.
+                # A plan only at whole 16-byte words: a full-width row of a
+                # table whose column count is not a multiple of 4 is not one,
+                # and such a table goes up whole.
                 plan = RowPlan(rows, row_bytes)
             if dirty:
-                self._sending(gpu, count)
+                self._sending(gpu, count, bounds)
 
             def published():
+                if self.revision != key[0]:
+                    # The host table was prepared again after this stage: the
+                    # upload read rows the plan did not cover, so the rows
+                    # stay unknown (`_sending`) and are sent again.
+                    return
                 self._published_rows(gpu, count)
                 self.published = (gpu, key)
 
@@ -308,7 +315,7 @@ class BlockTableState:
         dirty, key = self._dirty(count)
         if dirty:
             gpu = self.buffer.gpu
-            self._sending(gpu, count)
+            self._sending(gpu, count, self._row_bounds(count))
             self.buffer.copy_to_gpu(count)
             self._published_rows(gpu, count)
             self.published = (gpu, key)

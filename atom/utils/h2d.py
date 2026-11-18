@@ -63,6 +63,8 @@ class RowPlan:
             raise ValueError(f"row_bytes {self.row_bytes} is not a positive x16")
         if not len(self.rows) or self.rows[0] < 0:
             raise ValueError("a row plan names at least one nonnegative row")
+        if not (self.rows[1:] > self.rows[:-1]).all():
+            raise ValueError("row plan rows must be strictly increasing")
 
 
 def _count(value, capacity, name):
