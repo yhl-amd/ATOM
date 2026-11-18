@@ -176,6 +176,19 @@ class BlockTableState:
         self.zero_to = zero_to
         self.page_limit = page_limit
         self.checked = checked
+        if changes or clear_tail:
+            # A row whose upload is not confirmed (`_sending`) may still take
+            # these host bytes: a staged publish reads the host when it runs,
+            # and a failed one may have written part of them. Its destination
+            # bound covers them.
+            unknown = self.gpu_writes[:end] < 0
+            if unknown.any():
+                bounds = self._row_bounds(end)
+                np.maximum(
+                    self.gpu_bound[:end],
+                    np.where(unknown, bounds, 0),
+                    out=self.gpu_bound[:end],
+                )
         return self
 
     def _copy_changes(self, rows, changes, columns, bulk_clear):
@@ -301,14 +314,8 @@ class BlockTableState:
                 if self.revision != key[0]:
                     # The host table was prepared again after this stage: the
                     # upload read the host at publish time, so the rows stay
-                    # unknown (`_sending`) and are sent again, and their
-                    # destination bound widens to what that upload may have
-                    # written (a planned row that grew in between).
-                    np.maximum(
-                        self.gpu_bound[:count],
-                        self._row_bounds(count),
-                        out=self.gpu_bound[:count],
-                    )
+                    # unknown (`_sending`) and are sent again. `prepare`
+                    # already widened their destination bound to those bytes.
                     return
                 self._published_rows(gpu, count)
                 self.published = (gpu, key)

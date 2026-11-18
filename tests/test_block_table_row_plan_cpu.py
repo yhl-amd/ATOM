@@ -118,10 +118,14 @@ def test_churn_matches_the_host_after_every_successful_publish(seed):
     assert group.sent < full
 
 
-def test_a_prepare_between_stage_and_publish_is_not_recorded_as_received():
-    """The upload reads the host at publish time; a row prepared after the
-    plan was built and not in it must not be marked as held, and the next
-    publish sends it."""
+@pytest.mark.parametrize("outcome", ["ok", "fail", "half"])
+def test_a_prepare_between_stage_and_publish_is_not_recorded_as_received(outcome):
+    """The upload reads the host at publish time. A row prepared after the plan
+    was built and not in it must not be marked as held, and the next publish
+    sends it. A planned row that grows in between lands on the device past
+    its stage-time bound, whether the publish succeeds, fails or is cut short;
+    when that row later holds a shorter request at a smaller count, the plan
+    must still clear those pages."""
     table, device, group, state = _setup(8, 64)
     rows = [new_block_table([1, 2, 3]), new_block_table([4, 5])]
     state.prepare(rows, pad_to=4).stage(4, group)
@@ -138,13 +142,7 @@ def test_a_prepare_between_stage_and_publish_is_not_recorded_as_received():
     assert group.publish()
     np.testing.assert_array_equal(device[:4], table.np[:4])
 
-
-def test_a_planned_row_that_grows_before_the_publish_widens_its_bound():
-    """A planned row that grows between stage and publish lands on the device
-    past the bound recorded at stage time (the upload reads the host at
-    publish time, up to the plan width). When that row later holds a shorter
-    request at a smaller count, the plan must still clear those pages."""
-    table, device, group, state = _setup(4, 64)
+    # A planned row grows during the race, then the count narrows.
     rows = [new_block_table([1, 2]), new_block_table(list(range(100, 120)))]
     state.prepare(rows, pad_to=2).stage(2, group)
     assert group.publish()
@@ -155,8 +153,13 @@ def test_a_planned_row_that_grows_before_the_publish_widens_its_bound():
     assert plan.rows.tolist() == [0, 1] and plan.row_bytes == 24 * 4
     rows[0].extend(range(4, 12))  # row 0 grows to 11 pages before the publish
     state.prepare(rows, pad_to=2)
-    assert group.publish()
-    assert device[0, :11].tolist() == list(range(1, 12))
+    if outcome == "half":  # the cut-short upload landed row 0 only
+        device[0, :24] = table.np[0, :24]
+        group.publish("fail")
+    else:
+        assert group.publish(outcome) == (outcome == "ok")
+    if outcome != "fail":
+        assert device[0, :11].tolist() == list(range(1, 12))
     state.prepare([new_block_table([500])], pad_to=1).stage(1, group)
     assert group.publish()
     np.testing.assert_array_equal(device[:1], table.np[:1])
