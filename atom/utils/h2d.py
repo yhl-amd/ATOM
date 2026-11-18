@@ -67,6 +67,17 @@ class RowPlan:
             raise ValueError("row plan rows must be strictly increasing")
 
 
+def gather_rows(out, source, rows):
+    """Copy ``source[rows]`` into ``out``, reading only those rows: one slice
+    for a single run of consecutive rows, fancy indexing otherwise.
+    (``np.take(..., out=)`` on a strided ``source`` first copies all of it.)"""
+    first, last = int(rows[0]), int(rows[-1])
+    if last - first + 1 == len(rows):
+        out[:] = source[first : last + 1]
+    else:
+        out[:] = source[rows]
+
+
 def _count(value, capacity, name):
     if isinstance(value, bool):
         raise TypeError(f"{name}: count must be an integer, not bool")

@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils.h2d import gather_rows
+
 
 @triton.jit
 def scatter_packed_words(arena, destinations, wide, pitches, WORDS: tl.constexpr):
@@ -177,18 +179,7 @@ class PackedCopy:
                 block = self.arena[offset : offset + length].reshape(
                     len(rows), row_bytes
                 )
-                source = self.rows[i][:, :row_bytes]
-                # Increasing rows: copy each run of consecutive rows as one
-                # slice (a shifted batch is one run); scattered rows gather.
-                breaks = np.flatnonzero(np.diff(rows) != 1) + 1
-                if len(breaks) < 8:
-                    lo = 0
-                    for hi in (*breaks.tolist(), len(rows)):
-                        first = int(rows[lo])
-                        block[lo:hi] = source[first : first + hi - lo]
-                        lo = hi
-                else:
-                    np.take(source, rows, axis=0, out=block)
+                gather_rows(block, self.rows[i][:, :row_bytes], rows)
                 row_map = offset + _pad16(length)
                 self.arena[row_map : row_map + 4 * len(rows)].view(np.int32)[:] = rows
                 self.header[4 * i + 1] = length

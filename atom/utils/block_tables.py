@@ -61,6 +61,9 @@ class BlockTableState:
         self.gpu_writes = np.full(rows, -1, dtype=np.int64)
         self.gpu_bound = np.full(rows, self.cpu.shape[1], dtype=np.int64)
         self.gpu_tracked = None
+        # Counts stages and direct publishes: only the latest one's publish
+        # callback records rows as received (`stage`).
+        self.stages = 0
 
     def _acquire(self):
         self.buffer.acquire_write()
@@ -279,11 +282,12 @@ class BlockTableState:
         self.gpu_writes[:count] = -1
         np.maximum(self.gpu_bound[:count], bounds, out=self.gpu_bound[:count])
 
-    def _published_rows(self, gpu, count):
-        """The destination took every row below ``count`` (planned or whole)."""
+    def _published_rows(self, gpu, count, bounds):
+        """The destination took every row below ``count`` (planned or whole);
+        ``bounds`` is `_row_bounds(count)` of the table it took."""
         self._track(gpu)
         self.gpu_writes[:count] = self.row_writes[:count]
-        self.gpu_bound[:count] = self._row_bounds(count)
+        self.gpu_bound[:count] = bounds
 
     def stage(self, count, group):
         """Count a changed table into ``group``, whose owner publishes it.
@@ -292,9 +296,16 @@ class BlockTableState:
         The revision is recorded once that publish has succeeded. A packed
         transport sends only the rows the destination does not hold, each
         only as wide as needed (`_row_plan`); the result is the same bytes.
+
+        Stage a table once per publish. A later stage (into this or another
+        group) or a direct `publish` before this stage's group publishes
+        supersedes it: its callback then records nothing, and the rows it
+        covered stay unknown (`_sending`) until a later publish sends them.
         """
         dirty, key = self._dirty(count)
         plan = None
+        self.stages += 1
+        stage = self.stages
         if dirty:
             gpu = self.buffer.gpu
             bounds = self._row_bounds(count)
@@ -311,13 +322,13 @@ class BlockTableState:
                 self._sending(gpu, count, bounds)
 
             def published():
-                if self.revision != key[0]:
-                    # The host table was prepared again after this stage: the
-                    # upload read the host at publish time, so the rows stay
-                    # unknown (`_sending`) and are sent again. `prepare`
-                    # already widened their destination bound to those bytes.
+                if self.revision != key[0] or self.stages != stage:
+                    # The host table was prepared again, or staged or published
+                    # again, after this stage: the rows stay unknown
+                    # (`_sending`) and are sent again. `prepare` already
+                    # widened their destination bound to the host bytes.
                     return
-                self._published_rows(gpu, count)
+                self._published_rows(gpu, count, bounds)
                 self.published = (gpu, key)
 
             group.after_publish(published)
@@ -327,11 +338,13 @@ class BlockTableState:
     def publish(self, count):
         """Upload a changed table on its own."""
         dirty, key = self._dirty(count)
+        self.stages += 1  # supersedes a pending stage's record
         if dirty:
             gpu = self.buffer.gpu
-            self._sending(gpu, count, self._row_bounds(count))
+            bounds = self._row_bounds(count)
+            self._sending(gpu, count, bounds)
             self.buffer.copy_to_gpu(count)
-            self._published_rows(gpu, count)
+            self._published_rows(gpu, count, bounds)
             self.published = (gpu, key)
         return self.buffer.gpu[:count]
 

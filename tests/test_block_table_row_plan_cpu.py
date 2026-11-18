@@ -16,7 +16,7 @@ import torch
 from atom.model_engine.sequence import new_block_table
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_tables import block_table_state
-from atom.utils.h2d import RowPlan
+from atom.utils.h2d import RowPlan, gather_rows
 from tests.block_table_churn import decode_churn, ids
 
 
@@ -163,6 +163,53 @@ def test_a_prepare_between_stage_and_publish_is_not_recorded_as_received(outcome
     state.prepare([new_block_table([500])], pad_to=1).stage(1, group)
     assert group.publish()
     np.testing.assert_array_equal(device[:1], table.np[:1])
+
+
+@pytest.mark.parametrize("second", ["narrower", "nothing", "direct"])
+def test_a_superseded_stage_records_nothing(second):
+    """Staging the same table again (a narrower count, or one with nothing to
+    send) or publishing it directly before the first stage's group publishes:
+    the first stage's callback must not record rows the device never got."""
+    table, device, group, state = _setup(8, 64)
+    rows = [new_block_table([1, 2]) for _ in range(4)]
+    state.prepare(rows, pad_to=4).stage(4, group)
+    assert group.publish()
+    for r in rows:
+        r.append(9)
+    state.prepare(rows, pad_to=4).stage(4, group)
+    if second == "direct":
+        state.publish(2)  # whole prefix [:2] straight to `table.gpu`
+        device[:2] = table.gpu[:2].numpy()
+    elif second == "nothing":
+        state.stage(4, group)  # nothing new to send on top of the first
+    else:
+        state.stage(2, group)
+    assert group.publish()
+    state.prepare(rows, pad_to=4).stage(4, group)
+    assert group.publish()
+    np.testing.assert_array_equal(device[:4], table.np[:4])
+
+
+def test_gather_rows_reads_only_the_planned_rows():
+    """The planned rows of a strided view are gathered without a temporary
+    copy of the whole table (what `np.take(..., out=)` makes)."""
+    import tracemalloc
+
+    rng = np.random.default_rng(0)
+    table = rng.integers(0, 255, size=(4096, 1024), dtype=np.uint8)
+    source = table[:, :512]  # a plan narrower than the row: strided
+    rows = np.sort(rng.choice(4096, size=12, replace=False)).astype(np.int32)
+    out = np.empty((len(rows), 512), dtype=np.uint8)
+    tracemalloc.start()
+    gather_rows(out, source, rows)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    np.testing.assert_array_equal(out, table[rows, :512])
+    assert peak < source.nbytes // 16
+    run = np.arange(100, 140, dtype=np.int32)
+    out = np.empty((len(run), 512), dtype=np.uint8)
+    gather_rows(out, source, run)
+    np.testing.assert_array_equal(out, table[100:140, :512])
 
 
 def test_a_table_whose_columns_are_not_whole_words_gets_no_plan():

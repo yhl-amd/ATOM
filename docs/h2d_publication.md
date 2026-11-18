@@ -81,8 +81,8 @@ combined group. Rejected producer reentry leaves earlier sources intact.
 A deliberate second publication supplies a reason and acquires its source
 before rewriting it. Enqueue failures invalidate the owner and retain storage.
 
-The packed arena holds one int64 header per member, (payload offset, byte
-count, row bytes, row map offset), then the byte payloads, in one DMA. Every
+The packed arena holds a header of four int64 per member (payload offset,
+byte count, row bytes, row map offset), then the byte payloads, in one DMA. Every
 payload starts 16-byte aligned. Row bytes 0 is a contiguous prefix of the
 member's source. A producer may count a two-dimensional `rows` member with a
 row plan (`set_count(buffer, count, row_plan=RowPlan(rows, row_bytes))`):
