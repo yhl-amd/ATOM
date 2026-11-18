@@ -14,6 +14,7 @@ from atom.model_engine.sequence import new_block_table
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_tables import block_table_state
 from atom.utils.h2d import PublicationOwner, RowPlan
+from tests.block_table_churn import decode_churn, ids
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_H2D_GPU_TESTS") != "1", reason="set RUN_H2D_GPU_TESTS=1"
@@ -66,10 +67,6 @@ def test_scatter_rows_kernel_matches_row_writes():
         assert torch.equal(table.gpu, reference), step
 
 
-def _ids(rng, n, page_limit):
-    return rng.integers(0, page_limit, size=n).tolist()
-
-
 def _simulate(seed, steps, columns, capacity, packed=True):
     """A scheduler's churn against the full-copy reference: appends, finishes
     (later rows shift up), admissions (with prefix hits), preemption,
@@ -85,7 +82,7 @@ def _simulate(seed, steps, columns, capacity, packed=True):
     state = block_table_state(table)
     reference = table.gpu.clone()
     running = [
-        new_block_table(_ids(rng, int(rng.integers(1, 64)), page_limit))
+        new_block_table(ids(rng, int(rng.integers(1, 64)), page_limit))
         for _ in range(40)
     ]
     sent = full = 0
@@ -95,9 +92,7 @@ def _simulate(seed, steps, columns, capacity, packed=True):
         kind = pyrng.random()
         if kind < 0.08:  # a prefill step: another batch in the same buffer
             rows = [
-                new_block_table(
-                    _ids(rng, int(rng.integers(1, columns + 1)), page_limit)
-                )
+                new_block_table(ids(rng, int(rng.integers(1, columns + 1)), page_limit))
                 for _ in range(pyrng.randint(1, 6))
             ]
             if pyrng.random() < 0.5:  # a prefix hit shares a running request's pages
@@ -109,29 +104,15 @@ def _simulate(seed, steps, columns, capacity, packed=True):
             rows = [np.arange(i * 3, i * 3 + 3, dtype=np.int32) for i in range(n)]
             count = pyrng.choice([b for b in buckets if b >= n])
         else:
-            for t in running:  # decode growth
-                if pyrng.random() < 0.15 and len(t) < columns:
-                    t.append(int(rng.integers(0, page_limit)))
-            if pyrng.random() < 0.05:  # speculative rollback / truncation
-                t = pyrng.choice(running)
-                if len(t) > 1:
-                    del t[len(t) - pyrng.randint(1, min(3, len(t) - 1)) :]
-            if pyrng.random() < 0.03:  # preemption: a table remapped in place
-                t = pyrng.choice(running)
-                t[0] = int(rng.integers(0, page_limit))
-            for _ in range(np.random.default_rng(step).poisson(0.6)):  # finishes
-                if len(running) > 1:
-                    running.pop(pyrng.randrange(len(running)))
-            while len(running) < capacity and pyrng.random() < 0.5:  # admissions
-                n = (
-                    columns
-                    if pyrng.random() < 0.02
-                    else int(rng.integers(1, columns // 4))
-                )
-                new = new_block_table(_ids(rng, n, page_limit))
-                running.insert(pyrng.randrange(len(running) + 1), new)
-            if pyrng.random() < 0.05:  # a reorder
-                pyrng.shuffle(running)
+            decode_churn(
+                running,
+                rng,
+                pyrng,
+                step,
+                columns=columns,
+                max_running=capacity,
+                page_limit=page_limit,
+            )
             rows = (
                 running
                 if pyrng.random() > 0.05

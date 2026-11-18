@@ -300,8 +300,15 @@ class BlockTableState:
             def published():
                 if self.revision != key[0]:
                     # The host table was prepared again after this stage: the
-                    # upload read rows the plan did not cover, so the rows
-                    # stay unknown (`_sending`) and are sent again.
+                    # upload read the host at publish time, so the rows stay
+                    # unknown (`_sending`) and are sent again, and their
+                    # destination bound widens to what that upload may have
+                    # written (a planned row that grew in between).
+                    np.maximum(
+                        self.gpu_bound[:count],
+                        self._row_bounds(count),
+                        out=self.gpu_bound[:count],
+                    )
                     return
                 self._published_rows(gpu, count)
                 self.published = (gpu, key)

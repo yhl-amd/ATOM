@@ -161,7 +161,8 @@ destination's old nonzero bound need (`_row_plan`); the destination ends
 byte-identical to a whole-prefix copy. Rows a failed or interrupted publish
 covered are unknown until a later publish succeeds and are sent again; a new
 destination gets every row at full width. A combined group omits an unchanged
-table but consumers retain its GPU view. Failed publication never marks the new revision as published.
+table but consumers retain its GPU view. Failed publication never marks the
+new revision as published.
 Padding, TBO slices and capture table preparation use the same state. Direct
 writes to the CPU/GPU table outside these entry points invalidate this contract.
 

@@ -17,6 +17,7 @@ from atom.model_engine.sequence import new_block_table
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_tables import block_table_state
 from atom.utils.h2d import RowPlan
+from tests.block_table_churn import decode_churn, ids
 
 
 class _Group:
@@ -66,10 +67,6 @@ def _setup(rows, columns):
     return table, device, _Group(table, device), block_table_state(table)
 
 
-def _ids(rng, n):
-    return rng.integers(0, 1 << 20, size=n).tolist()
-
-
 @pytest.mark.parametrize("seed", range(4))
 def test_churn_matches_the_host_after_every_successful_publish(seed):
     """Appends, finishes, admissions, preemption, rollback, reorders, prefill
@@ -79,31 +76,26 @@ def test_churn_matches_the_host_after_every_successful_publish(seed):
     rng = np.random.default_rng(seed)
     pyrng = random.Random(seed)
     table, device, group, state = _setup(capacity, columns)
-    running = [new_block_table(_ids(rng, pyrng.randint(1, 20))) for _ in range(20)]
+    running = [
+        new_block_table(ids(rng, pyrng.randint(1, 20), 1 << 20)) for _ in range(20)
+    ]
     buckets = [8, 16, 24, 32, 40, 48]
     full = 0
     for step in range(600):
         kind = pyrng.random()
         if kind < 0.05:  # a prefill prepares the same buffer and never publishes
-            batch = [new_block_table(_ids(rng, pyrng.randint(1, columns)))]
+            batch = [new_block_table(ids(rng, pyrng.randint(1, columns), 1 << 20))]
             state.prepare(batch, pad_to=1)
             continue
-        for t in running:
-            if pyrng.random() < 0.2 and len(t) < columns:
-                t.append(int(rng.integers(0, 1 << 20)))
-        if pyrng.random() < 0.05:  # speculative rollback
-            t = pyrng.choice(running)
-            if len(t) > 1:
-                del t[len(t) - pyrng.randint(1, min(3, len(t) - 1)) :]
-        if pyrng.random() < 0.03:  # preemption remaps a page in place
-            pyrng.choice(running)[0] = int(rng.integers(0, 1 << 20))
-        if pyrng.random() < 0.3 and len(running) > 1:  # a finish
-            running.pop(pyrng.randrange(len(running)))
-        while len(running) < 40 and pyrng.random() < 0.4:  # admissions
-            new = new_block_table(_ids(rng, pyrng.randint(1, columns)))
-            running.insert(pyrng.randrange(len(running) + 1), new)
-        if pyrng.random() < 0.05:
-            pyrng.shuffle(running)
+        decode_churn(
+            running,
+            rng,
+            pyrng,
+            step,
+            columns=columns,
+            max_running=40,
+            page_limit=1 << 20,
+        )
         count = next(b for b in buckets if b >= len(running))
         state.prepare(running, pad_to=count)
         dirty = state._dirty(count)[0]
@@ -145,6 +137,29 @@ def test_a_prepare_between_stage_and_publish_is_not_recorded_as_received():
     assert group.count == 4 and 1 in group.plan.rows.tolist()
     assert group.publish()
     np.testing.assert_array_equal(device[:4], table.np[:4])
+
+
+def test_a_planned_row_that_grows_before_the_publish_widens_its_bound():
+    """A planned row that grows between stage and publish lands on the device
+    past the bound recorded at stage time (the upload reads the host at
+    publish time, up to the plan width). When that row later holds a shorter
+    request at a smaller count, the plan must still clear those pages."""
+    table, device, group, state = _setup(4, 64)
+    rows = [new_block_table([1, 2]), new_block_table(list(range(100, 120)))]
+    state.prepare(rows, pad_to=2).stage(2, group)
+    assert group.publish()
+    rows[0].append(3)
+    rows[1].append(120)
+    state.prepare(rows, pad_to=2).stage(2, group)
+    plan = group.plan
+    assert plan.rows.tolist() == [0, 1] and plan.row_bytes == 24 * 4
+    rows[0].extend(range(4, 12))  # row 0 grows to 11 pages before the publish
+    state.prepare(rows, pad_to=2)
+    assert group.publish()
+    assert device[0, :11].tolist() == list(range(1, 12))
+    state.prepare([new_block_table([500])], pad_to=1).stage(1, group)
+    assert group.publish()
+    np.testing.assert_array_equal(device[:1], table.np[:1])
 
 
 def test_a_table_whose_columns_are_not_whole_words_gets_no_plan():
