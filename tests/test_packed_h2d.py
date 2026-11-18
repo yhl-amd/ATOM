@@ -278,7 +278,6 @@ def test_word_copy_matches_the_bytes_at_any_alignment_and_count():
                     bytes_per_count=unit,
                     unit="elements",
                     row_capacity=count,
-                    row_plan=None,
                     backing=backing,
                     offset=offset,
                     _copy=lambda c, s=source, d=destination, u=unit: d[: c * u].copy_(

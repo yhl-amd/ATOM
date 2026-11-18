@@ -4,6 +4,7 @@
 import numpy as np
 
 from atom.model_engine.sequence import BlockTable
+from atom.utils.h2d import RowPlan
 
 
 def _int32_row(row):
@@ -256,7 +257,10 @@ class BlockTableState:
     def _sending(self, gpu, count):
         """Before an upload of rows below ``count``: until it has succeeded
         (`_published_rows`), its rows are unknown and may hold the host's
-        bytes, so a failed or partial upload is resent in full width."""
+        bytes, so their destination bound widens to the host's. After a failed
+        or partial upload every row below ``count`` is resent, as wide as the
+        larger of the host's bound and that widened bound; only a destination
+        that is not tracked at all gets every row at full width (`_track`)."""
         self._track(gpu)
         self.gpu_writes[:count] = -1
         np.maximum(
@@ -278,14 +282,16 @@ class BlockTableState:
         only as wide as needed (`_row_plan`); the result is the same bytes.
         """
         dirty, key = self._dirty(count)
+        plan = None
         if dirty:
             gpu = self.buffer.gpu
             rows, width = self._row_plan(count)
-            binding = getattr(self.buffer, "_publication", None)
+            row_bytes = width * self.cpu.itemsize
             if rows is not None and not len(rows):
                 dirty = False  # the destination already holds every row
-            elif rows is not None and binding is not None:
-                binding.row_plan = (count, rows, width * self.cpu.itemsize)
+            elif rows is not None and row_bytes % 16 == 0:
+                # A table too narrow for whole 16-byte rows goes up whole.
+                plan = RowPlan(rows, row_bytes)
             if dirty:
                 self._sending(gpu, count)
 
@@ -294,7 +300,7 @@ class BlockTableState:
                 self.published = (gpu, key)
 
             group.after_publish(published)
-        group.set_count(self.buffer, count if dirty else None)
+        group.set_count(self.buffer, count if dirty else None, row_plan=plan)
         return self.buffer.gpu[:count]
 
     def publish(self, count):

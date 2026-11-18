@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import operator
 import threading
+from dataclasses import dataclass
 from functools import wraps
+from typing import Any
 
 import torch
 
@@ -42,6 +44,25 @@ def h2d_producer(*group_names, runner=None):
         return checked
 
     return decorate
+
+
+@dataclass(frozen=True, slots=True)
+class RowPlan:
+    """A producer's hint for the next packed publish of a `rows` member: of the
+    rows below its count only ``rows`` (strictly increasing int32 indices)
+    differ from the destination, and only in their leading ``row_bytes`` bytes
+    (a positive multiple of 16). The packed transport may send just those;
+    any transport may ignore it and copy the whole prefix
+    (`PublicationGroup.set_count`, `PackedCopy.submit`)."""
+
+    rows: Any
+    row_bytes: int
+
+    def __post_init__(self):
+        if self.row_bytes <= 0 or self.row_bytes % 16:
+            raise ValueError(f"row_bytes {self.row_bytes} is not a positive x16")
+        if not len(self.rows) or self.rows[0] < 0:
+            raise ValueError("a row plan names at least one nonnegative row")
 
 
 def _count(value, capacity, name):
@@ -223,7 +244,6 @@ class PublicationOwner:
         self._thread = threading.get_ident()
         for binding in self._bindings:
             binding._writable = True
-            binding.row_plan = None
         for group in self._groups:
             group._header_busy = False
             group._after_publish = []
@@ -314,11 +334,6 @@ class BufferPublication:
         self._epoch = -1
         self._writable = False
         self._single = None
-        # A producer's optional hint for the next packed publish of ``count``
-        # rows: (count, rows, row_bytes) -- only those rows' leading bytes
-        # differ from the destination (`PackedCopy.submit`). Any transport may
-        # ignore it and copy the whole prefix; publish clears it.
-        self.row_plan = None
         # At most four private prefix pairs per binding, with FIFO eviction.
         self._prefixes = {}
 
@@ -332,8 +347,6 @@ class BufferPublication:
         if not self._writable:
             self.owner._wait_sources()
             self._writable = True
-        # A rewritten source invalidates a row plan made against the old one.
-        self.row_plan = None
         return self.source
 
     def _validate(self, count, reason):
@@ -394,6 +407,8 @@ class PublicationGroup:
         self._single_member = members[0] if len(members) == 1 else None
         # CPU-only producer scratch; it is never borrowed by the GPU.
         self.counts = [None] * len(members)
+        # Each counted member's optional `RowPlan`, cleared with its count.
+        self.row_plans = [None] * len(members)
         self.indices = {member.name: i for i, member in enumerate(members)}
         self._buffer_indices = {member.buffer: i for i, member in enumerate(members)}
         self._counts = [None] * len(members)
@@ -403,14 +418,18 @@ class PublicationGroup:
         self.fallback_reason = None
         self._backend = None
 
-    def set_count(self, buffer, count):
+    def set_count(self, buffer, count, row_plan=None):
         """Record a producer's count without copying data or granting write access.
 
         This only fills CPU count scratch. The producer must acquire sources
         before writing them; publish validates the entire group before enqueue.
         Lookup by buffer identity keeps binding names private to registration.
+        ``row_plan`` (a `RowPlan`, rows below ``count``) lets the packed
+        transport send only those rows; it holds for this count only.
         """
-        self.counts[self._buffer_indices[buffer]] = count
+        i = self._buffer_indices[buffer]
+        self.counts[i] = count
+        self.row_plans[i] = None if count is None else row_plan
 
     def set_counts(self, counts):
         """Record the count of each member ``counts`` names, by name.
@@ -423,6 +442,7 @@ class PublicationGroup:
             raise KeyError(f"{self.name}: not members: {sorted(unknown)}")
         for name, count in counts.items():
             self.counts[self.indices[name]] = count
+            self.row_plans[self.indices[name]] = None
 
     def check_writable(self):
         """Check fresh sources before a producer writes any group member.
@@ -509,7 +529,7 @@ class PublicationGroup:
         try:
             if backend is not None and active_members:
                 # Direct fallback leaves any earlier packed read in flight.
-                self._header_busy |= backend.submit(self._counts)
+                self._header_busy |= backend.submit(self._counts, self.row_plans)
             elif backend is None:
                 for binding, count in zip(self.members, self._counts):
                     if count:
@@ -524,8 +544,7 @@ class PublicationGroup:
         only what its producers count, then run the `after_publish` callbacks."""
         for i in range(len(self.counts)):
             self.counts[i] = None
-        for binding in self.members:
-            binding.row_plan = None
+            self.row_plans[i] = None
         callbacks, self._after_publish = self._after_publish, []
         for callback in callbacks:
             callback()

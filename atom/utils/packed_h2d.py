@@ -86,7 +86,7 @@ class PackedCopy:
         result.header_bytes = 32 * len(members)
         # Destinations the word copy may store to as int64 (16-byte aligned).
         wide = [int(b.destination.data_ptr() % 16 == 0) for b in members]
-        # Members that may take a row plan (`BufferPublication.row_plan`):
+        # Members that may take a row plan (`RowPlan`):
         # two-dimensional rows of whole 16-byte words at a word-aligned address.
         result.row_members = tuple(
             b.unit == "rows"
@@ -142,28 +142,20 @@ class PackedCopy:
         result.kernel = None
         return result, None
 
-    def _plan(self, i, count):
-        """Member ``i``'s row plan for ``count`` rows, if it can take one: the
-        rows (strictly increasing int32) and the leading bytes of each to send
-        in place of the whole prefix."""
-        binding = self.members[i]
-        plan = binding.row_plan
-        if plan is None or not self.row_members[i] or plan[0] != count:
-            return None
-        rows, row_bytes = plan[1], plan[2]
+    def _plan(self, i, count, plan):
+        """Member ``i``'s `RowPlan` for ``count`` rows, if it can take one."""
         if (
-            row_bytes <= 0
-            or row_bytes % 16
-            or row_bytes > binding.bytes_per_count
-            or not 0 < len(rows) <= count
-            or rows[0] < 0
-            or rows[-1] >= count
+            plan is None
+            or not self.row_members[i]
+            or plan.row_bytes > self.members[i].bytes_per_count
+            or plan.rows[-1] >= count
         ):
             return None
-        return rows, row_bytes
+        return plan.rows, plan.row_bytes
 
-    def submit(self, counts):
-        """Enqueue copies and return whether the packed arena is borrowed."""
+    def submit(self, counts, plans=None):
+        """Enqueue copies and return whether the packed arena is borrowed.
+        ``plans`` holds each member's optional `RowPlan` for its count."""
         active = [i for i, count in enumerate(counts) if count]
         if len(active) == 1:
             # A single live member already takes one DMA; no packing/scatter.
@@ -173,7 +165,7 @@ class PackedCopy:
         offset = self.header_bytes
         largest = 0
         for i, (binding, count) in enumerate(zip(self.members, counts)):
-            plan = self._plan(i, count) if count else None
+            plan = self._plan(i, count, plans[i]) if count and plans else None
             self.header[4 * i] = offset
             self.header[4 * i + 2] = 0
             self.header[4 * i + 3] = 0

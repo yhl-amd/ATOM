@@ -13,7 +13,7 @@ import torch
 from atom.model_engine.sequence import new_block_table
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_tables import block_table_state
-from atom.utils.h2d import PublicationOwner
+from atom.utils.h2d import PublicationOwner, RowPlan
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_H2D_GPU_TESTS") != "1", reason="set RUN_H2D_GPU_TESTS=1"
@@ -42,7 +42,6 @@ def test_scatter_rows_kernel_matches_row_writes():
     rng = np.random.default_rng(0)
     table, others = _buffers(64, 1024)
     owner, group = _owner(table, others)
-    binding = table._publication
     reference = torch.zeros_like(table.gpu)
     for step in range(60):
         owner.begin()
@@ -55,8 +54,7 @@ def test_scatter_rows_kernel_matches_row_writes():
         width = int(rng.integers(1, 257)) * 4
         if step % 7 == 0:
             rows, width = np.arange(count, dtype=np.int32), 1024
-        binding.row_plan = (count, rows, width * 4)
-        group.set_count(table, count)
+        group.set_count(table, count, row_plan=RowPlan(rows, width * 4))
         for b in others:
             group.set_count(b, int(rng.integers(1, 98)))
         group.publish()
@@ -144,9 +142,9 @@ def _simulate(seed, steps, columns, capacity, packed=True):
         published = state.published
         dirty = state._dirty(count)[0]
         state.stage(count, group)
-        plan = table._publication.row_plan
+        plan = group.row_plans[0]
         if plan is not None:
-            sent += len(plan[1]) * plan[2]
+            sent += len(plan.rows) * plan.row_bytes
         elif group.counts[0]:
             sent += count * columns * 4
         for b in others:
@@ -172,7 +170,7 @@ def test_direct_transport_ignores_plans():
     _simulate(11, 150, columns=256, capacity=64, packed=False)
 
 
-def test_destination_replacement_and_failed_publish_resend_everything():
+def test_destination_replacement_resends_every_row_at_full_width():
     table, others = _buffers(8, 64)
     owner, group = _owner(table, others)
     state = block_table_state(table)
@@ -186,8 +184,8 @@ def test_destination_replacement_and_failed_publish_resend_everything():
     owner.begin()
     state.prepare(rows, pad_to=4)
     state.stage(4, group)
-    plan = table._publication.row_plan
-    assert plan is not None and plan[1].tolist() == [0] and plan[2] == 16
+    plan = group.row_plans[0]
+    assert plan is not None and plan.rows.tolist() == [0] and plan.row_bytes == 16
     group.publish()
     owner.finish()
     owner.completion.synchronize()
@@ -198,8 +196,68 @@ def test_destination_replacement_and_failed_publish_resend_everything():
     owner.begin()
     state.prepare(rows, pad_to=4)
     state.stage(4, group)
-    assert table._publication.row_plan is None
+    assert group.counts[0] == 4 and group.row_plans[0] is None
     group.publish()
     owner.finish()
     owner.completion.synchronize()
     assert torch.equal(table.gpu[:4].cpu(), torch.from_numpy(table.np[:4]))
+
+
+@pytest.mark.parametrize("applied", ["none", "half"])
+def test_a_failed_or_partial_publish_resends_its_rows(monkeypatch, applied):
+    """A publish that raises (nothing or only some rows reached the
+    destination) leaves every row it covered unknown: the next publish, on a
+    rebuilt owner, sends each of them again, at the host's bound widened by
+    what the failed upload may have written, and the destination ends equal
+    to the host."""
+    columns = 64
+    table, others = _buffers(8, columns)
+    owner, group = _owner(table, others)
+    state = block_table_state(table)
+    rows = [new_block_table(list(range(1, 4 + 3 * i))) for i in range(6)]
+    owner.begin()
+    state.prepare(rows, pad_to=8)
+    state.stage(8, group)
+    group.publish()
+    owner.finish()
+    owner.completion.synchronize()
+    # Rows 1 and 4 change; their pages grow past the old bounds.
+    rows[1].extend([40, 41, 42, 43, 44])
+    rows[4].append(77)
+    owner.begin()
+    state.prepare(rows, pad_to=8)
+    state.stage(8, group)
+    plan = group.row_plans[0]
+    assert plan is not None and plan.rows.tolist() == [1, 4]
+
+    def failing_submit(counts, plans=None):
+        if applied == "half":  # the first planned row lands, the second not
+            table.gpu[1, : plan.row_bytes // 4] = torch.from_numpy(
+                table.np[1, : plan.row_bytes // 4]
+            ).cuda()
+        raise RuntimeError("injected enqueue failure")
+
+    monkeypatch.setattr(group._backend, "submit", failing_submit)
+    with pytest.raises(RuntimeError, match="injected"):
+        group.publish()
+    assert owner._state == "failed"
+    owner.drain()
+
+    # The runner rebuilds a failed owner over the same buffers.
+    table._publication = None
+    for b in others:
+        b._publication = None
+    owner, group = _owner(table, others)
+    rows[2].append(91)
+    owner.begin()
+    state.prepare(rows, pad_to=8)
+    state.stage(8, group)
+    plan = group.row_plans[0]
+    widest = max(len(r) for r in rows)
+    assert plan is not None
+    assert plan.rows.tolist() == list(range(8))  # every row of the failed count
+    assert plan.row_bytes == -(-widest // 4) * 16 < columns * 4
+    group.publish()
+    owner.finish()
+    owner.completion.synchronize()
+    assert torch.equal(table.gpu[:8].cpu(), torch.from_numpy(table.np[:8]))
