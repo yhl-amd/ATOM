@@ -12,13 +12,13 @@ from atom.utils.h2d import RowPlan
 # tables sit well below this bound and keep that path's host cost exactly; only
 # larger tables pay for the tracking.
 WHOLE_PREFIX_BYTES = 4 << 20
-# A large table leaves the row tracking (and goes up whole) on a step whose
-# last `prepare` changed more than this fraction of the published rows, and
-# enters it again only once a step changes at most TRACK_ENTER_FRACTION of
-# them. The gap keeps a table whose changed fraction hovers around the upper
-# bound from re-entering (a whole copy from unknown) every other step.
+# A tracked large table goes up whole (still recorded, so the next step can
+# plan) on a step whose last `prepare` changed more than this fraction of the
+# published rows; after BUSY_STEPS_TO_LEAVE such steps in a row it leaves the
+# tracking (rows that all change every step gain nothing from it), and an
+# untracked one enters it again on a step that changed at most this fraction.
 PLAN_MAX_CHANGED_FRACTION = 0.5
-TRACK_ENTER_FRACTION = 0.25
+BUSY_STEPS_TO_LEAVE = 2
 
 
 def _int32_row(row):
@@ -80,6 +80,8 @@ class BlockTableState:
         self.stages = 0
         # Rows the last `prepare` wrote (`stage` of a large table reads it).
         self.changed_rows = 0
+        # Consecutive tracked stages that changed most rows (`stage`).
+        self.busy_steps = 0
         self.row_nbytes = self.cpu.shape[1] * self.cpu.itemsize
         self.whole_words = self.row_nbytes % 16 == 0  # a plan moves 16-byte words
 
@@ -314,6 +316,7 @@ class BlockTableState:
         """Stop the row tracking; a later tracked stage starts from unknown
         (`_track`). Supersedes a pending tracked stage's record (`stage`)."""
         self.gpu_tracked = None
+        self.busy_steps = 0
         self.stages += 1
 
     def stage(self, count, group):
@@ -324,11 +327,14 @@ class BlockTableState:
 
         A table whose prefix is at most `WHOLE_PREFIX_BYTES` (or whose rows are
         not whole 16-byte words, or whose group is not packed) goes up whole
-        exactly as without row plans, untracked. So does a larger one on a step
-        that changed too many rows (`PLAN_MAX_CHANGED_FRACTION` while tracked,
-        `TRACK_ENTER_FRACTION` to enter). Otherwise it is tracked
+        exactly as without row plans, untracked. A larger one is tracked
         (`_stage_tracked`): the packed transport sends only the rows the
         destination does not hold, each only as wide as needed (`_row_plan`).
+        A step whose `prepare` changed more than `PLAN_MAX_CHANGED_FRACTION` of
+        the rows goes up whole but stays recorded, so the next step can plan;
+        after `BUSY_STEPS_TO_LEAVE` such steps in a row the table leaves the
+        tracking, and it enters again (from unknown) on a step below that
+        fraction.
 
         Contract: the host table is not prepared again between this stage and
         its group's publish (the upload reads the host when it runs; only then
@@ -336,16 +342,12 @@ class BlockTableState:
         a stage's group must publish before any other stage or publish of this
         table.
         """
+        busy = self.changed_rows > PLAN_MAX_CHANGED_FRACTION * count
         if (
             count * self.row_nbytes <= WHOLE_PREFIX_BYTES
             or not (self.whole_words and group.transport == "packed")
-            or self.changed_rows
-            > count
-            * (
-                TRACK_ENTER_FRACTION
-                if self.gpu_tracked is None
-                else PLAN_MAX_CHANGED_FRACTION
-            )
+            or busy
+            and (self.gpu_tracked is None or self.busy_steps + 1 >= BUSY_STEPS_TO_LEAVE)
         ):
             if self.gpu_tracked is not None:
                 self._untrack()
@@ -355,14 +357,15 @@ class BlockTableState:
                 gpu = self.buffer.gpu
                 group.after_publish(lambda: setattr(self, "published", (gpu, key)))
             return self.buffer.gpu[:count]
+        self.busy_steps = self.busy_steps + 1 if busy else 0
         return self._stage_tracked(count, group)
 
     def _stage_tracked(self, count, group):
         """`stage` for a large table: a plan when it covers at most
-        `PLAN_MAX_CHANGED_FRACTION` of the rows, else the whole prefix; either
-        way the rows sent are recorded as received once the publish succeeds.
-        Entering tracking starts from unknown: the first stage sends every row
-        at full width."""
+        `PLAN_MAX_CHANGED_FRACTION` of the rows, else (entering tracking, a
+        step that changed most rows) the whole prefix; either way the rows sent
+        are recorded as received once the publish succeeds. Entering tracking
+        starts from unknown: the first stage sends every row at full width."""
         dirty, key = self._dirty(count)
         self.stages += 1
         stage = self.stages
@@ -370,11 +373,16 @@ class BlockTableState:
         if dirty:
             gpu = self.buffer.gpu
             bounds = self._row_bounds(count)
-            rows, width = self._row_plan(count, bounds)
-            if rows is not None and not len(rows):
-                dirty = False  # the destination already holds every row
-            elif rows is not None and len(rows) <= PLAN_MAX_CHANGED_FRACTION * count:
-                plan = RowPlan(rows, width * self.cpu.itemsize)
+            if self.gpu_tracked is gpu and not self.busy_steps:
+                rows, width = self._row_plan(count, bounds)
+                if rows is not None and not len(rows):
+                    dirty = False  # the destination already holds every row
+                elif (
+                    rows is not None and len(rows) <= PLAN_MAX_CHANGED_FRACTION * count
+                ):
+                    plan = RowPlan(rows, width * self.cpu.itemsize)
+            # Otherwise (entering tracking, or most rows changed) the whole
+            # prefix, still recorded, so the next step can plan.
             if dirty:
                 self._sending(gpu, count, bounds)
 

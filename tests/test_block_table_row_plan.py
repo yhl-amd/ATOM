@@ -25,7 +25,6 @@ def _plan_every_table(monkeypatch):
 
     monkeypatch.setattr(block_tables, "WHOLE_PREFIX_BYTES", 0)
     monkeypatch.setattr(block_tables, "PLAN_MAX_CHANGED_FRACTION", 1.0)
-    monkeypatch.setattr(block_tables, "TRACK_ENTER_FRACTION", 1.0)
 
 
 pytestmark = pytest.mark.skipif(
