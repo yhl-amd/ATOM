@@ -157,8 +157,13 @@ Prefill can prepare CPU slots without uploading a table. Publication reuses the
 GPU table only when its destination, prepared revision and requested row count
 match. A changed table on a packed group sends only the rows of the published
 count the destination does not hold, each only as wide as its pages and the
-destination's old nonzero bound need (`_row_plan`); the destination ends
-byte-identical to a whole-prefix copy. Rows a failed or interrupted publish
+destination's old nonzero bound need (`_row_plan`), when that pays
+(`_plans_pay`): its prefix is larger than `WHOLE_PREFIX_BYTES` (4 MiB), its
+column count is a multiple of 4, and the last prepare changed at most half of
+its rows. Otherwise, on a direct group, and when it is the group's only active
+member, it goes up whole. Provided the table is not prepared again between
+its stage and the publish, the destination ends byte-identical to a
+whole-prefix copy. Rows a failed or interrupted publish
 covered are unknown until a later publish succeeds and are sent again; a new
 destination gets every row at full width. A combined group omits an unchanged
 table but consumers retain its GPU view. Failed publication never marks the

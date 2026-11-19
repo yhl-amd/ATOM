@@ -422,6 +422,7 @@ class PublicationGroup:
         self.counts = [None] * len(members)
         # Each counted member's optional `RowPlan`, cleared with its count.
         self.row_plans = [None] * len(members)
+        self._has_plans = False  # any entry of row_plans set
         self.indices = {member.name: i for i, member in enumerate(members)}
         self._buffer_indices = {member.buffer: i for i, member in enumerate(members)}
         self._counts = [None] * len(members)
@@ -442,7 +443,11 @@ class PublicationGroup:
         """
         i = self._buffer_indices[buffer]
         self.counts[i] = count
-        self.row_plans[i] = None if count is None else row_plan
+        if row_plan is not None and count is not None:
+            self.row_plans[i] = row_plan
+            self._has_plans = True
+        elif self._has_plans:
+            self.row_plans[i] = None
 
     def set_counts(self, counts):
         """Record the count of each member ``counts`` names, by name.
@@ -455,7 +460,8 @@ class PublicationGroup:
             raise KeyError(f"{self.name}: not members: {sorted(unknown)}")
         for name, count in counts.items():
             self.counts[self.indices[name]] = count
-            self.row_plans[self.indices[name]] = None
+            if self._has_plans:
+                self.row_plans[self.indices[name]] = None
 
     def check_writable(self):
         """Check fresh sources before a producer writes any group member.
@@ -542,7 +548,9 @@ class PublicationGroup:
         try:
             if backend is not None and active_members:
                 # Direct fallback leaves any earlier packed read in flight.
-                self._header_busy |= backend.submit(self._counts, self.row_plans)
+                self._header_busy |= backend.submit(
+                    self._counts, self.row_plans if self._has_plans else None
+                )
             elif backend is None:
                 for binding, count in zip(self.members, self._counts):
                     if count:
@@ -557,7 +565,10 @@ class PublicationGroup:
         only what its producers count, then run the `after_publish` callbacks."""
         for i in range(len(self.counts)):
             self.counts[i] = None
-            self.row_plans[i] = None
+        if self._has_plans:
+            for i in range(len(self.row_plans)):
+                self.row_plans[i] = None
+            self._has_plans = False
         callbacks, self._after_publish = self._after_publish, []
         for callback in callbacks:
             callback()

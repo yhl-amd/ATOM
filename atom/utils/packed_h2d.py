@@ -70,6 +70,10 @@ def _pad16(nbytes):
     return -(-nbytes // 16) * 16
 
 
+# DMA size granularity of a step that carries a row plan.
+_PLANNED_DMA_STEP = 32 << 10
+
+
 class PackedCopy:
     """Persistent byte storage; the publication owner fences reuse of the arena."""
 
@@ -104,6 +108,7 @@ class PackedCopy:
             + (_pad16(4 * b.row_capacity) if rows else 0)
             for b, rows in zip(members, result.row_members)
         )
+        result.capacity = capacity
         result.host = torch.empty(
             capacity, dtype=torch.uint8, device="cpu", pin_memory=True
         )
@@ -140,6 +145,8 @@ class PackedCopy:
             device=device,
         )
         result.prefixes = {}
+        result.header[:] = 0  # row fields stay 0 except on planned steps
+        result.planned_last = False
         result.launch = scatter_packed_words
         result.kernel = None
         return result, None
@@ -166,11 +173,19 @@ class PackedCopy:
             return False
         offset = self.header_bytes
         largest = 0
+        planned = False
+        header = self.header
+        if self.planned_last:
+            # Only a planned step leaves row fields set; clear them once.
+            header.reshape(-1, 4)[:, 2:] = 0
+            self.planned_last = False
         for i, (binding, count) in enumerate(zip(self.members, counts)):
-            plan = self._plan(i, count, plans[i]) if count and plans else None
-            self.header[4 * i] = offset
-            self.header[4 * i + 2] = 0
-            self.header[4 * i + 3] = 0
+            plan = (
+                self._plan(i, count, plans[i])
+                if plans is not None and count and plans[i] is not None
+                else None
+            )
+            header[4 * i] = offset
             if plan is not None:
                 # Only the planned rows' leading bytes; the rest of every
                 # destination row already holds the source's bytes.
@@ -187,6 +202,7 @@ class PackedCopy:
                 self.header[4 * i + 3] = row_map
                 offset = row_map + _pad16(4 * len(rows))
                 largest = max(largest, length)
+                planned = self.planned_last = True
                 continue
             length = 0 if count is None else count * binding.bytes_per_count
             self.header[4 * i + 1] = length
@@ -194,6 +210,12 @@ class PackedCopy:
                 self.payload[offset : offset + length] = self.sources[i][:length]
                 offset += _pad16(length)
                 largest = max(largest, length)
+        if planned:
+            # A plan's payload size varies step to step; round the DMA up so
+            # its prefix views stay cached (the extra bytes are never read).
+            offset = min(
+                -(-offset // _PLANNED_DMA_STEP) * _PLANNED_DMA_STEP, self.capacity
+            )
         prefix = self.prefixes.get(offset)
         if prefix is None:
             prefix = self.host[:offset], self.device[:offset]

@@ -22,14 +22,18 @@ from tests.block_table_churn import decode_churn, ids
 
 @pytest.fixture(autouse=True)
 def _plan_every_table(monkeypatch):
-    """These tables are small; plan them anyway (`WHOLE_PREFIX_BYTES`)."""
+    """These tables are small and often change most rows; plan them anyway
+    (`WHOLE_PREFIX_BYTES`, `PLAN_MAX_CHANGED_FRACTION`)."""
     from atom.utils import block_tables
 
     monkeypatch.setattr(block_tables, "WHOLE_PREFIX_BYTES", 0)
+    monkeypatch.setattr(block_tables, "PLAN_MAX_CHANGED_FRACTION", 1.0)
 
 
 class _Group:
     """Records what `stage` counts; `publish` emulates the packed transport."""
+
+    transport = "packed"
 
     def __init__(self, table, device):
         self.table, self.device = table, device
@@ -75,12 +79,20 @@ def _setup(rows, columns):
     return table, device, _Group(table, device), block_table_state(table)
 
 
+@pytest.mark.parametrize("real_rules", [False, True])
 @pytest.mark.parametrize("seed", range(4))
-def test_churn_matches_the_host_after_every_successful_publish(seed):
+def test_churn_matches_the_host_after_every_successful_publish(
+    monkeypatch, seed, real_rules
+):
     """Appends, finishes, admissions, preemption, rollback, reorders, prefill
     prepares that are never published, prepares between stage and publish, and
     failed or half-applied publishes."""
     columns, capacity = 96, 48
+    if real_rules:  # the counts cross the whole-prefix size; changed-row rule on
+        from atom.utils import block_tables
+
+        monkeypatch.setattr(block_tables, "WHOLE_PREFIX_BYTES", 20 * columns * 4)
+        monkeypatch.setattr(block_tables, "PLAN_MAX_CHANGED_FRACTION", 0.5)
     rng = np.random.default_rng(seed)
     pyrng = random.Random(seed)
     table, device, group, state = _setup(capacity, columns)
@@ -267,9 +279,10 @@ def test_a_table_whose_columns_are_not_whole_words_gets_no_plan():
     assert group.count == 4 and group.plan is None
     assert group.publish()
     np.testing.assert_array_equal(device[:4], table.np[:4])
-    rows[1].append(7)  # a narrow change still fits whole words
+    rows[1].append(7)  # not whole 16-byte rows: never a plan
     state.prepare(rows, pad_to=4).stage(4, group)
-    assert group.plan is not None and group.plan.row_bytes == 16
+    assert group.count == 4 and group.plan is None
+    assert state.gpu_tracked is None
     assert group.publish()
     np.testing.assert_array_equal(device[:4], table.np[:4])
 
@@ -293,3 +306,31 @@ def test_row_plan_rejects_malformed_plans(rows, row_bytes):
 def test_row_plan_accepts_increasing_rows():
     plan = RowPlan(np.asarray([0, 2, 5], dtype=np.int32), 32)
     assert plan.rows.tolist() == [0, 2, 5] and plan.row_bytes == 32
+
+
+def test_a_step_that_changes_most_rows_goes_up_whole(monkeypatch):
+    """With the real changed-row rule: a step that rewrote most rows goes up
+    whole and untracked; the next step with few changes restarts tracking
+    (whole once, from unknown), then plans only the changed rows."""
+    from atom.utils import block_tables
+
+    monkeypatch.setattr(block_tables, "PLAN_MAX_CHANGED_FRACTION", 0.5)
+    table, device, group, state = _setup(8, 64)
+    rows = [new_block_table([i + 1]) for i in range(8)]
+    state.prepare(rows, pad_to=8).stage(8, group)
+    assert group.publish()
+    for r in rows[:6]:
+        r.append(70)
+    state.prepare(rows, pad_to=8).stage(8, group)
+    assert group.count == 8 and group.plan is None and state.gpu_tracked is None
+    assert group.publish()
+    np.testing.assert_array_equal(device[:8], table.np[:8])
+    rows[2].append(71)
+    state.prepare(rows, pad_to=8).stage(8, group)
+    assert group.plan is None and state.gpu_tracked is table.gpu  # from unknown
+    assert group.publish()
+    rows[4].append(72)
+    state.prepare(rows, pad_to=8).stage(8, group)
+    assert group.plan is not None and group.plan.rows.tolist() == [4]
+    assert group.publish()
+    np.testing.assert_array_equal(device[:8], table.np[:8])
