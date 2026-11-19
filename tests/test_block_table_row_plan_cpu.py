@@ -20,6 +20,14 @@ from atom.utils.h2d import RowPlan, gather_rows
 from tests.block_table_churn import decode_churn, ids
 
 
+@pytest.fixture(autouse=True)
+def _plan_every_table(monkeypatch):
+    """These tables are small; plan them anyway (`WHOLE_PREFIX_BYTES`)."""
+    from atom.utils import block_tables
+
+    monkeypatch.setattr(block_tables, "WHOLE_PREFIX_BYTES", 0)
+
+
 class _Group:
     """Records what `stage` counts; `publish` emulates the packed transport."""
 
@@ -210,6 +218,43 @@ def test_gather_rows_reads_only_the_planned_rows():
     out = np.empty((len(run), 512), dtype=np.uint8)
     gather_rows(out, source, run)
     np.testing.assert_array_equal(out, table[100:140, :512])
+
+
+def test_small_tables_go_up_whole_and_restart_tracking(monkeypatch):
+    """At most `WHOLE_PREFIX_BYTES` the prefix goes up whole and tracking
+    stops; the first planned stage after it starts from unknown (every row,
+    full width), later ones plan only changed rows, and the device always
+    matches the host."""
+    from atom.utils import block_tables
+
+    columns = 64
+    monkeypatch.setattr(block_tables, "WHOLE_PREFIX_BYTES", 8 * columns * 4)
+    table, device, group, state = _setup(32, columns)
+    rows = [new_block_table([i + 1, i + 2]) for i in range(8)]
+    for _ in range(2):  # small: the whole prefix, no plan, untracked
+        state.prepare(rows, pad_to=8).stage(8, group)
+        assert group.count == 8 and group.plan is None
+        assert state.gpu_tracked is None
+        assert group.publish()
+        np.testing.assert_array_equal(device[:8], table.np[:8])
+        rows[0].append(50)
+    rows += [new_block_table([100 + i]) for i in range(16)]
+    state.prepare(rows, pad_to=24).stage(24, group)  # large: tracking restarts
+    assert group.count == 24 and group.plan is None  # every row, full width
+    assert state.gpu_tracked is table.gpu
+    assert group.publish()
+    np.testing.assert_array_equal(device[:24], table.np[:24])
+    rows[3].append(77)
+    state.prepare(rows, pad_to=24).stage(24, group)
+    assert group.plan is not None and group.plan.rows.tolist() == [3]
+    assert group.publish()
+    np.testing.assert_array_equal(device[:24], table.np[:24])
+    rows = rows[:8]  # back to small
+    rows[5].append(88)
+    state.prepare(rows, pad_to=8).stage(8, group)
+    assert group.plan is None and state.gpu_tracked is None
+    assert group.publish()
+    np.testing.assert_array_equal(device[:8], table.np[:8])
 
 
 def test_a_table_whose_columns_are_not_whole_words_gets_no_plan():

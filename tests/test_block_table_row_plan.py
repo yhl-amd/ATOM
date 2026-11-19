@@ -16,6 +16,15 @@ from atom.utils.block_tables import block_table_state
 from atom.utils.h2d import PublicationOwner, RowPlan
 from tests.block_table_churn import decode_churn, ids
 
+
+@pytest.fixture(autouse=True)
+def _plan_every_table(monkeypatch):
+    """These tables are small; plan them anyway (`WHOLE_PREFIX_BYTES`)."""
+    from atom.utils import block_tables
+
+    monkeypatch.setattr(block_tables, "WHOLE_PREFIX_BYTES", 0)
+
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_H2D_GPU_TESTS") != "1", reason="set RUN_H2D_GPU_TESTS=1"
 )

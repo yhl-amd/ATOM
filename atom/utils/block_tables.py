@@ -6,6 +6,11 @@ import numpy as np
 from atom.model_engine.sequence import BlockTable
 from atom.utils.h2d import RowPlan
 
+# A changed table whose published prefix (count x columns x itemsize) is at most
+# this many bytes goes up whole: below it the per-row bookkeeping of a row plan
+# costs more host time than the copy it saves.
+WHOLE_PREFIX_BYTES = 512 << 10
+
 
 def _int32_row(row):
     values = np.asarray(row)
@@ -179,7 +184,7 @@ class BlockTableState:
         self.zero_to = zero_to
         self.page_limit = page_limit
         self.checked = checked
-        if changes or clear_tail:
+        if (changes or clear_tail) and self.gpu_tracked is not None:
             # A row whose upload is not confirmed (`_sending`) may still take
             # these host bytes: a staged publish reads the host when it runs,
             # and a failed one may have written part of them. Its destination
@@ -297,15 +302,26 @@ class BlockTableState:
         transport sends only the rows the destination does not hold, each
         only as wide as needed (`_row_plan`); the result is the same bytes.
 
-        Stage a table once per publish. A later stage (into this or another
-        group) or a direct `publish` before this stage's group publishes
-        supersedes it: its callback then records nothing, and the rows it
-        covered stay unknown (`_sending`) until a later publish sends them.
+        A small table (a prefix of at most `WHOLE_PREFIX_BYTES`) goes up whole
+        and stops the row tracking (`gpu_tracked` None), so the next planned
+        stage starts from "unknown".
+
+        A stage's group must publish before any other stage or publish of this
+        table.
         """
         dirty, key = self._dirty(count)
         plan = None
         self.stages += 1
         stage = self.stages
+        if (
+            dirty
+            and count * self.cpu.shape[1] * self.cpu.itemsize <= WHOLE_PREFIX_BYTES
+        ):
+            gpu = self.buffer.gpu
+            self.gpu_tracked = None
+            group.after_publish(lambda: setattr(self, "published", (gpu, key)))
+            group.set_count(self.buffer, count)
+            return self.buffer.gpu[:count]
         if dirty:
             gpu = self.buffer.gpu
             bounds = self._row_bounds(count)
