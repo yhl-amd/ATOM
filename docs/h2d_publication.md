@@ -160,8 +160,10 @@ Prefill can prepare CPU slots without uploading a table. Publication reuses the
 GPU table only when its destination, prepared revision and requested row count
 match. A table whose published prefix is at most `WHOLE_PREFIX_BYTES`
 (4 MiB), whose column count is not a multiple of 4, or whose group is direct
-goes up whole on the plain path, without row tracking. A larger table on a
-packed group is tracked: it sends only the rows of the published count the
+goes up whole on the plain path, without row tracking, and so does a larger
+one on a step whose prepare changed more than half of the rows (a table enters
+tracking again only on a step that changed at most a quarter of them). A
+larger table on a packed group is otherwise tracked: it sends only the rows of the published count the
 destination does not hold, each only as wide as its pages and the
 destination's old nonzero bound need (`_row_plan`), or the whole prefix when
 that plan would cover more than half of the rows (the transport also copies

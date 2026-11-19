@@ -12,9 +12,13 @@ from atom.utils.h2d import RowPlan
 # tables sit well below this bound and keep that path's host cost exactly; only
 # larger tables pay for the tracking.
 WHOLE_PREFIX_BYTES = 4 << 20
-# A tracked table whose plan would cover more than this fraction of the
-# published rows goes up whole instead (still tracked).
+# A large table leaves the row tracking (and goes up whole) on a step whose
+# last `prepare` changed more than this fraction of the published rows, and
+# enters it again only once a step changes at most TRACK_ENTER_FRACTION of
+# them. The gap keeps a table whose changed fraction hovers around the upper
+# bound from re-entering (a whole copy from unknown) every other step.
 PLAN_MAX_CHANGED_FRACTION = 0.5
+TRACK_ENTER_FRACTION = 0.25
 
 
 def _int32_row(row):
@@ -74,6 +78,8 @@ class BlockTableState:
         # Counts stages and direct publishes: only the latest one's publish
         # callback records rows as received (`stage`).
         self.stages = 0
+        # Rows the last `prepare` wrote (`stage` of a large table reads it).
+        self.changed_rows = 0
         self.row_nbytes = self.cpu.shape[1] * self.cpu.itemsize
         self.whole_words = self.row_nbytes % 16 == 0  # a plan moves 16-byte words
 
@@ -168,6 +174,7 @@ class BlockTableState:
         clear_tail = end > n and (n != old_n or end > self.zero_to)
         zero_to = max(end, self.zero_to) if n == old_n else end
         if changes or clear_tail:
+            self.changed_rows = len(changes)
             self._begin_write()  # all validation precedes the first write
             if self.gpu_tracked is not None:
                 # Mark the rows before writing them, so a failed write stays
@@ -317,7 +324,9 @@ class BlockTableState:
 
         A table whose prefix is at most `WHOLE_PREFIX_BYTES` (or whose rows are
         not whole 16-byte words, or whose group is not packed) goes up whole
-        exactly as without row plans, untracked. A larger one is tracked
+        exactly as without row plans, untracked. So does a larger one on a step
+        that changed too many rows (`PLAN_MAX_CHANGED_FRACTION` while tracked,
+        `TRACK_ENTER_FRACTION` to enter). Otherwise it is tracked
         (`_stage_tracked`): the packed transport sends only the rows the
         destination does not hold, each only as wide as needed (`_row_plan`).
 
@@ -327,8 +336,16 @@ class BlockTableState:
         a stage's group must publish before any other stage or publish of this
         table.
         """
-        if count * self.row_nbytes <= WHOLE_PREFIX_BYTES or not (
-            self.whole_words and group.transport == "packed"
+        if (
+            count * self.row_nbytes <= WHOLE_PREFIX_BYTES
+            or not (self.whole_words and group.transport == "packed")
+            or self.changed_rows
+            > count
+            * (
+                TRACK_ENTER_FRACTION
+                if self.gpu_tracked is None
+                else PLAN_MAX_CHANGED_FRACTION
+            )
         ):
             if self.gpu_tracked is not None:
                 self._untrack()

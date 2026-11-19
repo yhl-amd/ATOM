@@ -28,6 +28,7 @@ def _plan_every_table(monkeypatch):
 
     monkeypatch.setattr(block_tables, "WHOLE_PREFIX_BYTES", 0)
     monkeypatch.setattr(block_tables, "PLAN_MAX_CHANGED_FRACTION", 1.0)
+    monkeypatch.setattr(block_tables, "TRACK_ENTER_FRACTION", 1.0)
 
 
 class _Group:
@@ -93,6 +94,7 @@ def test_churn_matches_the_host_after_every_successful_publish(
 
         monkeypatch.setattr(block_tables, "WHOLE_PREFIX_BYTES", 20 * columns * 4)
         monkeypatch.setattr(block_tables, "PLAN_MAX_CHANGED_FRACTION", 0.5)
+        monkeypatch.setattr(block_tables, "TRACK_ENTER_FRACTION", 0.25)
     rng = np.random.default_rng(seed)
     pyrng = random.Random(seed)
     table, device, group, state = _setup(capacity, columns)
@@ -309,26 +311,32 @@ def test_row_plan_accepts_increasing_rows():
 
 
 def test_a_step_that_changes_most_rows_goes_up_whole(monkeypatch):
-    """With the real changed-row rule: a step whose plan would cover most rows
-    goes up whole but stays tracked, so the next step with few changes plans
-    only those rows (no restart from unknown)."""
+    """With the real rules: a step that changed more than half of the rows
+    goes up whole and leaves tracking; tracking resumes (from unknown) only
+    after a step that changed at most a quarter, then plans single rows; a
+    changed fraction between the two keeps the table untracked, so it does
+    not restart every step."""
     from atom.utils import block_tables
 
     monkeypatch.setattr(block_tables, "PLAN_MAX_CHANGED_FRACTION", 0.5)
+    monkeypatch.setattr(block_tables, "TRACK_ENTER_FRACTION", 0.25)
     table, device, group, state = _setup(8, 64)
     rows = [new_block_table([i + 1]) for i in range(8)]
-    state.prepare(rows, pad_to=8).stage(8, group)
-    assert group.plan is None  # entering tracking: every row, from unknown
-    assert group.publish()
-    for r in rows[:6]:
-        r.append(70)
-    state.prepare(rows, pad_to=8).stage(8, group)
-    assert group.count == 8 and group.plan is None
-    assert state.gpu_tracked is table.gpu
-    assert group.publish()
-    np.testing.assert_array_equal(device[:8], table.np[:8])
-    rows[2].append(71)
-    state.prepare(rows, pad_to=8).stage(8, group)
-    assert group.plan is not None and group.plan.rows.tolist() == [2]
-    assert group.publish()
-    np.testing.assert_array_equal(device[:8], table.np[:8])
+
+    def step(changed):
+        for i in changed:
+            rows[i].append(100 + i)
+        state.prepare(rows, pad_to=8).stage(8, group)
+        plan = group.plan
+        assert group.publish()
+        np.testing.assert_array_equal(device[:8], table.np[:8])
+        return plan
+
+    assert step([]) is None and state.gpu_tracked is None  # 8 new rows
+    assert step([0]) is None and state.gpu_tracked is table.gpu  # enter: whole
+    assert step([1]).rows.tolist() == [1]
+    assert step(range(6)) is None and state.gpu_tracked is None  # 6 of 8: leave
+    for _ in range(3):  # 3 of 8: above a quarter, below a half: stay out
+        assert step([2, 4, 6]) is None and state.gpu_tracked is None
+    assert step([3]) is None and state.gpu_tracked is table.gpu  # enter again
+    assert step([5]).rows.tolist() == [5]
