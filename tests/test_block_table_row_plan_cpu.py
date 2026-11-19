@@ -309,28 +309,26 @@ def test_row_plan_accepts_increasing_rows():
 
 
 def test_a_step_that_changes_most_rows_goes_up_whole(monkeypatch):
-    """With the real changed-row rule: a step that rewrote most rows goes up
-    whole and untracked; the next step with few changes restarts tracking
-    (whole once, from unknown), then plans only the changed rows."""
+    """With the real changed-row rule: a step whose plan would cover most rows
+    goes up whole but stays tracked, so the next step with few changes plans
+    only those rows (no restart from unknown)."""
     from atom.utils import block_tables
 
     monkeypatch.setattr(block_tables, "PLAN_MAX_CHANGED_FRACTION", 0.5)
     table, device, group, state = _setup(8, 64)
     rows = [new_block_table([i + 1]) for i in range(8)]
     state.prepare(rows, pad_to=8).stage(8, group)
+    assert group.plan is None  # entering tracking: every row, from unknown
     assert group.publish()
     for r in rows[:6]:
         r.append(70)
     state.prepare(rows, pad_to=8).stage(8, group)
-    assert group.count == 8 and group.plan is None and state.gpu_tracked is None
+    assert group.count == 8 and group.plan is None
+    assert state.gpu_tracked is table.gpu
     assert group.publish()
     np.testing.assert_array_equal(device[:8], table.np[:8])
     rows[2].append(71)
     state.prepare(rows, pad_to=8).stage(8, group)
-    assert group.plan is None and state.gpu_tracked is table.gpu  # from unknown
-    assert group.publish()
-    rows[4].append(72)
-    state.prepare(rows, pad_to=8).stage(8, group)
-    assert group.plan is not None and group.plan.rows.tolist() == [4]
+    assert group.plan is not None and group.plan.rows.tolist() == [2]
     assert group.publish()
     np.testing.assert_array_equal(device[:8], table.np[:8])

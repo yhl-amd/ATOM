@@ -70,8 +70,10 @@ def _pad16(nbytes):
     return -(-nbytes // 16) * 16
 
 
-# DMA size granularity of a step that carries a row plan.
+# DMA size granularity of a step that carries a row plan, and the number of
+# prefix view pairs cached (a 32 KiB step leaves about a dozen sizes in use).
 _PLANNED_DMA_STEP = 32 << 10
+_PREFIX_CACHE = 16
 
 
 class PackedCopy:
@@ -164,10 +166,37 @@ class PackedCopy:
 
     def submit(self, counts, plans=None):
         """Enqueue copies and return whether the packed arena is borrowed.
-        ``plans`` holds each member's optional `RowPlan` for its count."""
+        ``plans`` holds each member's optional `RowPlan` for its count, or is
+        None when no member has one (`_submit_planned`)."""
+        if plans is not None:
+            return self._submit_planned(counts, plans)
         active = [i for i, count in enumerate(counts) if count]
         if len(active) == 1:
             # A single live member already takes one DMA; no packing/scatter.
+            i = active[0]
+            self.members[i]._copy(counts[i])
+            return False
+        if self.planned_last:
+            # Only a planned step leaves row fields set; clear them once.
+            self.header.reshape(-1, 4)[:, 2:] = 0
+            self.planned_last = False
+        offset = self.header_bytes
+        largest = 0
+        for i, (binding, count) in enumerate(zip(self.members, counts)):
+            length = 0 if count is None else count * binding.bytes_per_count
+            self.header[4 * i] = offset
+            self.header[4 * i + 1] = length
+            if length:
+                self.payload[offset : offset + length] = self.sources[i][:length]
+                offset += -(-length // 16) * 16
+                largest = max(largest, length)
+        self._enqueue(offset, largest)
+        return True
+
+    def _submit_planned(self, counts, plans):
+        """`submit` for a step where some member carries a `RowPlan`."""
+        active = [i for i, count in enumerate(counts) if count]
+        if len(active) == 1:
             i = active[0]
             self.members[i]._copy(counts[i])
             return False
@@ -175,16 +204,8 @@ class PackedCopy:
         largest = 0
         planned = False
         header = self.header
-        if self.planned_last:
-            # Only a planned step leaves row fields set; clear them once.
-            header.reshape(-1, 4)[:, 2:] = 0
-            self.planned_last = False
         for i, (binding, count) in enumerate(zip(self.members, counts)):
-            plan = (
-                self._plan(i, count, plans[i])
-                if plans is not None and count and plans[i] is not None
-                else None
-            )
+            plan = self._plan(i, count, plans[i]) if count and plans[i] else None
             header[4 * i] = offset
             if plan is not None:
                 # Only the planned rows' leading bytes; the rest of every
@@ -197,29 +218,37 @@ class PackedCopy:
                 gather_rows(block, self.rows[i][:, :row_bytes], rows)
                 row_map = offset + _pad16(length)
                 self.arena[row_map : row_map + 4 * len(rows)].view(np.int32)[:] = rows
-                self.header[4 * i + 1] = length
-                self.header[4 * i + 2] = row_bytes
-                self.header[4 * i + 3] = row_map
+                header[4 * i + 1] = length
+                header[4 * i + 2] = row_bytes
+                header[4 * i + 3] = row_map
                 offset = row_map + _pad16(4 * len(rows))
                 largest = max(largest, length)
-                planned = self.planned_last = True
+                planned = True
                 continue
             length = 0 if count is None else count * binding.bytes_per_count
-            self.header[4 * i + 1] = length
+            header[4 * i + 1] = length
+            header[4 * i + 2] = 0
+            header[4 * i + 3] = 0
             if length:
                 self.payload[offset : offset + length] = self.sources[i][:length]
                 offset += _pad16(length)
                 largest = max(largest, length)
         if planned:
-            # A plan's payload size varies step to step; round the DMA up so
-            # its prefix views stay cached (the extra bytes are never read).
+            self.planned_last = True
+            # A plan's payload size varies step to step: round the DMA up to a
+            # few sizes the prefix cache holds (the extra bytes are never read).
             offset = min(
                 -(-offset // _PLANNED_DMA_STEP) * _PLANNED_DMA_STEP, self.capacity
             )
+        self._enqueue(offset, largest)
+        return True
+
+    def _enqueue(self, offset, largest):
+        """One H2D of the arena's first ``offset`` bytes, then the scatter."""
         prefix = self.prefixes.get(offset)
         if prefix is None:
             prefix = self.host[:offset], self.device[:offset]
-            if len(self.prefixes) == 4:
+            if len(self.prefixes) == _PREFIX_CACHE:
                 del self.prefixes[next(iter(self.prefixes))]
             self.prefixes[offset] = prefix
         # Header and payload share this single asynchronous H2D.
@@ -239,4 +268,3 @@ class PackedCopy:
             # Both argument storages and their layouts are fixed for this
             # binding. Reuse its compiled kernel; counts and grid stay dynamic.
             self.kernel[grid](self.device, self.destinations, self.wide, self.pitches)
-        return True

@@ -6,12 +6,14 @@ import numpy as np
 from atom.model_engine.sequence import BlockTable
 from atom.utils.h2d import RowPlan
 
-# A changed table whose published prefix (count x columns x itemsize) is at most
-# this many bytes goes up whole: below it the per-row bookkeeping of a row plan
-# costs more host time than the copy it saves.
+# A table whose published prefix (count x columns x itemsize) is at most this
+# many bytes takes the plain whole-prefix path, unchanged and without any row
+# tracking. Plans can already pay from about 1 MiB, but the default decode
+# tables sit well below this bound and keep that path's host cost exactly; only
+# larger tables pay for the tracking.
 WHOLE_PREFIX_BYTES = 4 << 20
-# Nor does a plan pay when the last `prepare` changed more than this fraction
-# of the published rows (most rows change every step): the table goes up whole.
+# A tracked table whose plan would cover more than this fraction of the
+# published rows goes up whole instead (still tracked).
 PLAN_MAX_CHANGED_FRACTION = 0.5
 
 
@@ -74,8 +76,6 @@ class BlockTableState:
         self.stages = 0
         self.row_nbytes = self.cpu.shape[1] * self.cpu.itemsize
         self.whole_words = self.row_nbytes % 16 == 0  # a plan moves 16-byte words
-        # Rows the last `prepare` wrote (`_plans_pay`).
-        self.changed_rows = 0
 
     def _acquire(self):
         self.buffer.acquire_write()
@@ -142,7 +142,6 @@ class BlockTableState:
             and end <= self.zero_to
             and page_limit == self.page_limit
         ):
-            self.changed_rows = 0
             return self
         if max(lengths, default=0) > columns:
             raise ValueError("Block-table row exceeds the destination columns")
@@ -168,7 +167,6 @@ class BlockTableState:
         ]
         clear_tail = end > n and (n != old_n or end > self.zero_to)
         zero_to = max(end, self.zero_to) if n == old_n else end
-        self.changed_rows = len(changes) + (end - n if clear_tail else 0)
         if changes or clear_tail:
             self._begin_write()  # all validation precedes the first write
             if self.gpu_tracked is not None:
@@ -305,27 +303,23 @@ class BlockTableState:
         self.gpu_writes[:count] = self.row_writes[:count]
         self.gpu_bound[:count] = bounds
 
-    def _plans_pay(self, count, group):
-        """Whether a row plan can beat the whole-prefix copy for this stage:
-        a packed group, rows of whole 16-byte words, a prefix larger than
-        `WHOLE_PREFIX_BYTES`, and at most `PLAN_MAX_CHANGED_FRACTION` of the
-        rows written by the last `prepare`."""
-        return (
-            count * self.row_nbytes > WHOLE_PREFIX_BYTES
-            and self.changed_rows <= PLAN_MAX_CHANGED_FRACTION * count
-            and self.whole_words
-            and group.transport == "packed"
-        )
+    def _untrack(self):
+        """Stop the row tracking; a later tracked stage starts from unknown
+        (`_track`). Supersedes a pending tracked stage's record (`stage`)."""
+        self.gpu_tracked = None
+        self.stages += 1
 
     def stage(self, count, group):
         """Count a changed table into ``group``, whose owner publishes it.
 
         Omitting a table from a group does not omit its GPU view from metadata.
-        The revision is recorded once that publish has succeeded. Where a plan
-        pays (`_plans_pay`), a packed transport sends only the rows the
-        destination does not hold, each only as wide as needed (`_row_plan`);
-        otherwise the table goes up whole and the row tracking stops
-        (`gpu_tracked` None), so the next planned stage starts from "unknown".
+        The revision is recorded once that publish has succeeded.
+
+        A table whose prefix is at most `WHOLE_PREFIX_BYTES` (or whose rows are
+        not whole 16-byte words, or whose group is not packed) goes up whole
+        exactly as without row plans, untracked. A larger one is tracked
+        (`_stage_tracked`): the packed transport sends only the rows the
+        destination does not hold, each only as wide as needed (`_row_plan`).
 
         Contract: the host table is not prepared again between this stage and
         its group's publish (the upload reads the host when it runs; only then
@@ -333,28 +327,37 @@ class BlockTableState:
         a stage's group must publish before any other stage or publish of this
         table.
         """
+        if count * self.row_nbytes <= WHOLE_PREFIX_BYTES or not (
+            self.whole_words and group.transport == "packed"
+        ):
+            if self.gpu_tracked is not None:
+                self._untrack()
+            dirty, key = self._dirty(count)
+            group.set_count(self.buffer, count if dirty else None)
+            if dirty:
+                gpu = self.buffer.gpu
+                group.after_publish(lambda: setattr(self, "published", (gpu, key)))
+            return self.buffer.gpu[:count]
+        return self._stage_tracked(count, group)
+
+    def _stage_tracked(self, count, group):
+        """`stage` for a large table: a plan when it covers at most
+        `PLAN_MAX_CHANGED_FRACTION` of the rows, else the whole prefix; either
+        way the rows sent are recorded as received once the publish succeeds.
+        Entering tracking starts from unknown: the first stage sends every row
+        at full width."""
         dirty, key = self._dirty(count)
-        plan = None
         self.stages += 1
         stage = self.stages
-        if dirty and (
-            count * self.row_nbytes <= WHOLE_PREFIX_BYTES
-            or not self._plans_pay(count, group)
-        ):
-            gpu = self.buffer.gpu
-            self.gpu_tracked = None
-            group.after_publish(lambda: setattr(self, "published", (gpu, key)))
-            group.set_count(self.buffer, count)
-            return self.buffer.gpu[:count]
+        plan = None
         if dirty:
             gpu = self.buffer.gpu
             bounds = self._row_bounds(count)
             rows, width = self._row_plan(count, bounds)
-            row_bytes = width * self.cpu.itemsize
             if rows is not None and not len(rows):
                 dirty = False  # the destination already holds every row
-            elif rows is not None:
-                plan = RowPlan(rows, row_bytes)  # whole words: columns % 4 == 0
+            elif rows is not None and len(rows) <= PLAN_MAX_CHANGED_FRACTION * count:
+                plan = RowPlan(rows, width * self.cpu.itemsize)
             if dirty:
                 self._sending(gpu, count, bounds)
 
@@ -373,16 +376,13 @@ class BlockTableState:
         return self.buffer.gpu[:count]
 
     def publish(self, count):
-        """Upload a changed table on its own."""
+        """Upload a changed table on its own (the whole prefix, untracked)."""
+        if self.gpu_tracked is not None:
+            self._untrack()
         dirty, key = self._dirty(count)
-        self.stages += 1  # supersedes a pending stage's record
         if dirty:
-            gpu = self.buffer.gpu
-            bounds = self._row_bounds(count)
-            self._sending(gpu, count, bounds)
             self.buffer.copy_to_gpu(count)
-            self._published_rows(gpu, count, bounds)
-            self.published = (gpu, key)
+            self.published = (self.buffer.gpu, key)
         return self.buffer.gpu[:count]
 
 

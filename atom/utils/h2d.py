@@ -460,7 +460,8 @@ class PublicationGroup:
             raise KeyError(f"{self.name}: not members: {sorted(unknown)}")
         for name, count in counts.items():
             self.counts[self.indices[name]] = count
-            if self._has_plans:
+        if self._has_plans:
+            for name in counts:
                 self.row_plans[self.indices[name]] = None
 
     def check_writable(self):

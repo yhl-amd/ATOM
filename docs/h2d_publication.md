@@ -115,10 +115,13 @@ kept beside the producers they protect:
 | `tests/test_h2d_v4_publication.py` | V4/V4.1 plans, state, step metadata and dummy isolation |
 | `tests/test_h2d_v4_indexer_publication.py` | V4 indexer, PCP, TBO and Opus |
 | `tests/test_h2d_draft_publication.py` | Draft and GDN consumers |
+| `tests/test_block_table_row_plan.py` | Block-table row plans through the real packed transport: the row scatter, scheduler churn, destination replacement and failed publishes |
 
 These suites check delayed source reuse, exact values, untouched tails, changing
 batch sizes, graph padding and first consumers. CPU page-table state transitions
-remain in `tests/test_shared_block_tables.py`, runnable without GPU opt-in.
+remain in `tests/test_shared_block_tables.py`, and the block-table row tracking
+(plans, the whole-prefix path, races, failed and partial publishes) in
+`tests/test_block_table_row_plan_cpu.py`; both run without GPU opt-in.
 
 Use the server's torch profiler endpoints for model traces. On ROCm, correlate
 copies with HIP runtime `kind=1`; displayed memcpy names can mislabel H2D as DtoD.
@@ -155,17 +158,20 @@ are validated and source ownership acquired before any host write.
 CPU preparation and successful GPU publication have separate revisions.
 Prefill can prepare CPU slots without uploading a table. Publication reuses the
 GPU table only when its destination, prepared revision and requested row count
-match. A changed table on a packed group sends only the rows of the published
-count the destination does not hold, each only as wide as its pages and the
-destination's old nonzero bound need (`_row_plan`), when that pays
-(`_plans_pay`): its prefix is larger than `WHOLE_PREFIX_BYTES` (4 MiB), its
-column count is a multiple of 4, and the last prepare changed at most half of
-its rows. Otherwise, on a direct group, and when it is the group's only active
-member, it goes up whole. Provided the table is not prepared again between
-its stage and the publish, the destination ends byte-identical to a
-whole-prefix copy. Rows a failed or interrupted publish
-covered are unknown until a later publish succeeds and are sent again; a new
-destination gets every row at full width. A combined group omits an unchanged
+match. A table whose published prefix is at most `WHOLE_PREFIX_BYTES`
+(4 MiB), whose column count is not a multiple of 4, or whose group is direct
+goes up whole on the plain path, without row tracking. A larger table on a
+packed group is tracked: it sends only the rows of the published count the
+destination does not hold, each only as wide as its pages and the
+destination's old nonzero bound need (`_row_plan`), or the whole prefix when
+that plan would cover more than half of the rows (the transport also copies
+whole a member that is the group's only active one); entering tracking starts
+from unknown, so the
+first stage sends every row at full width. Provided the table is not prepared
+again between its stage and the publish, the destination ends byte-identical
+to a whole-prefix copy. Rows a failed or interrupted publish covered are
+unknown until a later publish succeeds and are sent again; a new destination
+gets every row at full width. A combined group omits an unchanged
 table but consumers retain its GPU view. Failed publication never marks the
 new revision as published.
 Padding, TBO slices and capture table preparation use the same state. Direct
