@@ -81,16 +81,17 @@ combined group. Rejected producer reentry leaves earlier sources intact.
 A deliberate second publication supplies a reason and acquires its source
 before rewriting it. Enqueue failures invalidate the owner and retain storage.
 
-The packed arena holds a header of four int64 per member (payload offset,
-byte count, row bytes, row map offset), then the byte payloads, in one DMA. Every
-payload starts 16-byte aligned. Row bytes 0 is a contiguous prefix of the
-member's source. A producer may count a two-dimensional `rows` member with a
-row plan (`set_count(buffer, count, row_plan=RowPlan(rows, row_bytes))`):
-the payload then holds only the leading ``row_bytes`` (a multiple of 16) of the
-listed rows, followed by an int32 row map naming each row's destination row,
-and the scatter writes each one at its destination row's pitch. Only members
-of whole 16-byte rows at a 16-byte-aligned destination take a plan; the
-direct transport ignores it, and a publish clears it with the count.
+The packed arena contains int64 offset/count pairs and byte payloads in one DMA.
+A producer may also hand a packed group a row plan for a two-dimensional `rows`
+member (`set_row_plan(buffer, RowPlan(rows, row_bytes))`, after `set_count`).
+That one publish then takes a separate path (`PackedCopy._submit_planned`): a
+header of four int64 per member (payload offset, byte count, row bytes, row map
+offset), the planned member's payload holding only the leading ``row_bytes`` (a
+multiple of 16) of the listed rows and an int32 row map naming each row's
+destination row, and its own scatter (`scatter_packed_rows`), which writes each
+row at its destination row's pitch. Only members of whole 16-byte rows at a
+16-byte-aligned destination take a plan, and the publish consumes it. Groups
+and steps without a plan run the plain path unchanged.
 The scatter preserves bit patterns and writes only the published ranges into
 the original GPU addresses. It reuses its compiled kernel and fixed destination
 table. No new synchronization event or GPU scalar read is added by packing.
@@ -158,25 +159,26 @@ are validated and source ownership acquired before any host write.
 CPU preparation and successful GPU publication have separate revisions.
 Prefill can prepare CPU slots without uploading a table. Publication reuses the
 GPU table only when its destination, prepared revision and requested row count
-match. A table whose published prefix is at most `WHOLE_PREFIX_BYTES`
-(4 MiB), whose column count is not a multiple of 4, or whose group is direct
-goes up whole on the plain path, without row tracking. A larger table on a
-packed group is tracked: it sends only the rows of the published count the
-destination does not hold, each only as wide as its pages and the
-destination's old nonzero bound need (`_row_plan`), or the whole prefix when
-that plan would cover more than half of the rows or the step's prepare
-changed more than half of them (the transport also copies whole a member that
-is the group's only active one); the rows sent stay recorded either way, so the
-next step can plan. After two such whole steps in a row the table leaves
-tracking (rows that all change every step gain nothing from it) and enters it
-again on a step that changed at most half of its rows. Entering tracking starts
-from unknown, so the first stage sends every row at full width. Provided the table is not prepared
-again between its stage and the publish, the destination ends byte-identical
-to a whole-prefix copy. Rows a failed or interrupted publish covered are
-unknown until a later publish succeeds and are sent again; a new destination
-gets every row at full width. A combined group omits an unchanged
-table but consumers retain its GPU view. Failed publication never marks the
-new revision as published.
+match. A table whose buffer is at most `WHOLE_PREFIX_BYTES` (4 MiB) is a
+plain `BlockTableState` and always goes up whole. A larger buffer gets a
+`TrackedBlockTableState`. While untracked it takes the same plain path for a
+count whose prefix fits in 4 MiB, a group that is not packed, rows that are not
+whole 16-byte words, or a busy step (its prepare changed more than half of the
+published rows); any other step enters the tracking, from unknown, so that
+first stage sends every row at full width. Tracked, a step sends only the rows
+the destination does not hold, each only as wide as its pages and the
+destination's old nonzero bound need (`_row_plan`); a busy step, a step at a
+small count (a prefill staging the same buffer) or a plan covering more than
+half of the rows goes up whole instead, and the rows sent stay recorded either
+way, so the next step can plan. Eight busy steps in a row, or eight small
+stages in a row, leave the tracking; a whole copy because of a wide plan counts
+as neither. The transport also copies whole a member that is the group's only
+active one. Provided the table is not prepared again between its stage and the
+publish, the destination ends byte-identical to a whole-prefix copy. Rows a
+failed or interrupted publish covered are unknown until a later publish
+succeeds and are sent again; a new destination gets every row at full width. A
+combined group omits an unchanged table but consumers retain its GPU view.
+Failed publication never marks the new revision as published.
 Padding, TBO slices and capture table preparation use the same state. Direct
 writes to the CPU/GPU table outside these entry points invalidate this contract.
 

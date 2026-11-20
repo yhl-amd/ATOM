@@ -10,16 +10,55 @@ from atom.utils.h2d import gather_rows
 
 
 @triton.jit
-def scatter_packed_words(arena, destinations, wide, pitches, WORDS: tl.constexpr):
-    """Scatter each packed member to its destination, WORDS * 8 bytes a
-    program: as int64 words where the member starts 16-byte aligned in the
-    arena (packing pads every member to that) and its destination is too
-    (`wide`), byte by byte otherwise.
+def scatter_packed_words(arena, destinations, wide, WORDS: tl.constexpr):
+    """Scatter each packed member (header: int64 arena offset, byte count) to
+    its destination, WORDS * 8 bytes a program: as int64 words where the
+    member starts 16-byte aligned in the arena (packing pads every member to
+    that) and its destination is too (`wide`), byte by byte otherwise."""
+    member = tl.program_id(0)
+    header = arena.to(tl.pointer_type(tl.int64))
+    start = tl.load(header + 2 * member)
+    length = tl.load(header + 2 * member + 1)
+    address = tl.load(destinations + member)
+    span = WORDS * 8
+    base = tl.program_id(1).to(tl.int64) * span
+    if base < length:
+        if tl.load(wide + member) != 0:
+            words = length // 8
+            index = base // 8 + tl.arange(0, WORDS)
+            source = (arena + tl.multiple_of(start, 16)).to(tl.pointer_type(tl.int64))
+            target = tl.multiple_of(address, 16).to(tl.pointer_type(tl.int64))
+            tl.store(
+                target + index, tl.load(source + index, index < words), index < words
+            )
+            # The last program also moves the 0-7 tail bytes.
+            if base + span >= length:
+                tail = words * 8 + tl.arange(0, 8)
+                tl.store(
+                    address.to(tl.pointer_type(tl.uint8)) + tail,
+                    tl.load(arena + start + tail, tail < length),
+                    tail < length,
+                )
+        else:
+            offset = base + tl.arange(0, WORDS * 8)
+            tl.store(
+                address.to(tl.pointer_type(tl.uint8)) + offset,
+                tl.load(arena + start + offset, offset < length),
+                offset < length,
+            )
+
+
+@triton.jit
+def scatter_packed_rows(arena, destinations, wide, pitches, WORDS: tl.constexpr):
+    """`scatter_packed_words` for a step that carries a row plan
+    (`PackedCopy._submit_planned`): WORDS * 8 bytes a program, as int64 words
+    where the member starts 16-byte aligned in the arena and its destination
+    is too (`wide`), byte by byte otherwise.
 
     A member's header is (start, byte count, row bytes, row map offset). Row
     bytes 0: a contiguous prefix. Otherwise the payload holds rows of that many
     bytes (a multiple of 16), each stored at the start of the destination row
-    the int32 row map names, ``pitches`` bytes apart (`PackedCopy.submit`)."""
+    the int32 row map names, ``pitches`` bytes apart."""
     member = tl.program_id(0)
     header = arena.to(tl.pointer_type(tl.int64))
     start = tl.load(header + 4 * member)
@@ -70,10 +109,11 @@ def _pad16(nbytes):
     return -(-nbytes // 16) * 16
 
 
-# DMA size granularity of a step that carries a row plan, and the number of
-# prefix view pairs cached (a 32 KiB step leaves about a dozen sizes in use).
+# A step that carries a row plan rounds its DMA up to this many bytes (the
+# extra bytes are never scattered) and caches that many prefix view pairs of
+# its own; plan sizes vary from step to step.
 _PLANNED_DMA_STEP = 32 << 10
-_PREFIX_CACHE = 16
+_PLANNED_PREFIX_CACHE = 64
 
 
 class PackedCopy:
@@ -90,38 +130,56 @@ class PackedCopy:
             return None, "strided regions use checked direct"
         result = cls()
         result.members = members
-        # int64 (offset, byte count, row bytes, row map offset) per member.
-        result.header_bytes = 32 * len(members)
-        # Destinations the word copy may store to as int64 (16-byte aligned).
-        wide = [int(b.destination.data_ptr() % 16 == 0) for b in members]
-        # Members that may take a row plan (`RowPlan`):
-        # two-dimensional rows of whole 16-byte words at a word-aligned address.
+        result.header_bytes = 16 * len(members)  # int64 (offset, byte count)
+        # A planned step's header: int64 (offset, byte count, row bytes, row
+        # map offset) per member (`_submit_planned`).
+        result.row_header_bytes = 32 * len(members)
+        # Members that may take a row plan (`RowPlan`): two-dimensional rows of
+        # whole 16-byte words at a word-aligned destination.
         result.row_members = tuple(
             b.unit == "rows"
             and b.source.ndim == 2
             and b.bytes_per_count % 16 == 0
-            and bool(w)
-            for b, w in zip(members, wide)
+            and b.destination.data_ptr() % 16 == 0
+            for b in members
         )
         # Every member starts 16-byte aligned (`submit` pads), for the word
-        # copy; a row member also reserves a row map of one int32 per row.
-        capacity = result.header_bytes + sum(
+        # copy; a planned step also needs a row map of one int32 a row.
+        capacity = result.row_header_bytes + sum(
             _pad16(b.capacity * b.bytes_per_count)
             + (_pad16(4 * b.row_capacity) if rows else 0)
             for b, rows in zip(members, result.row_members)
         )
-        result.capacity = capacity
         result.host = torch.empty(
             capacity, dtype=torch.uint8, device="cpu", pin_memory=True
         )
         result.device = torch.empty(capacity, dtype=torch.uint8, device=device)
         result.header = result.host[: result.header_bytes].view(torch.int64).numpy()
         result.payload = memoryview(result.host.numpy())
-        result.arena = result.host.numpy()
         # Byte views avoid typed copies canonicalizing bool or casting BF16.
         result.sources = tuple(
             memoryview(b.source.reshape(-1).view(torch.uint8).numpy()) for b in members
         )
+        result.destinations = torch.tensor(
+            [b.destination.data_ptr() for b in members],
+            dtype=torch.int64,
+            device=device,
+        )
+        # Destinations the word copy may store to as int64 (16-byte aligned).
+        result.wide = torch.tensor(
+            [int(b.destination.data_ptr() % 16 == 0) for b in members],
+            dtype=torch.int32,
+            device=device,
+        )
+        result.prefixes = {}
+        result.launch = scatter_packed_words
+        result.kernel = None
+        # The planned path (`plan_rows`, `_submit_planned`).
+        result.capacity = capacity
+        result.row_header = (
+            result.host[: result.row_header_bytes].view(torch.int64).numpy()
+        )
+        result.arena = result.host.numpy()
         result.rows = tuple(
             (
                 b.source.view(torch.uint8)
@@ -132,12 +190,6 @@ class PackedCopy:
             )
             for b, rows in zip(members, result.row_members)
         )
-        result.destinations = torch.tensor(
-            [b.destination.data_ptr() for b in members],
-            dtype=torch.int64,
-            device=device,
-        )
-        result.wide = torch.tensor(wide, dtype=torch.int32, device=device)
         result.pitches = torch.tensor(
             [
                 b.bytes_per_count if rows else 0
@@ -146,12 +198,59 @@ class PackedCopy:
             dtype=torch.int64,
             device=device,
         )
-        result.prefixes = {}
-        result.header[:] = 0  # row fields stay 0 except on planned steps
-        result.planned_last = False
-        result.launch = scatter_packed_words
-        result.kernel = None
+        result.plans = [None] * len(members)
+        result.planned_prefixes = {}
+        result.row_launch = scatter_packed_rows
+        result.row_kernel = None
         return result, None
+
+    def submit(self, counts):
+        """Enqueue copies and return whether the packed arena is borrowed."""
+        active = [i for i, count in enumerate(counts) if count]
+        if len(active) == 1:
+            # A single live member already takes one DMA; no packing/scatter.
+            i = active[0]
+            self.members[i]._copy(counts[i])
+            return False
+        offset = self.header_bytes
+        largest = 0
+        for i, (binding, count) in enumerate(zip(self.members, counts)):
+            length = 0 if count is None else count * binding.bytes_per_count
+            self.header[2 * i] = offset
+            self.header[2 * i + 1] = length
+            if length:
+                self.payload[offset : offset + length] = self.sources[i][:length]
+                offset += -(-length // 16) * 16
+                largest = max(largest, length)
+        prefix = self.prefixes.get(offset)
+        if prefix is None:
+            prefix = self.host[:offset], self.device[:offset]
+            if len(self.prefixes) == 4:
+                del self.prefixes[next(iter(self.prefixes))]
+            self.prefixes[offset] = prefix
+        # Header and payload share this single asynchronous H2D.
+        prefix[1].copy_(prefix[0], non_blocking=True)
+        # 1024 words (8 KiB) a program.
+        grid = (len(self.members), (largest + 8191) // 8192, 1)
+        if self.kernel is None:
+            self.kernel = self.launch[grid](
+                self.device, self.destinations, self.wide, WORDS=1024, num_warps=8
+            )
+        else:
+            # Both argument storages and their layouts are fixed for this
+            # binding. Reuse its compiled kernel; counts and grid stay dynamic.
+            self.kernel[grid](self.device, self.destinations, self.wide)
+        return True
+
+    def plan_rows(self, i, plan):
+        """Record member ``i``'s `RowPlan` (or None) for the next publish. A
+        plan routes that one publish through `_submit_planned`; the plain
+        `submit` stays untouched."""
+        self.plans[i] = plan
+        if any(p is not None for p in self.plans):
+            self.submit = self._submit_planned
+        elif "submit" in self.__dict__:
+            del self.submit
 
     def _plan(self, i, count, plan):
         """Member ``i``'s `RowPlan` for ``count`` rows, if it can take one."""
@@ -164,48 +263,25 @@ class PackedCopy:
             return None
         return plan.rows, plan.row_bytes
 
-    def submit(self, counts, plans=None):
-        """Enqueue copies and return whether the packed arena is borrowed.
-        ``plans`` holds each member's optional `RowPlan` for its count, or is
-        None when no member has one (`_submit_planned`)."""
-        if plans is not None:
-            return self._submit_planned(counts, plans)
+    def _submit_planned(self, counts):
+        """`submit` for one publish where a member carries a `RowPlan`: only
+        the planned rows' leading bytes and an int32 row map for it, the
+        plain prefix for the others, through `scatter_packed_rows`. Consumes
+        the plans."""
+        plans = self.plans
+        self.plans = [None] * len(self.members)
+        del self.submit
         active = [i for i, count in enumerate(counts) if count]
         if len(active) == 1:
             # A single live member already takes one DMA; no packing/scatter.
             i = active[0]
             self.members[i]._copy(counts[i])
             return False
-        if self.planned_last:
-            # Only a planned step leaves row fields set; clear them once.
-            self.header.reshape(-1, 4)[:, 2:] = 0
-            self.planned_last = False
-        offset = self.header_bytes
+        header = self.row_header
+        offset = self.row_header_bytes
         largest = 0
         for i, (binding, count) in enumerate(zip(self.members, counts)):
-            length = 0 if count is None else count * binding.bytes_per_count
-            self.header[4 * i] = offset
-            self.header[4 * i + 1] = length
-            if length:
-                self.payload[offset : offset + length] = self.sources[i][:length]
-                offset += -(-length // 16) * 16
-                largest = max(largest, length)
-        self._enqueue(offset, largest)
-        return True
-
-    def _submit_planned(self, counts, plans):
-        """`submit` for a step where some member carries a `RowPlan`."""
-        active = [i for i, count in enumerate(counts) if count]
-        if len(active) == 1:
-            i = active[0]
-            self.members[i]._copy(counts[i])
-            return False
-        offset = self.header_bytes
-        largest = 0
-        planned = False
-        header = self.header
-        for i, (binding, count) in enumerate(zip(self.members, counts)):
-            plan = self._plan(i, count, plans[i]) if count and plans[i] else None
+            plan = self._plan(i, count, plans[i]) if count else None
             header[4 * i] = offset
             if plan is not None:
                 # Only the planned rows' leading bytes; the rest of every
@@ -223,7 +299,6 @@ class PackedCopy:
                 header[4 * i + 3] = row_map
                 offset = row_map + _pad16(4 * len(rows))
                 largest = max(largest, length)
-                planned = True
                 continue
             length = 0 if count is None else count * binding.bytes_per_count
             header[4 * i + 1] = length
@@ -233,30 +308,18 @@ class PackedCopy:
                 self.payload[offset : offset + length] = self.sources[i][:length]
                 offset += _pad16(length)
                 largest = max(largest, length)
-        if planned:
-            self.planned_last = True
-            # A plan's payload size varies step to step: round the DMA up to a
-            # few sizes the prefix cache holds (the extra bytes are never read).
-            offset = min(
-                -(-offset // _PLANNED_DMA_STEP) * _PLANNED_DMA_STEP, self.capacity
-            )
-        self._enqueue(offset, largest)
-        return True
-
-    def _enqueue(self, offset, largest):
-        """One H2D of the arena's first ``offset`` bytes, then the scatter."""
-        prefix = self.prefixes.get(offset)
+        # Plan sizes vary step to step: round the DMA up to a few cached sizes.
+        offset = min(-(-offset // _PLANNED_DMA_STEP) * _PLANNED_DMA_STEP, self.capacity)
+        prefix = self.planned_prefixes.get(offset)
         if prefix is None:
             prefix = self.host[:offset], self.device[:offset]
-            if len(self.prefixes) == _PREFIX_CACHE:
-                del self.prefixes[next(iter(self.prefixes))]
-            self.prefixes[offset] = prefix
-        # Header and payload share this single asynchronous H2D.
+            if len(self.planned_prefixes) == _PLANNED_PREFIX_CACHE:
+                del self.planned_prefixes[next(iter(self.planned_prefixes))]
+            self.planned_prefixes[offset] = prefix
         prefix[1].copy_(prefix[0], non_blocking=True)
-        # 1024 words (8 KiB) a program.
         grid = (len(self.members), (largest + 8191) // 8192, 1)
-        if self.kernel is None:
-            self.kernel = self.launch[grid](
+        if self.row_kernel is None:
+            self.row_kernel = self.row_launch[grid](
                 self.device,
                 self.destinations,
                 self.wide,
@@ -265,6 +328,7 @@ class PackedCopy:
                 num_warps=8,
             )
         else:
-            # Both argument storages and their layouts are fixed for this
-            # binding. Reuse its compiled kernel; counts and grid stay dynamic.
-            self.kernel[grid](self.device, self.destinations, self.wide, self.pitches)
+            self.row_kernel[grid](
+                self.device, self.destinations, self.wide, self.pitches
+            )
+        return True

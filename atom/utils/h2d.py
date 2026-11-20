@@ -420,9 +420,6 @@ class PublicationGroup:
         self._single_member = members[0] if len(members) == 1 else None
         # CPU-only producer scratch; it is never borrowed by the GPU.
         self.counts = [None] * len(members)
-        # Each counted member's optional `RowPlan`, cleared with its count.
-        self.row_plans = [None] * len(members)
-        self._has_plans = False  # any entry of row_plans set
         self.indices = {member.name: i for i, member in enumerate(members)}
         self._buffer_indices = {member.buffer: i for i, member in enumerate(members)}
         self._counts = [None] * len(members)
@@ -432,22 +429,21 @@ class PublicationGroup:
         self.fallback_reason = None
         self._backend = None
 
-    def set_count(self, buffer, count, row_plan=None):
+    def set_count(self, buffer, count):
         """Record a producer's count without copying data or granting write access.
 
         This only fills CPU count scratch. The producer must acquire sources
         before writing them; publish validates the entire group before enqueue.
         Lookup by buffer identity keeps binding names private to registration.
-        ``row_plan`` (a `RowPlan`, rows below ``count``) lets the packed
-        transport send only those rows; it holds for this count only.
         """
-        i = self._buffer_indices[buffer]
-        self.counts[i] = count
-        if row_plan is not None and count is not None:
-            self.row_plans[i] = row_plan
-            self._has_plans = True
-        elif self._has_plans:
-            self.row_plans[i] = None
+        self.counts[self._buffer_indices[buffer]] = count
+
+    def set_row_plan(self, buffer, row_plan):
+        """Hand the packed transport a `RowPlan` (or None) for ``buffer``'s
+        count in the next publish (`PackedCopy.plan_rows`). Only a packed
+        group takes one; producers that never plan never call this, and their
+        publishes take the plain path."""
+        self._backend.plan_rows(self._buffer_indices[buffer], row_plan)
 
     def set_counts(self, counts):
         """Record the count of each member ``counts`` names, by name.
@@ -460,9 +456,6 @@ class PublicationGroup:
             raise KeyError(f"{self.name}: not members: {sorted(unknown)}")
         for name, count in counts.items():
             self.counts[self.indices[name]] = count
-        if self._has_plans:
-            for name in counts:
-                self.row_plans[self.indices[name]] = None
 
     def check_writable(self):
         """Check fresh sources before a producer writes any group member.
@@ -549,9 +542,7 @@ class PublicationGroup:
         try:
             if backend is not None and active_members:
                 # Direct fallback leaves any earlier packed read in flight.
-                self._header_busy |= backend.submit(
-                    self._counts, self.row_plans if self._has_plans else None
-                )
+                self._header_busy |= backend.submit(self._counts)
             elif backend is None:
                 for binding, count in zip(self.members, self._counts):
                     if count:
@@ -566,10 +557,6 @@ class PublicationGroup:
         only what its producers count, then run the `after_publish` callbacks."""
         for i in range(len(self.counts)):
             self.counts[i] = None
-        if self._has_plans:
-            for i in range(len(self.row_plans)):
-                self.row_plans[i] = None
-            self._has_plans = False
         callbacks, self._after_publish = self._after_publish, []
         for callback in callbacks:
             callback()

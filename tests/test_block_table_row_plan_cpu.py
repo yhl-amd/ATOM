@@ -7,6 +7,7 @@ rows' leading bytes, or the whole prefix), reading the host table at publish
 time, and runs the `after_publish` callbacks only when it succeeds. The device
 prefix must equal the host's after every successful publish."""
 
+import functools
 import random
 
 import numpy as np
@@ -41,10 +42,13 @@ class _Group:
         self.callbacks = []
         self.sent = 0
 
-    def set_count(self, buffer, count, row_plan=None):
+    def set_count(self, buffer, count):
         assert buffer is self.table
         self.count = count
-        self.plan = None if count is None else row_plan
+
+    def set_row_plan(self, buffer, row_plan):
+        assert buffer is self.table
+        self.plan = row_plan
 
     def after_publish(self, callback):
         self.callbacks.append(callback)
@@ -233,10 +237,12 @@ def test_gather_rows_reads_only_the_planned_rows():
 
 
 def test_small_tables_go_up_whole_and_restart_tracking(monkeypatch):
-    """At most `WHOLE_PREFIX_BYTES` the prefix goes up whole and tracking
-    stops; the first planned stage after it starts from unknown (every row,
-    full width), later ones plan only changed rows, and the device always
-    matches the host."""
+    """Untracked, a prefix of at most `WHOLE_PREFIX_BYTES` takes the plain
+    path; the first stage past it enters the tracking from unknown (every row,
+    full width), later ones plan only changed rows; back at a small count the
+    table goes up whole but stays recorded until `SMALL_STAGES_TO_LEAVE`
+    such stages in a row leave the tracking. The device always matches the
+    host."""
     from atom.utils import block_tables
 
     columns = 64
@@ -261,12 +267,15 @@ def test_small_tables_go_up_whole_and_restart_tracking(monkeypatch):
     assert group.plan is not None and group.plan.rows.tolist() == [3]
     assert group.publish()
     np.testing.assert_array_equal(device[:24], table.np[:24])
-    rows = rows[:8]  # back to small
-    rows[5].append(88)
-    state.prepare(rows, pad_to=8).stage(8, group)
-    assert group.plan is None and state.gpu_tracked is None
-    assert group.publish()
-    np.testing.assert_array_equal(device[:8], table.np[:8])
+    rows = rows[:8]  # back to small: whole but recorded, then leave
+    monkeypatch.setattr(block_tables, "SMALL_STAGES_TO_LEAVE", 2)
+    for tracked in (True, False):
+        rows[5].append(88)
+        state.prepare(rows, pad_to=8).stage(8, group)
+        assert group.plan is None
+        assert (state.gpu_tracked is table.gpu) == tracked
+        assert group.publish()
+        np.testing.assert_array_equal(device[:8], table.np[:8])
 
 
 def test_a_table_whose_columns_are_not_whole_words_gets_no_plan():
@@ -341,3 +350,124 @@ def test_a_step_that_changes_most_rows_goes_up_whole(monkeypatch):
     assert step(range(6)) is None and state.gpu_tracked is None  # stays out
     assert step([3, 4, 5]) is None and state.gpu_tracked is table.gpu  # enter
     assert step([5]).rows.tolist() == [5]
+
+
+def _tracked_step(state, group, table, device, rows, changed, count):
+    for i in changed:
+        rows[i].append(100 + i)
+    state.prepare(rows, pad_to=count).stage(count, group)
+    plan = group.plan
+    assert group.publish()
+    np.testing.assert_array_equal(device[:count], table.np[:count])
+    return plan
+
+
+def test_an_idle_step_resets_the_changed_row_count(monkeypatch):
+    """A busy step, then a step that writes nothing, then a one-row change:
+    the idle step must not count as busy, so the table stays tracked and the
+    one-row change is a one-row plan."""
+    from atom.utils import block_tables
+
+    monkeypatch.setattr(block_tables, "PLAN_MAX_CHANGED_FRACTION", 0.5)
+    monkeypatch.setattr(block_tables, "BUSY_STEPS_TO_LEAVE", 2)
+    table, device, group, state = _setup(8, 64)
+    rows = [new_block_table([i + 1]) for i in range(8)]
+    step = functools.partial(_tracked_step, state, group, table, device, rows)
+    step([], 8)  # new rows: busy, untracked
+    step([0], 8)  # enter
+    assert step(range(6), 8) is None and state.gpu_tracked is table.gpu
+    assert step([], 8) is None  # idle: nothing written
+    assert state.gpu_tracked is table.gpu
+    assert step([4], 8).rows.tolist() == [4]
+
+
+def test_a_busy_busy_quiet_cycle_keeps_planning(monkeypatch):
+    """Two busy steps then a quiet one, repeated: with the default
+    `BUSY_STEPS_TO_LEAVE` the table stays tracked and every quiet step plans;
+    a long run of busy steps still leaves the tracking."""
+    from atom.utils import block_tables
+
+    monkeypatch.setattr(block_tables, "PLAN_MAX_CHANGED_FRACTION", 0.5)
+    table, device, group, state = _setup(10, 64)
+    rows = [new_block_table([i + 1]) for i in range(10)]
+    step = functools.partial(_tracked_step, state, group, table, device, rows)
+    step([], 10)
+    step([0], 10)  # enter
+    for k in range(4):
+        assert step(range(6), 10) is None
+        assert step(range(1, 7), 10) is None
+        assert step([k], 10).rows.tolist() == [k]
+    for _ in range(block_tables.BUSY_STEPS_TO_LEAVE):
+        step(range(10), 10)
+    assert state.gpu_tracked is None
+
+
+def test_a_small_prefill_stage_between_decode_steps_keeps_the_tracking(
+    monkeypatch,
+):
+    """A prefill staging the same buffer at a small count between decode
+    steps goes up whole but recorded; the decode steps keep planning. Only
+    `SMALL_STAGES_TO_LEAVE` small stages in a row leave the tracking."""
+    from atom.utils import block_tables
+
+    columns = 64
+    monkeypatch.setattr(block_tables, "WHOLE_PREFIX_BYTES", 4 * columns * 4)
+    monkeypatch.setattr(block_tables, "SMALL_STAGES_TO_LEAVE", 3)
+    table, device, group, state = _setup(16, columns)
+    rows = [new_block_table([i + 1]) for i in range(12)]
+    step = functools.partial(_tracked_step, state, group, table, device, rows)
+    step([], 12)  # new rows, then enter
+    step([0], 12)
+    for k in range(4):
+        prefill = [new_block_table([200 + k, 201]), rows[3]]
+        state.prepare(prefill, pad_to=2).stage(2, group)  # a small stage
+        assert group.publish()
+        np.testing.assert_array_equal(device[:2], table.np[:2])
+        assert state.gpu_tracked is table.gpu
+        plan = step([5 + k], 12)
+        assert plan is not None and 5 + k in plan.rows.tolist()
+    for tracked in (True, True, False):  # a batch that shrank for good
+        state.prepare(rows[:2], pad_to=2).stage(2, group)
+        assert group.publish()
+        assert (state.gpu_tracked is table.gpu) == tracked
+
+
+def test_a_direct_publish_stops_the_tracking():
+    """A direct `publish` writes the whole prefix behind the tracking's back:
+    a row that grew before it and shrinks after it must still be cleared."""
+    table, device, group, state = _setup(8, 64)
+    rows = [new_block_table([1, 2]), new_block_table(list(range(100, 120)))]
+    state.prepare(rows, pad_to=2).stage(2, group)
+    assert group.publish()
+    rows[1].append(120)  # a quiet step: enter the tracking
+    state.prepare(rows, pad_to=2).stage(2, group)
+    assert group.publish() and state.gpu_tracked is table.gpu
+    rows[0].extend(range(3, 12))  # 11 pages
+    state.prepare(rows, pad_to=2).publish(2)
+    device[:2] = table.gpu[:2].numpy()
+    assert state.gpu_tracked is None
+    rows[0] = new_block_table([500])
+    state.prepare(rows, pad_to=2).stage(2, group)
+    assert group.publish()
+    np.testing.assert_array_equal(device[:2], table.np[:2])
+
+
+def test_a_cut_short_publish_widens_the_bound_it_may_have_written():
+    """A planned row that grew is cut short mid-upload (`_sending` widened its
+    bound before the upload); after it shrinks, the next plan clears it."""
+    table, device, group, state = _setup(8, 64)
+    rows = [new_block_table([1, 2]), new_block_table(list(range(100, 120)))]
+    state.prepare(rows, pad_to=2).stage(2, group)
+    assert group.publish()
+    rows[1].append(120)  # a quiet step: enter the tracking
+    state.prepare(rows, pad_to=2).stage(2, group)
+    assert group.publish() and state.gpu_tracked is table.gpu
+    rows[0].extend(range(3, 12))  # 11 pages
+    state.prepare(rows, pad_to=2).stage(2, group)
+    assert group.plan.rows.tolist() == [0]
+    device[0, :12] = table.np[0, :12]  # the cut-short upload landed row 0
+    group.publish("fail")
+    rows[0] = new_block_table([500])
+    state.prepare(rows, pad_to=2).stage(2, group)
+    assert group.publish()
+    np.testing.assert_array_equal(device[:2], table.np[:2])

@@ -66,7 +66,8 @@ def test_scatter_rows_kernel_matches_row_writes():
         width = int(rng.integers(1, 257)) * 4
         if step % 7 == 0:
             rows, width = np.arange(count, dtype=np.int32), 1024
-        group.set_count(table, count, row_plan=RowPlan(rows, width * 4))
+        group.set_count(table, count)
+        group.set_row_plan(table, RowPlan(rows, width * 4))
         for b in others:
             group.set_count(b, int(rng.integers(1, 98)))
         group.publish()
@@ -134,7 +135,7 @@ def _simulate(seed, steps, columns, capacity, packed=True):
         published = state.published
         dirty = state._dirty(count)[0]
         state.stage(count, group)
-        plan = group.row_plans[0]
+        plan = group._backend.plans[0] if group._backend is not None else None
         if plan is not None:
             sent += len(plan.rows) * plan.row_bytes
         elif group.counts[0]:
@@ -176,7 +177,7 @@ def test_destination_replacement_resends_every_row_at_full_width():
     owner.begin()
     state.prepare(rows, pad_to=4)
     state.stage(4, group)
-    plan = group.row_plans[0]
+    plan = group._backend.plans[0]
     assert plan is not None and plan.rows.tolist() == [0] and plan.row_bytes == 16
     group.publish()
     owner.finish()
@@ -188,7 +189,7 @@ def test_destination_replacement_resends_every_row_at_full_width():
     owner.begin()
     state.prepare(rows, pad_to=4)
     state.stage(4, group)
-    assert group.counts[0] == 4 and group.row_plans[0] is None
+    assert group.counts[0] == 4 and group._backend.plans[0] is None
     group.publish()
     owner.finish()
     owner.completion.synchronize()
@@ -219,7 +220,7 @@ def test_a_failed_or_partial_publish_resends_its_rows(monkeypatch, applied):
     owner.begin()
     state.prepare(rows, pad_to=8)
     state.stage(8, group)
-    plan = group.row_plans[0]
+    plan = group._backend.plans[0]
     assert plan is not None and plan.rows.tolist() == [1, 4]
 
     def failing_submit(counts, plans=None):
@@ -244,7 +245,7 @@ def test_a_failed_or_partial_publish_resends_its_rows(monkeypatch, applied):
     owner.begin()
     state.prepare(rows, pad_to=8)
     state.stage(8, group)
-    plan = group.row_plans[0]
+    plan = group._backend.plans[0]
     widest = max(len(r) for r in rows)
     assert plan is not None
     assert plan.rows.tolist() == list(range(8))  # every row of the failed count
