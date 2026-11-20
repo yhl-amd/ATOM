@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import operator
 import threading
+from dataclasses import dataclass
 from functools import wraps
+from typing import Any
 
 import torch
 
@@ -42,6 +44,38 @@ def h2d_producer(*group_names, runner=None):
         return checked
 
     return decorate
+
+
+@dataclass(frozen=True, slots=True)
+class RowPlan:
+    """A producer's hint for the next packed publish of a `rows` member: of the
+    rows below its count only ``rows`` (strictly increasing int32 indices)
+    differ from the destination, and only in their leading ``row_bytes`` bytes
+    (a positive multiple of 16). The packed transport may send just those;
+    any transport may ignore it and copy the whole prefix
+    (`PublicationGroup.set_count`, `PackedCopy.submit`)."""
+
+    rows: Any
+    row_bytes: int
+
+    def __post_init__(self):
+        if self.row_bytes <= 0 or self.row_bytes % 16:
+            raise ValueError(f"row_bytes {self.row_bytes} is not a positive x16")
+        if not len(self.rows) or self.rows[0] < 0:
+            raise ValueError("a row plan names at least one nonnegative row")
+        if not (self.rows[1:] > self.rows[:-1]).all():
+            raise ValueError("row plan rows must be strictly increasing")
+
+
+def gather_rows(out, source, rows):
+    """Copy ``source[rows]`` into ``out``, reading only those rows: one slice
+    for a single run of consecutive rows, fancy indexing otherwise.
+    (``np.take(..., out=)`` on a strided ``source`` first copies all of it.)"""
+    first, last = int(rows[0]), int(rows[-1])
+    if last - first + 1 == len(rows):
+        out[:] = source[first : last + 1]
+    else:
+        out[:] = source[rows]
 
 
 def _count(value, capacity, name):
@@ -403,6 +437,13 @@ class PublicationGroup:
         Lookup by buffer identity keeps binding names private to registration.
         """
         self.counts[self._buffer_indices[buffer]] = count
+
+    def set_row_plan(self, buffer, row_plan):
+        """Hand the packed transport a `RowPlan` (or None) for ``buffer``'s
+        count in the next publish (`PackedCopy.plan_rows`). Only a packed
+        group takes one; producers that never plan never call this, and their
+        publishes take the plain path."""
+        self._backend.plan_rows(self._buffer_indices[buffer], row_plan)
 
     def set_counts(self, counts):
         """Record the count of each member ``counts`` names, by name.
