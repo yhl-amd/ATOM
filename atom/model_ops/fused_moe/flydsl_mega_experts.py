@@ -12,8 +12,10 @@ MegaMoEV2 auto-selects its execution config from the runtime token count and
 ``max_tok_per_rank`` (MTPR): MTPR<=255 -> low-latency fixed-slot path,
 MTPR>=256 -> compact path (``FIXED_SLOT_MAX_MTPR``). MTPR must be a positive
 power of two. The configured ``max_num_tokens`` remains the fallback capacity.
-For native ATOM EP8 with 48 experts per rank, DP-unified forwards with at most 128
-padded token rows can use a second, 128-token instance. Target verification
+For native ATOM EP8 with an experts-per-rank width aiter dispatches fixed-slot
+(48; and those aiter lists in ``FIXED_SLOT_EXPERTS_PER_RANK``, e.g. 49 with the
+shared expert as each rank's last local expert), DP-unified forwards with at
+most 128 padded token rows can use a second, 128-token instance. Target verification
 and draft passes use their own token counts, including MTP and graph padding.
 MTPR also selects the p2p wire format, so the choice must use group-agreed
 metadata, never a rank's local request count. Set ATOM_MEGA_DECODE_FAST_PATH=0
@@ -45,6 +47,7 @@ not baked into the kernel).
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 
@@ -74,6 +77,19 @@ _MEGA_LAYERS_WITHOUT_ID: list[str] = []
 
 def _os_env(k):
     return os.environ.get(k, "<unset>")
+
+
+@functools.cache
+def _decode_experts_per_rank() -> tuple[int, ...]:
+    """Experts-per-rank widths that get the decode capacity at EP8: the widths
+    aiter dispatches fixed-slot. An aiter without the table has only 48."""
+    try:
+        from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
+            FIXED_SLOT_EXPERTS_PER_RANK,
+        )
+    except ImportError:
+        return (48,)
+    return tuple(FIXED_SLOT_EXPERTS_PER_RANK)
 
 
 def _select_decode_mtpr(
@@ -414,7 +430,8 @@ def run_mega_moe(
         and not is_plugin_mode()
         and mtpr > _MEGA_DECODE_MTPR
         and world == 8
-        and experts == world * 48
+        and experts % world == 0
+        and experts // world in _decode_experts_per_rank()
         # The small-input route of the configured capacity serves these steps
         # with the kernel the decode capacity's own small-input route would.
         # It is built from the layout alone, so every rank decides the same.

@@ -73,6 +73,7 @@ def runtime(monkeypatch):
     monkeypatch.setattr(plugin_prepare, "_CURRENT_FRAMEWORK", "atom")
     monkeypatch.setattr(mega, "_MEGA_CACHE", {})
     monkeypatch.setattr(mega, "_MEGA_CAPACITY_LOGGED", set())
+    monkeypatch.setattr(mega, "_decode_experts_per_rank", lambda: (48,))
     monkeypatch.setattr(mega, "_MEGA_LAYER_IDS", set())
     monkeypatch.setattr(mega, "_MEGA_LAYERS_WITHOUT_ID", [])
     monkeypatch.setattr(
@@ -287,6 +288,39 @@ def test_disabled_or_unsupported_cases_keep_the_original_instance(
 
     assert _built(runtime) == [mtpr]
     assert _forwarded(runtime) == [mtpr]
+
+
+@pytest.mark.parametrize(
+    ("fixed_slot_widths", "expected"),
+    [((48,), [LARGE_CAPACITY]), ((48, 49), [LARGE_CAPACITY, 128])],
+)
+def test_shared_slot_width_gets_decode_capacity_when_aiter_runs_it_fixed_slot(
+    runtime, monkeypatch, fixed_slot_widths, expected
+):
+    # V4.1-Flash at EP8 with the shared expert as each rank's 49th expert.
+    monkeypatch.setattr(mega, "_decode_experts_per_rank", lambda: fixed_slot_widths)
+    runtime.run(_context(32), experts=392)
+
+    assert _built(runtime) == expected
+    assert _forwarded(runtime) == expected[-1:]
+
+
+def test_decode_widths_fall_back_to_48_without_the_aiter_table(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_table(name, *args, **kwargs):
+        if name.startswith("aiter.ops.flydsl.kernels.mega_moe"):
+            raise ImportError(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_table)
+    mega._decode_experts_per_rank.cache_clear()
+    try:
+        assert mega._decode_experts_per_rank() == (48,)
+    finally:
+        mega._decode_experts_per_rank.cache_clear()
 
 
 @pytest.mark.parametrize("framework", ["vllm", "sglang", "sgl", "rtpllm"])
