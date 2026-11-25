@@ -50,12 +50,20 @@ class MoEExpertLayout:
         ep_size: int,
         use_all2all: bool,
         eplb_enabled: bool,
+        shared_stays_local: bool = False,
     ) -> "MoEExpertLayout":
+        """`shared_stays_local`: the shared expert cannot be placed as a
+        routed expert (a staged shared expert whose tensors only reach a
+        per-rank shared slot). Under EPLB without redundant experts it then
+        keeps each rank's shared slot, and EPLB places the routed experts
+        only."""
         if num_fused_shared_experts == 0:
             mode = SharedExpertMode.NONE
         elif not use_all2all:
             mode = SharedExpertMode.LEGACY_AITER
-        elif eplb_enabled:
+        elif eplb_enabled and not (
+            shared_stays_local and num_configured_redundant == 0
+        ):
             mode = SharedExpertMode.EPLB_ROUTED
         else:
             mode = SharedExpertMode.LOCAL_REPLICA

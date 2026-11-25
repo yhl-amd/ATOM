@@ -3752,6 +3752,7 @@ class FusedMoE(torch.nn.Module):
             ep_size=self.ep_size,
             use_all2all=self.moe_parallel_config.use_all2all_kernels,
             eplb_enabled=eplb_enabled,
+            shared_stays_local=stage_shared,
         )
         # Dispatch space: the id bound the kernels see, not the routed width.
         self.global_num_experts = self.expert_layout.num_physical

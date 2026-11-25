@@ -55,11 +55,14 @@ class SharedExpertStaging:
             else "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4"
         )
         if layer.expert_layout.shared_is_routed:
-            # EPLB with all2all EP routes the shared expert as a logical expert
-            # in the routed slots, so its tensors never reach a shared slot.
+            # EPLB with redundant experts and all2all EP routes the shared
+            # expert as a logical expert in the routed slots, so its tensors
+            # never reach a shared slot. Without redundant experts the layout
+            # keeps the per-rank shared slot (`shared_stays_local`).
             raise NotImplementedError(
-                f"{layer.prefix}: {name} does not support EPLB with all2all EP, "
-                "which places the shared expert among the routed experts."
+                f"{layer.prefix}: {name} does not support EPLB redundant "
+                "experts with all2all EP, which place the shared expert among "
+                "the routed experts."
             )
         self.ptpc = ptpc
         block = getattr(shared_expert_spec, "weight_block_size", None) or (1, 32)

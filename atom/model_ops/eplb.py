@@ -1621,6 +1621,24 @@ def _replica_spread(gathered: bool = False) -> tuple[int, int]:
     return _MANAGER.replica_spread
 
 
+def _local_shared_slots(layer: Any) -> int:
+    """Shared slots that close each rank's block of `layer` (LOCAL_REPLICA).
+    They are not EPLB's: placement never moves them."""
+    layout = getattr(layer, "expert_layout", None)
+    if layout is not None and getattr(layout, "uses_dispatch_remap", False):
+        return int(layout.num_fused_shared_experts)
+    return 0
+
+
+def eplb_num_physical(layer: Any) -> int:
+    """The physical experts EPLB places for `layer`: the routed physical
+    experts when each rank keeps its own shared slots, which the dispatch
+    space adds after them."""
+    if _local_shared_slots(layer):
+        return int(layer.expert_layout.num_routed_physical)
+    return int(getattr(layer, "global_num_experts", 0))
+
+
 def collect_ep_moe_layers(model: Any) -> dict[int, Any]:
     """Map checkpoint layer id -> EP MoE module that owns expert weights."""
     layers: dict[int, Any] = {}
@@ -1740,7 +1758,7 @@ class EPLBManager:
             )
 
         first_layer = layers[min(layers)]
-        num_physical = int(getattr(first_layer, "global_num_experts", 0))
+        num_physical = eplb_num_physical(first_layer)
         num_redundant = int(getattr(first_layer, "num_redundant_experts", 0))
         assert num_physical > num_redundant
         num_logical = num_physical - num_redundant
@@ -1752,7 +1770,7 @@ class EPLBManager:
                 f"num_physical={num_physical}, ep_size={ep_size}"
             )
         for layer_id, layer in layers.items():
-            layer_physical = int(getattr(layer, "global_num_experts", 0))
+            layer_physical = eplb_num_physical(layer)
             layer_redundant = int(getattr(layer, "num_redundant_experts", 0))
             assert layer_physical > layer_redundant
             layer_logical = layer_physical - layer_redundant
@@ -1873,6 +1891,14 @@ class EPLBManager:
         provider = getattr(quant_method, "get_eplb_weight_views", None)
         if callable(provider):
             method_views = provider(layer)
+            n_shared = _local_shared_slots(layer)
+            if method_views is not None and n_shared:
+                # The rank's shared slots follow its routed ones; EPLB
+                # migrates the routed prefix only.
+                method_views = [
+                    t[:num_local] if int(t.shape[0]) == num_local + n_shared else t
+                    for t in method_views
+                ]
             if method_views is not None:
                 if not method_views:
                     raise RuntimeError(
@@ -1946,10 +1972,11 @@ class EPLBManager:
         num_physical = self.live_metadata.num_physical_experts
         for layer_id, layer in self._moe_layers.items():
             old_map = getattr(layer, "expert_map", None)
-            if isinstance(old_map, torch.Tensor) and old_map.numel() > int(
-                getattr(layer, "global_num_experts", num_physical)
-            ):
-                tail = old_map[int(layer.global_num_experts) :].clone()
+            # Entries past the placed experts (shared slots, the sentinel)
+            # are carried over as they are.
+            n_placed = eplb_num_physical(layer) or num_physical
+            if isinstance(old_map, torch.Tensor) and old_map.numel() > n_placed:
+                tail = old_map[n_placed:].clone()
             else:
                 tail = torch.empty(
                     0, dtype=torch.int32, device=self.live_metadata.expert_map.device
@@ -1964,7 +1991,11 @@ class EPLBManager:
             if tail.numel() > 0:
                 runtime_map[num_physical:].copy_(tail.to(runtime_map.device))
             layer.expert_map = runtime_map
-            if getattr(layer, "expert_mask", None) is not None:
+            # A dispatch-space mask (shared slots kept per rank) marks this
+            # rank's block by position, which placement never changes.
+            if getattr(layer, "expert_mask", None) is not None and not (
+                _local_shared_slots(layer)
+            ):
                 layer.expert_mask = (runtime_map > -1).to(torch.int32)
 
     def _assert_placement_matches_loaded(self) -> None:
